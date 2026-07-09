@@ -434,6 +434,9 @@ impl Combat {
                     // "commit at cast start" for cast-time skills.
                     self.commit_cost(actor, action.skill, &skill);
                     self.state.entities[actor.0].action_bar = 0.0;
+                    // Commit the focus too: teammates' `TargetedBy` queries see
+                    // the mark from this moment, cast-time skills included.
+                    self.state.entities[actor.0].focus = action.targets.first().copied();
 
                     if skill.cast_time > 0 {
                         // Root the caster; the action resolves later, re-validated.
@@ -1312,6 +1315,7 @@ mod tests {
                 atb_speed: speed,
                 move_speed,
                 action_bar: 0.0,
+                focus: None,
             });
             id
         }
@@ -1357,6 +1361,64 @@ mod tests {
 
         assert!(log.contains(&Event::Died(dummy)));
         assert!(log.contains(&Event::Victory(Team::Player)));
+    }
+
+    /// Acting records the actor's focus (its committed primary target), and a
+    /// teammate whose gambit leads with a `TargetedBy` rule converges on that
+    /// mark instead of splitting fire onto its own preferred target.
+    #[test]
+    fn focus_fire_converges_on_an_allys_target() {
+        let mut a = Arena::new();
+        let hit = a.skill(damage_skill("Hit", 5.0, None, 0));
+        let leader = a.add("leader", Team::Player, 100.0, 1.0);
+        let follower = a.add("follower", Team::Player, 100.0, 1.0);
+        let weak = a.add("weak", Team::Enemy, 40.0, 0.0);
+        let _tough = a.add("tough", Team::Enemy, 100.0, 0.0);
+
+        // Leader picks the weakest foe on its own.
+        a.gambit(
+            leader,
+            Node::act(TargetQuery::new(Pool::Enemies).sort(SortKey::Hp, Order::Asc), hit),
+        );
+        // Follower joins an ally's mark first; alone it would hit the toughest.
+        a.gambit(
+            follower,
+            Node::context(
+                Condition::Always,
+                GroupMode::Fallthrough,
+                vec![
+                    Node::act(
+                        TargetQuery::new(Pool::Enemies).filter(Filter::TargetedBy(Box::new(
+                            TargetQuery::new(Pool::Allies)
+                                .filter(Filter::NotSelf)
+                                .pick(Pick::All),
+                        ))),
+                        hit,
+                    ),
+                    Node::act(
+                        TargetQuery::new(Pool::Enemies).sort(SortKey::Hp, Order::Desc),
+                        hit,
+                    ),
+                ],
+            ),
+        );
+
+        // Same tick: the leader (lower id) acts first and sets its focus; the
+        // follower's decision already sees it.
+        let mut combat = a.into_combat();
+        let log = combat.tick();
+
+        assert_eq!(combat.state.entity(leader).focus, Some(weak));
+        let follower_targets = log
+            .iter()
+            .find_map(|e| match e {
+                Event::Acted { actor, targets, .. } if *actor == follower => {
+                    Some(targets.clone())
+                }
+                _ => None,
+            })
+            .expect("the follower should act");
+        assert_eq!(follower_targets, vec![weak], "the follower joins the leader's mark");
     }
 
     #[test]

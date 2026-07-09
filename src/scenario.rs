@@ -109,6 +109,7 @@ pub fn demo() -> Combat {
         atb_speed,
         move_speed,
         action_bar: 0.0,
+        focus: None,
     };
 
     let hero = EntityId(0);
@@ -784,6 +785,7 @@ pub fn skirmish() -> Combat {
         atb_speed,
         move_speed,
         action_bar: 0.0,
+        focus: None,
     };
 
     //          id  name        team          hp     atb   move  x     y     kit                weak
@@ -829,6 +831,22 @@ pub fn skirmish() -> Combat {
                 ),
                 3.0,
             ))
+            .sort(SortKey::Hp, Order::Asc)
+    };
+    // The focus-fire pick: a foe a *nearby* teammate is already attacking (the
+    // primary target of its most recent action — casts count from the moment
+    // they start). Weakest first, so converged fire finishes a kill instead of
+    // spreading damage across two half-dead foes; when no nearby ally is
+    // engaging anything the query matches nothing and the rule falls through
+    // to the unit's own target preference below it.
+    let allys_target = || {
+        TargetQuery::new(Pool::Enemies)
+            .filter(Filter::TargetedBy(Box::new(
+                TargetQuery::new(Pool::Allies)
+                    .filter(Filter::NotSelf)
+                    .filter(Filter::WithinDistance(8.0))
+                    .pick(Pick::All),
+            )))
             .sort(SortKey::Hp, Order::Asc)
     };
     // The most-hurt ally (self included) that is actually below ~70% — the heal's
@@ -892,8 +910,10 @@ pub fn skirmish() -> Combat {
     // Archers: take the long aimed shot only while nobody threatens them up
     // close (rooting for the 4-tick draw with a foe in melee reach is how
     // archers die — the guard is the player-authored counterpart of the
-    // engine's implicit feasibility), otherwise focus-fire plinks at the
-    // weakest foe to secure kills.
+    // engine's implicit feasibility), otherwise plink at whatever a nearby
+    // teammate is already hitting (converged fire kills; two units each
+    // shooting their own "best" target kill nobody), falling back to the
+    // weakest foe when no teammate is engaged yet.
     let no_foe_in_my_face = || {
         Condition::Not(Box::new(Condition::Exists(
             TargetQuery::new(Pool::Enemies).filter(Filter::WithinDistanceOf(
@@ -908,6 +928,7 @@ pub fn skirmish() -> Combat {
             GroupMode::Fallthrough,
             vec![
                 Node::act(weakest_enemy(), snipe).when(no_foe_in_my_face()),
+                Node::act(allys_target(), shot),
                 Node::act(weakest_enemy(), shot),
             ],
         )
@@ -966,8 +987,16 @@ pub fn skirmish() -> Combat {
             GroupMode::Fallthrough,
             vec![
                 // Swarmed? Vanish. Two foes in melee reach of this frame is
-                // already lethal pressure — survival outranks everything.
-                Node::act(TargetQuery::new(Pool::Myself), sneak).when(Condition::Count {
+                // already lethal pressure — survival outranks everything. But
+                // only once actually scratched: at full HP the press hasn't
+                // landed anything yet (the target filter makes the rule
+                // infeasible until then), so the vanish isn't wasted on
+                // pressure that never materialized.
+                Node::act(
+                    TargetQuery::new(Pool::Myself).filter(Filter::HpPctBelow(1.0)),
+                    sneak,
+                )
+                .when(Condition::Count {
                     q: TargetQuery::new(Pool::Enemies).filter(Filter::WithinDistance(4.0)),
                     cmp: Cmp::Ge,
                     n: 2,
@@ -1088,8 +1117,11 @@ pub fn skirmish() -> Combat {
         ),
     );
     // Shaman: mend-first like any healer, but its filler is the drain — hurting
-    // the nearest player is also how it keeps itself topped up. Plain Shot
-    // remains the floor while Siphon recharges.
+    // players is also how it keeps itself topped up. The offense joins a nearby
+    // teammate's target first (the shaman-and-raider endgame used to split its
+    // fire across different marks and lose winnable fights), and only picks its
+    // own (nearest) when nobody is engaged. Plain Shot remains the floor while
+    // Siphon recharges.
     gambits.insert(
         EntityId(7),
         Node::context(
@@ -1097,7 +1129,9 @@ pub fn skirmish() -> Combat {
             GroupMode::Fallthrough,
             vec![
                 Node::act(hurt_ally(), heal),
+                Node::act(allys_target(), siphon),
                 Node::act(nearest_enemy(), siphon),
+                Node::act(allys_target(), shot),
                 Node::act(nearest_enemy(), shot),
             ],
         ),
@@ -1243,6 +1277,13 @@ pub fn skirmish() -> Combat {
                 2.5,
             ),
             (Term::Near(ally_attacker(), 0.0), 1.5),
+            // Invade from behind: the dive target is busy attacking a
+            // teammate (its focus — the direction it "faces"), so the rear
+            // arc is open. This term curves the same approach the dive pull
+            // drives around to the mark's back instead of walking straight
+            // through its front; it shares the dive's query, so it drops out
+            // together with it when no foe is engaged.
+            (Term::Behind(ally_attacker()), 0.7),
             (
                 Term::Near(
                     TargetQuery::new(Pool::Allies)

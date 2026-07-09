@@ -132,6 +132,23 @@ pub fn move_intent(
         .filter_map(|(term, weight)| match term.query() {
             Some(q) => {
                 let refs = select(q, actor, state, &[], None);
+                // `Behind` needs a facing, not just a point: the first selected
+                // reference's focus (what it last attacked) is where it "looks".
+                // Its pts carry [mark, focus] for the score kernel; a reference
+                // that is unengaged, whose focus died, or that stands on its
+                // focus (no axis) gives no rear to seek — the term drops out.
+                if matches!(term, Term::Behind(_)) {
+                    let &mark = refs.first()?;
+                    let focus = state
+                        .entity(mark)
+                        .focus
+                        .filter(|&f| state.entity(f).is_alive())?;
+                    let (mp, fp) = (state.entity(mark).pos, state.entity(focus).pos);
+                    if mp.dist(fp) <= f32::EPSILON {
+                        return None;
+                    }
+                    return Some((term, *weight, vec![mp, fp], Some(mp)));
+                }
                 let pts: Vec<Pos> = refs.iter().map(|&id| state.entity(id).pos).collect();
                 centroid(&refs, state).map(|point| (term, *weight, pts, Some(point)))
             }
@@ -158,6 +175,21 @@ pub fn move_intent(
                 Term::SightOf(_) => {
                     let Some(r) = reference else { continue };
                     if state.line_of_sight(p, *r) { 1.0 } else { 0.0 }
+                }
+                Term::Behind(_) => {
+                    // pts = [mark, focus]. Cosine of the candidate's angle off
+                    // the mark's rear axis (focus -> mark, extended): +1 dead
+                    // behind, 0 abeam, -1 in front. Scale-free — it prefers a
+                    // *side*, and leaves closing the distance to a `Near`.
+                    let (mp, fp) = (pts[0], pts[1]);
+                    let (bx, by) = (mp.x - fp.x, mp.y - fp.y);
+                    let (px, py) = (p.x - mp.x, p.y - mp.y);
+                    let len = (bx * bx + by * by).sqrt() * (px * px + py * py).sqrt();
+                    if len <= f32::EPSILON {
+                        0.0 // standing on the mark: no side yet
+                    } else {
+                        (px * bx + py * by) / len
+                    }
                 }
                 Term::Crowd(_, radius) => pts
                     .iter()
@@ -494,6 +526,13 @@ fn pass_filter(filter: &Filter, id: EntityId, actor: EntityId, state: &BattleSta
         Filter::WithinDistanceOf(q, d) => select(q, actor, state, &[], None)
             .iter()
             .any(|&r| r != id && state.entity(r).pos.dist(e.pos) <= *d),
+        // Resolve the nested query (a reference lookup, like WithinDistanceOf)
+        // and pass if any selected entity's current focus is the candidate.
+        // Focus staleness needs no handling here: a dead candidate never
+        // reaches a filter (pools only yield the living).
+        Filter::TargetedBy(q) => select(q, actor, state, &[], None)
+            .iter()
+            .any(|&r| r != id && state.entity(r).focus == Some(id)),
         Filter::Not(inner) => !pass_filter(inner, id, actor, state),
     }
 }
@@ -610,6 +649,7 @@ mod tests {
                 atb_speed: 0.25,
                 move_speed: 0.0,
                 action_bar: 0.0,
+                focus: None,
             });
             id
         }
@@ -900,6 +940,65 @@ mod tests {
         assert_eq!(intent.refs, vec![(w.state.entity(enemy).pos, Pull::Away)]);
     }
 
+    /// The flanker's blend: `Near(mark, 0)` + `Behind(mark)` converges to the
+    /// mark's *rear* — the side opposite its focus (the entity it is
+    /// attacking) — instead of stopping on the near/front side.
+    #[test]
+    fn behind_term_curves_the_approach_to_the_marks_rear() {
+        let mut w = World::new();
+        let hero = w.add("hero", Team::Player, 100.0, 44.0);
+        let victim = w.add("victim", Team::Player, 100.0, 46.0);
+        let mark = w.add("mark", Team::Enemy, 100.0, 50.0);
+        for id in [hero, victim, mark] {
+            w.ent(id).pos.y = 50.0; // interior, away from bounds clamping
+        }
+        w.ent(hero).move_speed = 1.0;
+        w.ent(mark).focus = Some(victim); // the mark faces west, at its victim
+
+        let mark_q = || TargetQuery::new(Pool::Enemies);
+        let gambit = MoveGambit::new(vec![
+            (Term::Near(mark_q(), 0.0), 1.0),
+            (Term::Behind(mark_q()), 1.0),
+        ]);
+
+        // Walk the drift to convergence (the hero starts on the mark's *front*
+        // side, next to the victim).
+        let mut steps = 0;
+        while let Some(dest) = decide_move(&gambit, hero, &w.state) {
+            w.ent(hero).pos = dest;
+            steps += 1;
+            assert!(steps < 60, "flanking drift must converge");
+        }
+        let settled = w.state.entity(hero).pos;
+        let mark_pos = w.state.entity(mark).pos;
+        assert!(
+            settled.x > mark_pos.x,
+            "should settle on the mark's rear side (east), got x = {}",
+            settled.x
+        );
+        assert!(
+            settled.dist(mark_pos) < 4.0,
+            "the Near pull should still keep it close, got {}",
+            settled.dist(mark_pos)
+        );
+    }
+
+    /// A `Behind` reference with no living focus has no facing: the term
+    /// drops out, and a gambit made of only that term holds position.
+    #[test]
+    fn behind_term_drops_out_without_a_facing() {
+        let mut w = World::new();
+        let hero = w.add("hero", Team::Player, 100.0, 44.0);
+        let _mark = w.add("mark", Team::Enemy, 100.0, 50.0); // focus: None
+        w.ent(hero).move_speed = 1.0;
+
+        let gambit = MoveGambit::new(vec![(
+            Term::Behind(TargetQuery::new(Pool::Enemies)),
+            1.0,
+        )]);
+        assert_eq!(decide_move(&gambit, hero, &w.state), None);
+    }
+
     /// A gambit whose every query matches nothing holds position rather than
     /// moving relative to nothing.
     #[test]
@@ -1021,6 +1120,53 @@ mod tests {
                 Box::new(TargetQuery::new(Pool::Enemies).pick(Pick::All)),
                 3.0,
             )),
+            strike,
+        );
+
+        assert_eq!(decide(&rule, hero, &w.state), None);
+    }
+
+    /// The focus-fire filter: "an enemy my ally is already attacking" picks
+    /// the ally's mark, not some other enemy the actor would prefer alone.
+    #[test]
+    fn targeted_by_selects_the_allys_mark() {
+        let mut w = World::new();
+        let hero = w.add("hero", Team::Player, 100.0, 0.0);
+        let ally = w.add("ally", Team::Player, 100.0, 1.0);
+        let _fresh = w.add("fresh", Team::Enemy, 100.0, 2.0);
+        let marked = w.add("marked", Team::Enemy, 100.0, 3.0);
+        w.ent(ally).focus = Some(marked); // the ally's last action hit `marked`
+        let strike = w.add_skill("Strike", 0, 100.0, None);
+
+        let rule = Node::act(
+            TargetQuery::new(Pool::Enemies).filter(Filter::TargetedBy(Box::new(
+                TargetQuery::new(Pool::Allies)
+                    .filter(Filter::NotSelf)
+                    .pick(Pick::All),
+            ))),
+            strike,
+        );
+
+        let action = decide(&rule, hero, &w.state).unwrap();
+        assert_eq!(action.targets, vec![marked]);
+    }
+
+    /// A candidate never satisfies `TargetedBy` through *itself*, and an
+    /// unengaged team (every focus empty) matches nothing — the rule falls
+    /// through to whatever comes after it.
+    #[test]
+    fn targeted_by_ignores_self_focus_and_unengaged_allies() {
+        let mut w = World::new();
+        let hero = w.add("hero", Team::Player, 100.0, 0.0);
+        let _idle_ally = w.add("ally", Team::Player, 100.0, 1.0); // focus: None
+        let lone = w.add("lone", Team::Enemy, 100.0, 2.0);
+        w.ent(lone).focus = Some(lone); // its own focus must not mark it
+        let strike = w.add_skill("Strike", 0, 100.0, None);
+
+        let rule = Node::act(
+            TargetQuery::new(Pool::Enemies).filter(Filter::TargetedBy(Box::new(
+                TargetQuery::new(Pool::Everyone).pick(Pick::All),
+            ))),
             strike,
         );
 

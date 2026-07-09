@@ -252,6 +252,14 @@ pub struct Entity {
     pub move_speed: f32,
     /// Action bar in `0.0..=1.0`; the entity acts when it reaches 1.0.
     pub action_bar: f32,
+    /// The primary target of this entity's most recent committed action —
+    /// written by the combat loop at commit time (cast start included, so a
+    /// channeling caster is already "on" its mark). This is what
+    /// `Filter::TargetedBy` reads to express focus-fire ("hit what my ally is
+    /// already hitting"). Sticky until the next action replaces it; a stale
+    /// focus (target since died) is naturally inert because queries only ever
+    /// consider living candidates.
+    pub focus: Option<EntityId>,
 }
 
 impl Entity {
