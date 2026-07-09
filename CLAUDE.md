@@ -11,6 +11,59 @@ Dragon Age: Origins tactics, but deliberately more modular.
 - **Engine:** [Macroquad](https://macroquad.rs/) — 2D game framework. Not yet added to
   `Cargo.toml`; add `macroquad` as a dependency when we start on rendering/input.
 
+## Core principle: entities = equipment + rules
+
+**An entity's identity is fully determined by its equipment and its gambit rules — there are
+no classes or archetypes.** "Mage", "archer", "tank" are emergent labels for a bundle of gear
++ rules, never a type in the code. All stats (HP, ATB speed, move speed, ranges, cast times)
+come from equipment; all behaviour comes from the gambit tree.
+
+This is load-bearing and constrains every future feature: **do not** add systems that tune
+behaviour per "entity type", and be suspicious of any balance mechanism that implicitly
+reintroduces classes. Balance problems are solved with more *tools* (skills, equipment,
+counter-rules), not with hardcoded, type-specific throttles. (This is exactly why the
+per-archetype move budget below was rejected.)
+
+## Code layout
+
+The whole game core is currently **engine-agnostic** (no Macroquad types), so it's unit
+testable in isolation. When rendering lands, keep engine types at the boundary and convert
+(e.g. `battle::Pos` <-> `macroquad::Vec2`).
+
+```
+src/
+  battle.rs   World state: Entity, Skill, Effect, Status, BattleState. No engine/AI deps.
+  gambit.rs   The rule model: Node / Body / Condition / TargetQuery (a behaviour tree).
+  eval.rs     decide(root, actor, state) -> Option<Action>: walk the tree. (unit tests)
+  combat.rs   Combat: the ATB loop + action resolution. (unit tests)
+  main.rs     A runnable, Macroquad-free demo battle that prints an event log.
+```
+
+Run `cargo test` for the behaviour specs and `cargo run` for the demo battle.
+
+## Combat loop (`combat.rs`)
+
+`Combat { state, gambits: HashMap<EntityId, Node>, time }` drives a tick-based ATB battle.
+Each `tick()`:
+
+1. **Statuses:** apply DoT/regen (Poison/Burn damage, Regen heal — per stack, per tick), then
+   age every status and drop expired ones.
+2. **Cooldowns:** decrement each entity's per-skill cooldowns.
+3. **Fill bars:** `action_bar += speed`, capped at `READY` (1.0).
+4. **Act:** every entity with a full bar acts, fullest-bar-first (ties by id). For each,
+   `decide()` walks its gambit; on an `Action` the bar resets to 0 and the action resolves;
+   on `None` the entity **waits** with its bar still full, so it re-evaluates next tick and
+   acts the instant a cooldown/condition frees up.
+
+Battle ends when one whole team is dead; `run(max_ticks)` loops until then (the cap guards
+against stalemates). Every tick returns a `Vec<Event>` log (Acted / Waited / Damage / Heal /
+Inflicted / Died / Victory) for tests and, later, the UI.
+
+**Resolution rules** (tunable constants at the top of `combat.rs`): weakness multiplier
+`1.5×` when the target's `weaknesses` contains the skill's `damage_type`; per-stack DoT/regen
+amounts. Resolution also pays MP cost and starts the skill's cooldown. Feasibility
+(cooldown / MP / range / has-a-valid-target) is checked in `eval`, never hand-authored.
+
 ## The gambit system — design decisions
 
 This is the heart of the game. The design below is settled; implement against it.
@@ -143,3 +196,81 @@ The **model** is the powerful one; the **UI** decides how much to expose. Ship F
 presets ("nearest foe", "weakest foe", "lowest-HP ally") that expand into full
 pool→filter→sort→pick queries, and hide the individual knobs behind an "advanced" mode. Cap
 *displayed* nesting to ~2–3 levels even if the data model allows arbitrary depth.
+
+## Movement & positioning (designed — not yet built)
+
+Entities are currently **static**: every entity has a `Pos`, and `range` / `SortKey::Distance`
+*read* it, but nothing ever *writes* it. The settled design:
+
+- **Flowy, continuous movement — decoupled from the action.** Movement is NOT a turn/action
+  choice competing with skills (that makes it a dead option). Instead a unit *drifts* toward a
+  desired position every tick at its `move_speed`, driven by its own lightweight **movement
+  gambit**, while the ATB bar independently fills and fires skills. Move **and** pick skills,
+  never move-*or*-pick. This decoupling is what makes movement worth having — and it's the
+  reason we don't need a movement budget (see below).
+- **Movement reuses the target engine.** A movement rule is `MoveToward(TargetQuery)` /
+  `MoveAway(TargetQuery)` — the same pool→filter→sort→pick machinery picks what to move
+  relative to. "Kite the nearest enemy" = MoveAway(nearest enemy). Low marginal complexity.
+- **Cast-time / rooting.** Some skills have `cast_time > 0` (ticks). Selecting one puts the
+  unit in a **Casting** state: rooted (movement suppressed — "stand still"), ATB not filling,
+  not re-deciding, until it resolves. Idle drifts, Casting stands still — one small state
+  machine shared with movement. Cast-time is the key counter to kiting: committing to a big
+  skill = a vulnerability window. Decisions: **commit MP + cooldown at cast start**, **resolve
+  at completion** (re-validate targets; fizzle if none still valid — this is the interrupt/
+  counterplay engine); **not interruptible by plain damage**, but a future hard-CC status
+  cancels a cast. Open: whether a unit may *abandon* a cast to flee (ship locked-in first).
+- **Rejected: a movement budget / stamina.** Considered to stop infinite kiting, but dropped:
+  (a) it throttles the *chaser* as much as the fleer, so it can gut melee; (b) tuning it
+  per-archetype smuggles back a class system, violating the equipment+rules identity
+  principle. "Never commits to an attack" is an authoring problem (a bad gambit), not a system
+  one; solve real kiting with more *tools* (gap-closers, roots), not a systemic throttle.
+- **`speed` naming:** the current `Entity.speed` is the **ATB fill rate**. When movement lands,
+  add a separate `move_speed` and rename this to `atb_speed` to avoid confusion.
+
+## Terrain, height & navigation (designed — not yet built)
+
+This makes the game a **tactics RPG** (Final Fantasy Tactics / Tactics Ogre lineage): fights
+happen on terrain with obstacles and elevation, not a flat plane. It's the largest subsystem —
+pulls in pathfinding, line-of-sight, terrain data, and terrain rendering.
+
+- **Representation — tile grid, continuous units.** Terrain is a grid of tiles; each tile has
+  an `elevation` and a `passable` flag (walls/pits impassable). Units keep **continuous** `Pos`
+  and flowy movement — the grid is the *terrain*, not the unit positions (RTS-style: grid
+  navigation underneath, smooth units on top). The playable arena bounds are the grid extent,
+  so units can't drift off-screen. (Chosen over a continuous heightmap+navmesh, which is far
+  more engineering, and over a pure tile-step grid, which would drop flowy movement.)
+- **Navigation — A\* + steering.** Global routing is **A\*** over the tile grid (steering alone
+  can't route around concave obstacles). A* yields waypoints; the **steering** layer follows
+  them smoothly and does local avoidance (walls, other units). A* = *where* to go, steering =
+  *how* to move there. Movement gambits still express only *intent*
+  (`MoveToward`/`MoveAway(TargetQuery)`, seek high ground, …); navigation resolves it.
+- **Spatial sanity is implicit** — like feasibility. Pathfinding around obstacles, staying in
+  bounds, and not overlapping allies are systemic and always-on; the player never hand-authors
+  "don't run into walls". Getting cornered is still *possible* (a real tactical outcome when
+  outplayed), just not obliviously self-inflicted.
+- **Height — discrete tile elevations.** Adjacent tiles are walkable if their elevation delta
+  is within a step threshold; a larger drop/rise is a **cliff** (impassable to walking, but you
+  can see/shoot across it). Traversability is a property of the terrain + threshold, not of an
+  "entity type" — consistent with the equipment+rules identity principle.
+- **Height in combat = line-of-sight & range only (no stat bonuses).** High ground sees over
+  lower obstacles and can shoot across gaps; a low unit behind cover may have no LoS.
+  **LoS is a new implicit feasibility check** for ranged skills, alongside range/cooldown/cost:
+  you can't target what you can't see. No flat accuracy/damage bonus for height — kept emergent
+  from geometry; revisit only if positioning feels weak.
+- **Gambit payoff — new spatial material** (the reason terrain is worth the cost):
+  - Filters: `HasLineOfSight`, `OnHigherGround`, `InCover`, elevation comparisons.
+  - Sort key: `Elevation` (e.g. "prefer the high-ground target", "seek the highest reachable tile").
+  - Movement intents: "seek nearest high tile with LoS to the target", "break LoS from ranged threats".
+- **Not doing (yet):** navmesh / continuous heightmap (the grid is enough); flight/teleport
+  traversal; height stat bonuses; interior-cover authoring tools.
+
+## Open questions / not yet built
+
+- **`Pick::Random` is deterministic** (hashes actor + candidate set) to keep `decide()` pure.
+  Swap for a seeded RNG threaded through `BattleState` when real randomness is wanted.
+- **No rendering yet.** Next step is the Macroquad layer: a window drawing entities + filling
+  action bars, stepping `Combat` on a timer. With terrain now in scope, the **view projection**
+  is an open choice — top-down with height cues (shading/outlines) vs. isometric/2.5D
+  (FFT-style). Isometric reads height best but is more art/render work.
+- **Terrain authoring is undecided** — how maps are defined (hand-authored data files, an
+  in-engine editor, procedural). Not needed until we build the terrain layer.
