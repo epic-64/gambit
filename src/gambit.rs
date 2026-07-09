@@ -69,6 +69,14 @@ pub enum Filter {
     /// protect/peel trigger. Give the nested query `Pick::All` to mean "near
     /// *any* of them"; a narrower pick ("near the weakest ally") also works.
     WithinDistanceOf(Box<TargetQuery>, f32),
+    /// The candidate is the current *focus* (see [`crate::battle::Entity::focus`],
+    /// the primary target of the most recent committed action) of some entity
+    /// the nested query selects — the candidate itself never counts as its own
+    /// selector. This is the focus-fire filter: "the foe a nearby teammate is
+    /// already hitting" is `Pool::Enemies` + `TargetedBy(allies-not-me,
+    /// Pick::All)`, which converges split damage onto one kill instead of two
+    /// half-dead foes.
+    TargetedBy(Box<TargetQuery>),
     Not(Box<Filter>),
 }
 
@@ -254,6 +262,15 @@ pub enum Term {
     /// weight; blind ones score zero. A *negative* weight turns this into
     /// "hide from the target" (break line-of-sight) for free.
     SightOf(TargetQuery),
+    /// Stand points *behind* the selected target score up to full weight,
+    /// points in front of it down to negative full weight (cosine of the
+    /// angle off its rear axis). "Behind" is defined by focus, not geometry
+    /// alone: an entity *faces* its [`crate::battle::Entity::focus`] (the
+    /// target of its last committed action), so its rear is the opposite
+    /// half-plane. The flanker's term — pair it with `Near(same query, 0)`
+    /// and the approach curves around the victim to strike the back. A
+    /// reference with no living focus has no facing and the term drops out.
+    Behind(TargetQuery),
     /// Sum, over *every* entity the query selects, of a linear proximity
     /// kernel: 1 at a body, fading to 0 at the given radius. A stand point
     /// touching several of them outscores one near a single body, and the
@@ -269,7 +286,11 @@ impl Term {
     /// The query this term selects its reference entity from, if it has one.
     pub fn query(&self) -> Option<&TargetQuery> {
         match self {
-            Term::Near(q, _) | Term::AwayFrom(q) | Term::SightOf(q) | Term::Crowd(q, _) => Some(q),
+            Term::Near(q, _)
+            | Term::AwayFrom(q)
+            | Term::SightOf(q)
+            | Term::Behind(q)
+            | Term::Crowd(q, _) => Some(q),
             Term::HighGround => None,
         }
     }

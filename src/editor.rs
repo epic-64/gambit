@@ -53,6 +53,7 @@ pub fn describe_filter(f: &Filter) -> String {
         Filter::WithinDistanceOf(q, d) => {
             format!("within {} of ({})", num(*d), describe_query(q))
         }
+        Filter::TargetedBy(q) => format!("targeted by ({})", describe_query(q)),
         Filter::Not(inner) => format!("not {}", describe_filter(inner)),
     }
 }
@@ -140,6 +141,7 @@ pub fn describe_term(t: &Term) -> String {
         Term::AwayFrom(q) => format!("away from [{}]", describe_query(q)),
         Term::HighGround => "high ground".into(),
         Term::SightOf(q) => format!("sight of [{}]", describe_query(q)),
+        Term::Behind(q) => format!("behind [{}]", describe_query(q)),
         Term::Crowd(q, r) => format!("amid [{}] (reach {})", describe_query(q), num(*r)),
     }
 }
@@ -301,6 +303,21 @@ fn foe_on_ally() -> TargetQuery {
         .sort(SortKey::Hp, Order::Asc)
 }
 
+/// The focus-fire pick: a foe a nearby teammate is already attacking (its
+/// most recent action's target), weakest first so converged fire finishes
+/// kills. Falls through when no ally is engaging anything, so it wants a
+/// plain fallback rule below it.
+fn allys_target() -> TargetQuery {
+    TargetQuery::new(Pool::Enemies)
+        .filter(Filter::TargetedBy(Box::new(
+            TargetQuery::new(Pool::Allies)
+                .filter(Filter::NotSelf)
+                .filter(Filter::WithinDistance(8.0))
+                .pick(Pick::All),
+        )))
+        .sort(SortKey::Hp, Order::Asc)
+}
+
 pub fn target_menu() -> Vec<MenuEntry<TargetQuery>> {
     vec![
         // The passthrough: hit exactly what the condition matched (the FF12
@@ -329,6 +346,15 @@ pub fn target_menu() -> Vec<MenuEntry<TargetQuery>> {
                     "most hurt foe",
                     TargetQuery::new(Pool::Enemies).sort(SortKey::HpPct, Order::Asc),
                 ),
+                // The kill-securing pick (the assassin's `weak_mark`): only
+                // foes already bleeding out qualify, so the rule falls through
+                // entirely until someone is actually dying.
+                (
+                    "dying foe (<40%)",
+                    TargetQuery::new(Pool::Enemies)
+                        .filter(Filter::HpPctBelow(0.4))
+                        .sort(SortKey::HpPct, Order::Asc),
+                ),
                 (
                     "fullest-mp foe",
                     TargetQuery::new(Pool::Enemies).sort(SortKey::Mp, Order::Desc),
@@ -349,6 +375,7 @@ pub fn target_menu() -> Vec<MenuEntry<TargetQuery>> {
                         .sort(SortKey::MaxHp, Order::Asc),
                 ),
                 ("foe on an ally", foe_on_ally()),
+                ("ally's target", allys_target()),
             ],
         ),
         sub(
@@ -494,6 +521,7 @@ pub fn term_menu() -> Vec<MenuEntry<Term>> {
                 ("standoff from nearest foe", Term::Near(nearest_foe(), 6.5)),
                 ("away from nearest foe", Term::AwayFrom(nearest_foe())),
                 ("sight of nearest foe", Term::SightOf(nearest_foe())),
+                ("flank behind nearest foe", Term::Behind(nearest_foe())),
                 (
                     "amid the foes",
                     Term::Crowd(TargetQuery::new(Pool::Enemies).pick(Pick::All), 5.0),
