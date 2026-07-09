@@ -1086,6 +1086,12 @@ fn draw_entity(
         draw_text("casting", sx - 24.0, sy + r + 22.0, 16.0, Color::new(0.95, 0.85, 0.3, 1.0));
     }
 
+    // Persistent status overlays (poison bubbles, shield hex, stun stars, …):
+    // every effect is readable from the field itself, not just the status text.
+    if alive {
+        draw_status_fx(view, e);
+    }
+
     // Name (just above the token).
     draw_text(&e.name, sx - 20.0, sy - r - 12.0, 18.0, WHITE);
 
@@ -1142,6 +1148,177 @@ fn draw_entity(
             .map(|st| format!("{:?}x{}", st.kind, st.stacks))
             .collect();
         draw_text(&s.join(" "), bx, next_y + 12.0, 14.0, Color::new(0.8, 0.7, 0.9, 1.0));
+    }
+}
+
+/// Persistent per-status battlefield overlays, drawn on the token itself.
+/// Project rule: **every** effect — shield, snare, elemental ailment, buff,
+/// debuff, mark — has its own visual, readable from the field without the
+/// GUI. Sneak's ghosting and the aura field circles live elsewhere (they
+/// change how the token/field itself draws); everything else is here.
+/// Animated on real time with a per-entity phase so a crowd doesn't pulse in
+/// lockstep; where a status has meaningful stacks (Poison) or charges
+/// (SpellWard) the count shows as more marks.
+fn draw_status_fx(view: &View, e: &Entity) {
+    use std::f32::consts::TAU;
+    let (sx, sy) = view.pos(e.pos);
+    let r = (ENTITY_RADIUS * view.scale).max(6.0);
+    let t = get_time() as f32 + e.id.0 as f32 * 1.73;
+
+    for st in &e.statuses {
+        let c = status_color(st.kind);
+        match st.kind {
+            // Poison: slow green bubbles rising off the body — one more per
+            // stack (capped) so a deep poison reads heavier.
+            StatusKind::Poison => {
+                let n = (1 + st.stacks).min(4);
+                for k in 0..n {
+                    let ph = (t * 0.55 + k as f32 / n as f32).fract();
+                    let bx = sx + (k as f32 * 2.4 + t * 0.9).sin() * r * 0.55;
+                    let by = sy + r * 0.35 - ph * r * 1.9;
+                    draw_circle(bx, by, 1.6 + (k % 2) as f32, with_alpha(c, (1.0 - ph) * 0.85));
+                }
+            }
+            // Burn: fast-flickering flame licks off the token's crown.
+            StatusKind::Burn => {
+                for k in 0..3 {
+                    let fx = sx + (k as f32 - 1.0) * r * 0.5;
+                    let flick = (t * 9.0 + k as f32 * 2.1).sin() * 0.5 + 0.5;
+                    let h = r * (0.45 + 0.5 * flick);
+                    let w = r * 0.22;
+                    let by = sy - r * 0.35;
+                    draw_triangle(
+                        vec2(fx - w, by),
+                        vec2(fx + w, by),
+                        vec2(fx, by - h),
+                        with_alpha(c, 0.55 + 0.35 * flick),
+                    );
+                }
+            }
+            // Regen: little green crosses drifting upward — restorative,
+            // where poison's round bubbles read as sickness.
+            StatusKind::Regen => {
+                for k in 0..2 {
+                    let ph = (t * 0.5 + k as f32 * 0.5).fract();
+                    let px = sx + (k as f32 * 2.0 - 1.0) * r * 0.55;
+                    let py = sy - ph * r * 1.7;
+                    let s = 3.0;
+                    let a = (1.0 - ph) * 0.9;
+                    draw_line(px - s, py, px + s, py, 1.5, with_alpha(c, a));
+                    draw_line(px, py - s, px, py + s, 1.5, with_alpha(c, a));
+                }
+            }
+            // Shield: a slowly turning hex bubble enclosing the token.
+            StatusKind::Shield => {
+                let pulse = 0.8 + 0.2 * (t * 2.5).sin();
+                draw_poly(sx, sy, 6, r + 4.0, t * 18.0, with_alpha(c, 0.10));
+                draw_poly_lines(sx, sy, 6, r + 4.0, t * 18.0, 2.0, with_alpha(c, 0.75 * pulse));
+            }
+            // Enrage: a bristling ring of red spikes, seething outward.
+            StatusKind::Enrage => {
+                let pulse = 0.5 + 0.5 * (t * 5.0).sin().abs();
+                for k in 0..8 {
+                    let ang = k as f32 / 8.0 * TAU + t * 0.9;
+                    let (ca, sa) = (ang.cos(), ang.sin());
+                    let inner = r + 1.5;
+                    let outer = inner + 2.5 + 3.5 * pulse;
+                    draw_line(
+                        sx + ca * inner,
+                        sy + sa * inner,
+                        sx + ca * outer,
+                        sy + sa * outer,
+                        2.0,
+                        with_alpha(c, 0.85),
+                    );
+                }
+            }
+            // Silence: a struck-through speech bubble bobbing at the shoulder.
+            StatusKind::Silence => {
+                let px = sx + r + 5.0;
+                let py = sy - r - 4.0 + (t * 2.2).sin() * 1.5;
+                draw_circle_lines(px, py, 4.5, 1.5, with_alpha(c, 0.95));
+                draw_line(px - 3.2, py + 3.2, px + 3.2, py - 3.2, 1.5, with_alpha(c, 0.95));
+            }
+            // Stun: the classic — golden sparks orbiting above the head.
+            StatusKind::Stun => {
+                for k in 0..3 {
+                    let ang = t * 3.2 + k as f32 * TAU / 3.0;
+                    let px = sx + ang.cos() * r * 0.9;
+                    let py = sy - r - 6.0 + ang.sin() * 3.0;
+                    draw_poly(px, py, 4, 3.0, ang.to_degrees(), with_alpha(c, 0.95));
+                }
+            }
+            // Snare: a shackle-ring clamped around the feet, studs crawling.
+            StatusKind::Snare => {
+                let ey = sy + r * 0.55;
+                let (rx, ry) = (r * 1.1, r * 0.5);
+                draw_ellipse_lines(sx, ey, rx, ry, 0.0, 2.0, with_alpha(c, 0.8));
+                for k in 0..4 {
+                    let ang = k as f32 / 4.0 * TAU + t * 0.6;
+                    let px = sx + ang.cos() * rx;
+                    let py = ey + ang.sin() * ry;
+                    draw_circle(px, py, 2.0, with_alpha(c, 0.9));
+                }
+            }
+            // Mortal wound: dark drops bleeding down off the body — the
+            // downward mirror of poison's rising bubbles.
+            StatusKind::MortalWound => {
+                for k in 0..2 {
+                    let ph = (t * 0.8 + k as f32 * 0.5).fract();
+                    let px = sx + (k as f32 * 2.0 - 1.0) * r * 0.35;
+                    let py = sy + r * 0.3 + ph * r * 1.5;
+                    draw_circle(px, py, 2.2, with_alpha(c, 1.0 - ph));
+                }
+            }
+            // Spell ward: one orbiting rune per charge on a flattened orbit,
+            // so the remaining parries are countable at a glance.
+            StatusKind::SpellWard => {
+                let n = st.stacks.clamp(1, 4);
+                for k in 0..n {
+                    let ang = t * 2.1 + k as f32 * TAU / n as f32;
+                    let px = sx + ang.cos() * (r + 5.0);
+                    let py = sy + ang.sin() * (r + 5.0) * 0.4;
+                    draw_poly(px, py, 4, 3.2, 45.0, with_alpha(c, 0.95));
+                }
+            }
+            // Exposed: chevrons stabbing inward — "hit this one".
+            StatusKind::Exposed => {
+                let slide = ((t * 2.8).sin() * 0.5 + 0.5) * 4.0;
+                for k in 0..3 {
+                    let ang = k as f32 / 3.0 * TAU - TAU / 4.0;
+                    let (ca, sa) = (ang.cos(), ang.sin());
+                    let tip = r + 8.0 - slide;
+                    let back = tip + 5.0;
+                    let spread = 0.38;
+                    for s in [-1.0f32, 1.0] {
+                        let ba = ang + s * spread;
+                        draw_line(
+                            sx + ca * tip,
+                            sy + sa * tip,
+                            sx + ba.cos() * back,
+                            sy + ba.sin() * back,
+                            2.0,
+                            with_alpha(c, 0.9),
+                        );
+                    }
+                }
+            }
+            // Lifeleech: essence motes streaming up and out of the body —
+            // the mark's life feeding whoever strikes it.
+            StatusKind::Lifeleech => {
+                for k in 0..3 {
+                    let ph = (t * 0.7 + k as f32 / 3.0).fract();
+                    let ang = k as f32 * 2.1 + t * 0.5;
+                    let d = r * (0.25 + ph * 1.5);
+                    let px = sx + ang.cos() * d;
+                    let py = sy + ang.sin() * d * 0.5 - ph * 5.0;
+                    draw_circle(px, py, 2.0, with_alpha(c, (1.0 - ph) * 0.9));
+                }
+            }
+            // Sneak ghosts the token itself (draw_entity); the auras draw
+            // their field circles under everything (draw_auras).
+            StatusKind::Sneak | StatusKind::RegenAura | StatusKind::MightAura => {}
+        }
     }
 }
 

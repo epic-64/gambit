@@ -360,6 +360,12 @@ pub fn target_menu() -> Vec<MenuEntry<TargetQuery>> {
                         .sort(SortKey::HpPct, Order::Asc),
                 ),
                 (
+                    "damaged foe (<60%)",
+                    TargetQuery::new(Pool::Enemies)
+                        .filter(Filter::HpPctBelow(0.6))
+                        .sort(SortKey::HpPct, Order::Asc),
+                ),
+                (
                     "fullest-mp foe",
                     TargetQuery::new(Pool::Enemies).sort(SortKey::Mp, Order::Desc),
                 ),

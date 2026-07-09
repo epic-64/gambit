@@ -395,5 +395,9 @@ Implementation notes / decisions made while building:
   centre is covered ghosts through as a team-colored silhouette ring, so it stays trackable.
   Vfx and projectiles still draw on top of everything. A full isometric/2.5D (FFT-style)
   projection remains a possible future upgrade if height still reads too weakly.
+  **Every effect must be readable from the field alone, without the GUI** (project rule):
+  each `StatusKind` has its own persistent battlefield visual (`main.rs::draw_status_fx` —
+  poison bubbles, burn licks, shield hex, stun stars, ward runes per charge, …; Sneak ghosts
+  the token, auras draw field circles). A new status or effect isn't done until it draws.
 - **Terrain authoring is undecided** — how maps are defined (hand-authored data files, an
   in-engine editor, procedural). Not needed until we build the terrain layer.
