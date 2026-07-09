@@ -5,156 +5,229 @@
 
 //! gambit — a 2D semi-turn-based RPG built around a modular gambit system.
 //!
-//! This binary exercises the gambit *core* (no Macroquad yet): it builds a
-//! small battle, gives each character a gambit tree, and runs the ATB combat
-//! loop to completion, printing the event log. See CLAUDE.md for the design
-//! and `cargo test` for the behaviour specs.
+//! This binary is the Macroquad viewer for the (still flat, movement-free)
+//! combat core: it steps `Combat` on a fixed timer and draws each entity's HP
+//! and action bars plus a live event log. See CLAUDE.md for the design and
+//! `cargo test` for the behaviour specs.
 
 mod battle;
 mod combat;
 mod eval;
 mod gambit;
+mod scenario;
 
-use battle::*;
+use macroquad::prelude::*;
+
+use battle::{Entity, EntityId, SkillId, Team};
 use combat::{Combat, Event};
-use gambit::*;
-use std::collections::HashMap;
 
-fn main() {
-    let mut skills = Vec::new();
-    let mut skill = |s: Skill| {
-        let id = SkillId(skills.len());
-        skills.push(s);
-        id
-    };
-    let attack = skill(Skill {
-        name: "Attack".into(),
-        cost: 0,
-        range: 100.0,
-        cooldown: 0,
-        damage_type: Some(DamageType::Physical),
-        effects: vec![Effect::Damage(12.0)],
-    });
-    let fireball = skill(Skill {
-        name: "Fireball".into(),
-        cost: 12,
-        range: 100.0,
-        cooldown: 3,
-        damage_type: Some(DamageType::Fire),
-        effects: vec![Effect::Damage(18.0)],
-    });
-    let heal = skill(Skill {
-        name: "Heal".into(),
-        cost: 10,
-        range: 100.0,
-        cooldown: 0,
-        damage_type: None,
-        effects: vec![Effect::Heal(40.0)],
-    });
+/// Arena size in world units (entity positions live in this space).
+const WORLD_W: f32 = 20.0;
+const WORLD_H: f32 = 12.0;
+/// Seconds of real time per simulation tick.
+const TICK_INTERVAL: f32 = 0.25;
+/// Width reserved on the right for the event log.
+const LOG_W: f32 = 300.0;
 
-    let mk = |id: usize, name: &str, team: Team, hp: f32, speed: f32, weak: &[DamageType]| Entity {
-        id: EntityId(id),
-        name: name.into(),
-        team,
-        hp,
-        max_hp: hp,
-        mp: 100,
-        pos: Pos { x: 0.0, y: 0.0 },
-        statuses: Vec::new(),
-        weaknesses: weak.to_vec(),
-        skills: vec![attack, fireball, heal],
-        cooldowns: HashMap::new(),
-        speed,
-        action_bar: 0.0,
-    };
+fn window_conf() -> Conf {
+    Conf {
+        window_title: "gambit".to_owned(),
+        window_width: 1000,
+        window_height: 640,
+        high_dpi: true,
+        ..Default::default()
+    }
+}
 
-    let hero = EntityId(0);
-    let mage = EntityId(1);
-    let goblin = EntityId(2);
-    let ogre = EntityId(3);
-    let entities = vec![
-        mk(0, "Hero", Team::Player, 80.0, 0.30, &[]),
-        mk(1, "Mage", Team::Player, 50.0, 0.22, &[]),
-        mk(2, "Goblin", Team::Enemy, 40.0, 0.28, &[DamageType::Fire]),
-        mk(3, "Ogre", Team::Enemy, 120.0, 0.18, &[]),
-    ];
-    let state = BattleState { entities, skills };
+#[macroquad::main(window_conf)]
+async fn main() {
+    let mut combat = scenario::demo();
+    let mut log: Vec<String> = Vec::new();
+    let mut acc = 0.0f32;
+    let mut paused = false;
 
-    let mut gambits = HashMap::new();
-
-    // Hero: self-preserve first (Commit — no valid heal? then wait), else bash
-    // the nearest enemy.
-    gambits.insert(
-        hero,
-        Node::context(
-            Condition::Always,
-            GroupMode::Fallthrough,
-            vec![
-                Node::context(
-                    Condition::Exists(TargetQuery::new(Pool::Myself).filter(Filter::HpPctBelow(0.3))),
-                    GroupMode::Commit,
-                    vec![Node::act(TargetQuery::new(Pool::Myself), heal)],
-                ),
-                Node::act(
-                    TargetQuery::new(Pool::Enemies).sort(SortKey::Distance, Order::Asc),
-                    attack,
-                ),
-            ],
-        ),
-    );
-
-    // Mage: fireball the highest-HP enemy while it has any MP, else plink.
-    gambits.insert(
-        mage,
-        Node::context(
-            Condition::Always,
-            GroupMode::Fallthrough,
-            vec![
-                Node::act(
-                    TargetQuery::new(Pool::Enemies).sort(SortKey::Hp, Order::Desc),
-                    fireball,
-                ),
-                Node::act(TargetQuery::new(Pool::Enemies), attack),
-            ],
-        ),
-    );
-
-    // Enemies: focus-fire the lowest-HP player.
-    let focus_weakest = || {
-        Node::act(
-            TargetQuery::new(Pool::Enemies).sort(SortKey::Hp, Order::Asc),
-            attack,
-        )
-    };
-    gambits.insert(goblin, focus_weakest());
-    gambits.insert(ogre, focus_weakest());
-
-    let mut combat = Combat::new(state, gambits);
-    let log = combat.run(500);
-
-    let name = |id: EntityId| combat.state.entity(id).name.clone();
-    let skill_name = |id: SkillId| combat.state.skill(id).name.clone();
-
-    println!("=== Battle start ===");
-    for ev in &log {
-        match ev {
-            Event::Acted { actor, skill, targets } => {
-                let tnames: Vec<String> = targets.iter().map(|&t| name(t)).collect();
-                println!("{} casts {} at {}", name(*actor), skill_name(*skill), tnames.join(", "));
-            }
-            Event::Waited(actor) => println!("{} waits.", name(*actor)),
-            Event::Damage { target, amount, weakness } => {
-                let tag = if *weakness { " (weakness!)" } else { "" };
-                println!("  {} takes {amount:.0} damage{tag}", name(*target));
-            }
-            Event::Heal { target, amount } => {
-                println!("  {} heals {amount:.0} HP", name(*target));
-            }
-            Event::Inflicted { target, kind, stacks } => {
-                println!("  {} is afflicted with {kind:?} x{stacks}", name(*target));
-            }
-            Event::Died(target) => println!("  *** {} is defeated!", name(*target)),
-            Event::Victory(team) => println!("=== {team:?} wins in {} ticks ===", combat.time),
+    loop {
+        // --- input ---
+        if is_key_pressed(KeyCode::Space) {
+            paused = !paused;
         }
+        if is_key_pressed(KeyCode::R) {
+            combat = scenario::demo();
+            log.clear();
+            acc = 0.0;
+            paused = false;
+        }
+
+        // --- update: step the sim on a fixed timer ---
+        if !paused && !combat.is_over() {
+            acc += get_frame_time();
+            let mut steps = 0;
+            while acc >= TICK_INTERVAL && steps < 4 {
+                acc -= TICK_INTERVAL;
+                steps += 1;
+                for ev in combat.tick() {
+                    log.push(format_event(&combat, &ev));
+                }
+            }
+            // Keep the log from growing without bound.
+            const MAX_LOG: usize = 500;
+            if log.len() > MAX_LOG {
+                log.drain(0..log.len() - MAX_LOG);
+            }
+        }
+
+        // --- draw ---
+        clear_background(Color::new(0.10, 0.11, 0.13, 1.0));
+        draw_arena();
+        for e in &combat.state.entities {
+            draw_entity(e);
+        }
+        draw_log(&log);
+        draw_hud(&combat, paused);
+
+        next_frame().await;
+    }
+}
+
+// --- world <-> screen ------------------------------------------------------
+
+fn arena_rect() -> (f32, f32, f32, f32) {
+    let margin = 20.0;
+    let top = 46.0;
+    let x = margin;
+    let y = top;
+    let w = screen_width() - LOG_W - margin * 2.0;
+    let h = screen_height() - top - margin;
+    (x, y, w, h)
+}
+
+fn world_to_screen(wx: f32, wy: f32) -> (f32, f32) {
+    let (ax, ay, aw, ah) = arena_rect();
+    let scale = (aw / WORLD_W).min(ah / WORLD_H);
+    (ax + wx * scale, ay + wy * scale)
+}
+
+// --- drawing ---------------------------------------------------------------
+
+fn draw_arena() {
+    let (sx, sy) = world_to_screen(0.0, 0.0);
+    let (ex, ey) = world_to_screen(WORLD_W, WORLD_H);
+    draw_rectangle(sx, sy, ex - sx, ey - sy, Color::new(0.14, 0.16, 0.19, 1.0));
+    draw_rectangle_lines(sx, sy, ex - sx, ey - sy, 2.0, Color::new(0.3, 0.34, 0.4, 1.0));
+}
+
+fn draw_entity(e: &Entity) {
+    let (sx, sy) = world_to_screen(e.pos.x, e.pos.y);
+    let alive = e.is_alive();
+    let base = if e.team == Team::Player {
+        Color::new(0.35, 0.55, 0.95, 1.0)
+    } else {
+        Color::new(0.9, 0.4, 0.35, 1.0)
+    };
+    let col = if alive {
+        base
+    } else {
+        Color::new(0.3, 0.3, 0.32, 1.0)
+    };
+    draw_circle(sx, sy, 18.0, col);
+    draw_circle_lines(sx, sy, 18.0, 2.0, Color::new(0.0, 0.0, 0.0, 0.4));
+
+    // Name.
+    draw_text(&e.name, sx - 20.0, sy - 28.0, 18.0, WHITE);
+
+    if !alive {
+        draw_text("x_x", sx - 12.0, sy + 5.0, 18.0, LIGHTGRAY);
+        return;
+    }
+
+    // HP number in the token.
+    draw_text(&format!("{:.0}", e.hp), sx - 9.0, sy + 5.0, 16.0, WHITE);
+
+    let bw = 54.0;
+    let bh = 6.0;
+    let bx = sx - bw / 2.0;
+
+    // HP bar (above).
+    let hy = sy - 24.0;
+    draw_rectangle(bx, hy, bw, bh, Color::new(0.25, 0.05, 0.05, 1.0));
+    let hp_frac = (e.hp / e.max_hp).clamp(0.0, 1.0);
+    draw_rectangle(bx, hy, bw * hp_frac, bh, Color::new(0.35, 0.8, 0.4, 1.0));
+
+    // Action bar (below).
+    let ay = sy + 20.0;
+    draw_rectangle(bx, ay, bw, bh, Color::new(0.15, 0.15, 0.17, 1.0));
+    let ab = e.action_bar.clamp(0.0, 1.0);
+    draw_rectangle(bx, ay, bw * ab, bh, Color::new(0.95, 0.85, 0.3, 1.0));
+
+    // Compact status readout (e.g. "Poison x2").
+    if !e.statuses.is_empty() {
+        let s: Vec<String> = e
+            .statuses
+            .iter()
+            .map(|st| format!("{:?}x{}", st.kind, st.stacks))
+            .collect();
+        draw_text(&s.join(" "), bx, ay + 16.0, 14.0, Color::new(0.8, 0.7, 0.9, 1.0));
+    }
+}
+
+fn draw_log(log: &[String]) {
+    let x = screen_width() - LOG_W + 10.0;
+    draw_text("Combat log", x, 30.0, 22.0, WHITE);
+
+    let line_h = 18.0;
+    let top = 52.0;
+    let rows = ((screen_height() - top) / line_h) as usize;
+    let start = log.len().saturating_sub(rows);
+    let mut y = top;
+    for line in &log[start..] {
+        // Sub-events (damage/heal/etc.) are indented; dim them.
+        let color = if line.starts_with(' ') {
+            Color::new(0.7, 0.72, 0.75, 1.0)
+        } else if line.starts_with('*') {
+            Color::new(0.95, 0.85, 0.3, 1.0)
+        } else {
+            WHITE
+        };
+        draw_text(line, x, y, 16.0, color);
+        y += line_h;
+    }
+}
+
+fn draw_hud(combat: &Combat, paused: bool) {
+    let state = if combat.is_over() {
+        "OVER"
+    } else if paused {
+        "PAUSED"
+    } else {
+        "RUNNING"
+    };
+    let hud = format!(
+        "gambit  |  tick {}  [{}]   —   Space: pause · R: restart",
+        combat.time, state
+    );
+    draw_text(&hud, 20.0, 28.0, 22.0, WHITE);
+}
+
+// --- event formatting ------------------------------------------------------
+
+fn format_event(c: &Combat, ev: &Event) -> String {
+    let name = |id: EntityId| c.state.entity(id).name.clone();
+    let skill = |id: SkillId| c.state.skill(id).name.clone();
+    match ev {
+        Event::Acted { actor, skill: s, targets } => {
+            let ts: Vec<String> = targets.iter().map(|&t| name(t)).collect();
+            format!("{} -> {} @ {}", name(*actor), skill(*s), ts.join(", "))
+        }
+        Event::Waited(a) => format!("{} waits", name(*a)),
+        Event::Damage { target, amount, weakness } => {
+            let tag = if *weakness { " (weak!)" } else { "" };
+            format!("   {} -{amount:.0}{tag}", name(*target))
+        }
+        Event::Heal { target, amount } => format!("   {} +{amount:.0} hp", name(*target)),
+        Event::Inflicted { target, kind, stacks } => {
+            format!("   {} {kind:?} x{stacks}", name(*target))
+        }
+        Event::Died(t) => format!("   {} defeated", name(*t)),
+        Event::Victory(team) => format!("*** {team:?} wins ***"),
     }
 }

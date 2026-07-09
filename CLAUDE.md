@@ -8,8 +8,8 @@ Dragon Age: Origins tactics, but deliberately more modular.
 ## Tech
 
 - **Language:** Rust (edition 2024)
-- **Engine:** [Macroquad](https://macroquad.rs/) — 2D game framework. Not yet added to
-  `Cargo.toml`; add `macroquad` as a dependency when we start on rendering/input.
+- **Engine:** [Macroquad](https://macroquad.rs/) — 2D game framework (`macroquad = "0.4"`).
+  The combat *core* stays engine-agnostic; only `main.rs` (the viewer) touches Macroquad.
 
 ## Core principle: entities = equipment + rules
 
@@ -36,10 +36,13 @@ src/
   gambit.rs   The rule model: Node / Body / Condition / TargetQuery (a behaviour tree).
   eval.rs     decide(root, actor, state) -> Option<Action>: walk the tree. (unit tests)
   combat.rs   Combat: the ATB loop + action resolution. (unit tests)
-  main.rs     A runnable, Macroquad-free demo battle that prints an event log.
+  scenario.rs Hand-built demo battle (temporary, until real encounters exist).
+  main.rs     Macroquad viewer: steps Combat on a timer, draws HP/action bars + log.
 ```
 
-Run `cargo test` for the behaviour specs and `cargo run` for the demo battle.
+Run `cargo test` for the behaviour specs and `cargo run` for the live viewer
+(Space = pause, R = restart). Only `main.rs` depends on Macroquad; everything else is
+engine-agnostic and headless-testable.
 
 ## Combat loop (`combat.rs`)
 
@@ -268,9 +271,9 @@ pulls in pathfinding, line-of-sight, terrain data, and terrain rendering.
 
 - **`Pick::Random` is deterministic** (hashes actor + candidate set) to keep `decide()` pure.
   Swap for a seeded RNG threaded through `BattleState` when real randomness is wanted.
-- **No rendering yet.** Next step is the Macroquad layer: a window drawing entities + filling
-  action bars, stepping `Combat` on a timer. With terrain now in scope, the **view projection**
-  is an open choice — top-down with height cues (shading/outlines) vs. isometric/2.5D
-  (FFT-style). Isometric reads height best but is more art/render work.
+- **Rendering:** a basic top-down viewer exists (`main.rs`) for the flat, movement-free
+  combat. When terrain lands, the **view projection** is an open choice — top-down with height
+  cues (shading/outlines) vs. isometric/2.5D (FFT-style). Isometric reads height best but is
+  more art/render work.
 - **Terrain authoring is undecided** — how maps are defined (hand-authored data files, an
   in-engine editor, procedural). Not needed until we build the terrain layer.
