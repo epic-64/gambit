@@ -30,6 +30,12 @@ const SHIELD_REDUCTION: f32 = 0.5;
 const ENRAGE_BONUS: f32 = 0.5;
 /// Fraction of dealt damage an [`Effect::Drain`] returns to the actor as healing.
 pub const DRAIN_RATIO: f32 = 0.5;
+/// Extra damage an [`Effect::ExecuteDamage`] gains per fraction of the
+/// target's *missing* HP: 2.0 == +2% per 1% missing, so a full-HP target
+/// takes the base and one at death's door ~3×. Steep on purpose — HP pools
+/// are scaled up for battle length, and at the old 1:1 a "finisher" peaked
+/// barely above a basic swing.
+pub const EXECUTE_MISSING_MULT: f32 = 2.0;
 /// Extra damage a target with [`StatusKind::Exposed`] takes, from every source
 /// (0.1 == +10%; DoT pulses included — the multiplier lives on the target's
 /// side). Flat regardless of stacks, like `SHIELD_REDUCTION`.
@@ -913,11 +919,12 @@ impl Combat {
                     }
                 }
                 Effect::ExecuteDamage(base) => {
-                    // 1% more per 1% of the target's missing HP: Ã—1 at full
-                    // health up to Ã—2 at death's door. Scaled off HP *before*
-                    // this hit, then fed through the normal multiplier stack.
+                    // +EXECUTE_MISSING_MULT% per 1% of the target's missing
+                    // HP: x1 at full health up to x3 at death's door. Scaled
+                    // off HP *before* this hit, then fed through the normal
+                    // multiplier stack.
                     let missing = 1.0 - self.state.entity(target).hp_pct();
-                    let amount = base * (1.0 + missing.clamp(0.0, 1.0));
+                    let amount = base * (1.0 + EXECUTE_MISSING_MULT * missing.clamp(0.0, 1.0));
                     self.apply_damage(Some(actor), target, amount, skill.damage_type, events);
                 }
                 Effect::Drain(base) => {
@@ -2587,7 +2594,7 @@ mod tests {
                 _ => None,
             })
             .expect("a damage event");
-        assert_eq!(amount, 15.0, "10 base * (1 + 0.5 missing)");
+        assert_eq!(amount, 20.0, "10 base * (1 + 2.0 * 0.5 missing)");
     }
 
     /// A drain heals the actor for `DRAIN_RATIO` of the damage actually dealt.

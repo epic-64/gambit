@@ -519,10 +519,11 @@ pub fn skirmish() -> Combat {
             ],
         },
     );
-    // Assassin's finisher: +1% damage per 1% of the target's missing HP — the
-    // base of 10 grows toward 20 as the mark bleeds out. Cheap and quick so
-    // it's the kill-securing rhythm hit once a dive has done its work; the
-    // gambit gates it to already-hurt targets where the scaling actually pays.
+    // Assassin's finisher: +2% damage per 1% of the target's missing HP — the
+    // base of 10 grows toward 30 as the mark bleeds out (a real kill-securer
+    // against HP_SCALE'd pools; at the old +1%/1% it peaked at 20, barely a
+    // Bash). Cheap and quick so it's the rhythm hit once a dive has done its
+    // work; the gambit gates it to already-hurt targets where the scaling pays.
     let reap = push_skill(
         &mut skills,
         Skill {
@@ -1044,8 +1045,11 @@ pub fn skirmish() -> Combat {
                         .sort(SortKey::Hp, Order::Asc),
                     maim,
                 ),
-                // 0.7 is Reap's break-even vs Backstab (10 x 1.3 = 13 flat) —
-                // below that, the execute scaling wins.
+                // At 70% the execute already out-hits Backstab's flat 13
+                // (10 x 1.6 = 16) — but Backstab's poison rider is worth ~12
+                // more on a mark that lives to bleed, so the gate keeps Reap
+                // for targets the scaling genuinely finishes rather than
+                // making it the every-swing default.
                 Node::act(
                     TargetQuery::new(Pool::Enemies)
                         .filter(Filter::HpPctBelow(0.7))

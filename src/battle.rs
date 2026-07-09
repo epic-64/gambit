@@ -138,9 +138,10 @@ pub enum Effect {
     /// Raw damage; multiplied if the target is weak to the skill's `damage_type`.
     Damage(f32),
     /// Execute-style damage: the base is scaled up by the target's *missing* HP
-    /// fraction — 1% more damage per 1% missing, so a full-HP target takes the
-    /// base and one at death's door takes ~2×. The finisher's counterpart to
-    /// opener burst; weakness/enrage/shield multipliers apply on top.
+    /// fraction — [`crate::combat::EXECUTE_MISSING_MULT`]% more damage per 1%
+    /// missing, so a full-HP target takes the base and one at death's door
+    /// takes ~3×. The finisher's counterpart to opener burst;
+    /// weakness/enrage/shield multipliers apply on top.
     ExecuteDamage(f32),
     /// Damage the target and heal the *actor* for [`crate::combat::DRAIN_RATIO`]
     /// of the damage actually dealt (after all multipliers) — nothing comes back

@@ -176,7 +176,11 @@ pub fn describe_effect(e: &Effect) -> String {
     match e {
         Effect::Damage(x) => format!("deal {} damage", num(*x)),
         Effect::ExecuteDamage(x) => {
-            format!("execute: {} dmg, +1% per 1% missing hp", num(*x))
+            format!(
+                "execute: {} dmg, +{}% per 1% missing hp",
+                num(*x),
+                num(crate::combat::EXECUTE_MISSING_MULT)
+            )
         }
         Effect::Drain(x) => format!("drain {} hp (half heals self)", num(*x)),
         Effect::Heal(x) => format!("heal {}", num(*x)),
