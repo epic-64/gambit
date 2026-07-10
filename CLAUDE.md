@@ -45,8 +45,9 @@ src/
               A*-routed around terrain. (unit tests)
   combat.rs   Combat: the ATB loop + movement + cast-time state machine + action resolution. (unit tests)
   scenario.rs Hand-built demo battle + demo map (temporary, until real encounters exist).
-  main.rs     Macroquad viewer: steps Combat on a timer, draws terrain (elevation/walls/pits),
-              HP/action bars, movement + casting, log.
+  main.rs     Macroquad viewer: feeds real frame time to Combat::step and draws combat.state
+              verbatim — terrain (elevation/walls/pits), HP/action bars, movement + casting,
+              intent lines, log. No render-side interpolation.
 ```
 
 Run `cargo test` for the behaviour specs and `cargo run` for the live viewer
@@ -55,24 +56,41 @@ engine-agnostic and headless-testable.
 
 ## Combat loop (`combat.rs`)
 
-`Combat { state, gambits, move_gambits, casts, time }` drives a tick-based ATB battle.
-Each `tick()`:
+`Combat { state, gambits, move_gambits, casts, time }` drives an ATB battle in **continuous
+time measured in ticks**. `step(dt)` advances by a fractional tick; `tick()` = `step(1.0)` is
+the exact-stepping form tests use. The viewer feeds real frame time
+(`step(frame_seconds / TICK_INTERVAL)`) and draws `combat.state` verbatim — **the sim is the
+single source of truth for rendering; there is no render-side interpolation, prediction, or
+smoothing** (that layer existed once and caused sync bugs — don't reintroduce it; if something
+looks choppy, make the *sim* quantity continuous instead). Only transient event vfx
+(projectiles/pierce-beams) animate outside the sim.
 
-1. **Statuses:** apply DoT/regen (Poison/Burn damage, Regen heal — per stack, per tick), then
-   age every status and drop expired ones.
+**Continuous quantities** integrate over every `step` slice:
+
+- **Move:** every alive, non-casting entity drifts `move_speed·dt` along its `move_gambit`
+  (`decide_move`) — concurrent with the ATB, never move-*or*-act. Movement checks casting per
+  slice, so a caster roots the instant its cast starts and stays rooted through the boundary
+  the cast resolves on.
+- **Fill bars:** `action_bar += atb_speed·dt`, capped at `READY` (1.0). **Casting entities are
+  frozen** (bar stays put until the cast resolves), stunned ones too.
+- **MP regen:** `mp += mp_regen·dt`, capped at `max_mp`.
+
+Crossing a **whole-tick boundary** fires the discrete phases, in order:
+
+1. **Statuses:** apply DoT/regen pulses (Poison/Burn damage, Regen heal — per stack, per tick),
+   then age every status and drop expired ones.
 2. **Cooldowns:** decrement each entity's per-skill cooldowns.
-3. **Advance casts:** tick down each in-flight cast; a completed one resolves — re-validating
+3. **Resolve casts:** tick down each in-flight cast; a completed one resolves — re-validating
    its committed targets against the *current* world (alive + still in range) and **fizzling**
    if none survive. A caster that died mid-cast simply loses the cast.
-4. **Move:** every alive, non-casting entity drifts one `move_speed` step along its
-   `move_gambit` (`decide_move`) — continuous, concurrent with the ATB, never move-*or*-act.
-5. **Fill bars:** `action_bar += atb_speed`, capped at `READY` (1.0). **Casting entities are
-   frozen** (bar stays put until the cast resolves).
-6. **Act:** every non-casting entity with a full bar acts, fullest-bar-first (ties by id). For
+4. **Act:** every non-casting entity with a full bar acts, fullest-bar-first (ties by id). For
    each, `decide()` walks its gambit; on an `Action` the bar resets to 0 and MP + cooldown are
    committed immediately — an **instant** skill (`cast_time == 0`) resolves now, a **cast-time**
-   skill instead roots the actor into the `casts` map to resolve in a later tick (step 3). On
-   `None` the entity **waits** with its bar still full, re-evaluating next tick.
+   skill instead roots the actor into the `casts` map to resolve at a later boundary (step 3).
+   On `None` the entity **waits** with its bar still full, re-evaluating next boundary.
+
+All durations (cast times, cooldowns, status lifetimes, DoT cadence) stay authored in whole
+ticks — the boundary is the game's heartbeat; continuity is only for what the eye tracks.
 
 Battle ends when one whole team is dead; `run(max_ticks)` loops until then (the cap guards
 against stalemates). Every tick returns a `Vec<Event>` log (Acted / Waited / Damage / Heal /

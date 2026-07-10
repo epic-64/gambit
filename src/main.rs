@@ -18,12 +18,11 @@ mod nav;
 mod scenario;
 mod terrain;
 
-use std::collections::HashMap;
-
 use macroquad::prelude::*;
 
 use battle::{DamageType, Effect, Entity, EntityId, Pos, Skill, SkillId, Team, ENTITY_RADIUS};
 use combat::{Combat, Event};
+use eval::Pull;
 use terrain::{Terrain, Tile3};
 
 /// Seconds of real time per simulation tick.
@@ -41,33 +40,26 @@ const PIERCE_LIFE: f32 = 0.22;
 /// (Dash/Charge) are always melee — they close to contact before they hit.
 const MELEE_RANGE: f32 = 3.0;
 
+// Intent-line palette (toggled with I). Kept faint so the lines read as an
+// overlay under the tokens, and off the team colors so a red line means
+// "hunting this" rather than "is an enemy".
+/// Movement destination: the gambit's chosen stand point.
+const INTENT_GOAL: Color = Color::new(0.90, 0.90, 0.95, 0.30);
+/// A reference the mover is drawn toward (pursuit, standoff band, watching).
+const INTENT_TOWARD: Color = Color::new(1.00, 0.30, 0.30, 0.55);
+/// A reference the mover is pushed away from (flee, hide).
+const INTENT_AWAY: Color = Color::new(0.35, 0.85, 0.85, 0.55);
+/// A rooted caster's committed targets (matches the gold casting ring).
+const INTENT_CAST: Color = Color::new(0.95, 0.85, 0.30, 0.60);
+/// How far past a fleeing mover its "pushed away" stub extends (world units).
+const AWAY_STUB: f32 = 2.0;
+
 /// Arena size in world units. Taken from the running battle's bounds so
 /// differently-sized scenario maps all render to fit.
 type World = (f32, f32);
 
-/// A snapshot of the per-entity values the viewer animates, captured just before
-/// a tick so the draw pass can interpolate from the previous tick to the current
-/// one. The sim still advances in discrete `TICK_INTERVAL` steps; this only
-/// smooths what's *shown*, so nothing here touches the ATB or sim cadence.
-#[derive(Clone, Copy)]
-struct Snap {
-    pos: battle::Pos,
-    action_bar: f32,
-    hp: f32,
-    mp: f32,
-}
-
-impl Snap {
-    fn of(e: &Entity) -> Snap {
-        Snap { pos: e.pos, action_bar: e.action_bar, hp: e.hp, mp: e.mp }
-    }
-}
-
-/// Snapshot every entity's animated state, keyed by id.
-fn capture(combat: &Combat) -> HashMap<EntityId, Snap> {
-    combat.state.entities.iter().map(|e| (e.id, Snap::of(e))).collect()
-}
-
+/// Linear blend — used only by the event vfx (projectile flight), never to
+/// interpolate sim state: entities draw exactly where the sim says they are.
 fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
 }
@@ -164,11 +156,8 @@ async fn main() {
     let mut combat: Option<Combat> = None;
     let mut current = 0usize;
     let mut log: Vec<String> = Vec::new();
-    let mut acc = 0.0f32;
     let mut paused = false;
-    // State one tick behind the sim, so the draw pass can interpolate toward the
-    // current tick and render smoothly instead of jumping 4×/sec.
-    let mut prev: HashMap<EntityId, Snap> = HashMap::new();
+    let mut show_intent = true;
     // In-flight attack visuals (projectiles / pierce-beams), aged in real time.
     let mut vfx: Vec<Vfx> = Vec::new();
 
@@ -178,13 +167,10 @@ async fn main() {
                 // Number keys pick a scenario and drop into the battle.
                 for i in 0..scenarios.len() {
                     if digit_key(i).is_some_and(is_key_pressed) {
-                        let c = scenarios[i].1();
-                        prev = capture(&c);
-                        combat = Some(c);
+                        combat = Some(scenarios[i].1());
                         current = i;
                         log.clear();
                         vfx.clear();
-                        acc = 0.0;
                         paused = false;
                         screen = Screen::Playing;
                     }
@@ -199,37 +185,31 @@ async fn main() {
                     paused = !paused;
                 }
                 if is_key_pressed(KeyCode::R) {
-                    let c = scenarios[current].1();
-                    prev = capture(&c);
-                    combat = Some(c);
+                    combat = Some(scenarios[current].1());
                     log.clear();
                     vfx.clear();
-                    acc = 0.0;
                     paused = false;
                 }
                 if is_key_pressed(KeyCode::M) || is_key_pressed(KeyCode::Escape) {
                     screen = Screen::Menu;
+                }
+                if is_key_pressed(KeyCode::I) {
+                    show_intent = !show_intent;
                 }
 
                 let Some(combat) = combat.as_mut() else {
                     continue;
                 };
 
-                // --- update: step the sim on a fixed timer ---
+                // --- update: real frame time drives the sim directly ---
                 if !paused && !combat.is_over() {
-                    acc += get_frame_time();
-                    let mut steps = 0;
-                    while acc >= TICK_INTERVAL && steps < 4 {
-                        acc -= TICK_INTERVAL;
-                        steps += 1;
-                        // Remember the state entering this tick so the draw pass
-                        // can interpolate from it toward the post-tick state.
-                        prev = capture(combat);
-                        let events = combat.tick();
-                        for ev in &events {
-                            log.push(format_event(combat, ev));
-                            spawn_attack_vfx(combat, ev, &mut vfx);
-                        }
+                    // dt in tick units. A hitch (window drag, debugger pause) is
+                    // capped at one tick of sim time so the world never leaps.
+                    let dt = get_frame_time().min(TICK_INTERVAL) / TICK_INTERVAL;
+                    let events = combat.step(dt);
+                    for ev in &events {
+                        log.push(format_event(combat, ev));
+                        spawn_attack_vfx(combat, ev, &mut vfx);
                     }
                     // Keep the log from growing without bound.
                     const MAX_LOG: usize = 500;
@@ -253,17 +233,19 @@ async fn main() {
                 if let Some(t) = combat.state.terrain.as_ref() {
                     draw_terrain(world, t);
                 }
-                // Interpolate from the previous tick toward the current one so
-                // motion and bars read smoothly. Frozen when paused/over so the
-                // view reflects the true sim state.
-                let alpha = if paused || combat.is_over() {
-                    1.0
-                } else {
-                    (acc / TICK_INTERVAL).clamp(0.0, 1.0)
-                };
+                // Everything below draws combat.state directly — the sim is the
+                // single source of truth; nothing is interpolated or predicted.
+                // Intent lines go under the tokens: where each unit is heading
+                // and what it's positioning relative to (or casting at).
+                if show_intent {
+                    for e in &combat.state.entities {
+                        if e.is_alive() {
+                            draw_intent(world, e, combat);
+                        }
+                    }
+                }
                 for e in &combat.state.entities {
-                    let p = prev.get(&e.id).copied().unwrap_or_else(|| Snap::of(e));
-                    draw_entity(world, e, combat.is_casting(e.id), p, alpha);
+                    draw_entity(world, e, combat.is_casting(e.id));
                 }
                 // Attack visuals ride on top of the tokens.
                 for v in &vfx {
@@ -319,7 +301,7 @@ fn draw_menu(scenarios: &[(&'static str, fn() -> Combat)]) {
         Color::new(0.65, 0.68, 0.72, 1.0),
     );
     draw_text(
-        "In battle:  Space pause  ·  R restart  ·  M / Esc menu",
+        "In battle:  Space pause  ·  R restart  ·  I intent lines  ·  M / Esc menu",
         46.0,
         y + 54.0,
         20.0,
@@ -395,22 +377,8 @@ fn tile_color(t: Tile3) -> Color {
     }
 }
 
-fn draw_entity(world: World, e: &Entity, casting: bool, prev: Snap, alpha: f32) {
-    // Interpolated (rendered) values — the sim itself still lives at e.*.
-    let px = lerp(prev.pos.x, e.pos.x, alpha);
-    let py = lerp(prev.pos.y, e.pos.y, alpha);
-    let hp = lerp(prev.hp, e.hp, alpha);
-    let mp = lerp(prev.mp, e.mp, alpha);
-    // The sim fills a bar to full and spends it (back to 0) inside one tick, so
-    // snapshots never hold a full bar — lerping through a reset would drain the
-    // bar backwards without it ever topping out. Animate it filling to full
-    // instead; the snap down to the refill next tick reads as the action firing.
-    let action_bar = if e.action_bar < prev.action_bar {
-        lerp(prev.action_bar, 1.0, alpha)
-    } else {
-        lerp(prev.action_bar, e.action_bar, alpha)
-    };
-    let (sx, sy) = world_to_screen(world, px, py);
+fn draw_entity(world: World, e: &Entity, casting: bool) {
+    let (sx, sy) = world_to_screen(world, e.pos.x, e.pos.y);
     let alive = e.is_alive();
     // Draw the token at the shared collision radius, so overlaps (or the lack of
     // them) are visible. A small floor keeps it legible when zoomed out.
@@ -443,7 +411,7 @@ fn draw_entity(world: World, e: &Entity, casting: bool, prev: Snap, alpha: f32) 
     }
 
     // HP number in the token.
-    draw_text(&format!("{:.0}", hp), sx - 9.0, sy + 5.0, 16.0, WHITE);
+    draw_text(&format!("{:.0}", e.hp), sx - 9.0, sy + 5.0, 16.0, WHITE);
 
     let bw = 54.0;
     let bh = 6.0;
@@ -452,13 +420,13 @@ fn draw_entity(world: World, e: &Entity, casting: bool, prev: Snap, alpha: f32) 
     // HP bar (above the token).
     let hy = sy - r - 8.0;
     draw_rectangle(bx, hy, bw, bh, Color::new(0.25, 0.05, 0.05, 1.0));
-    let hp_frac = (hp / e.max_hp).clamp(0.0, 1.0);
+    let hp_frac = (e.hp / e.max_hp).clamp(0.0, 1.0);
     draw_rectangle(bx, hy, bw * hp_frac, bh, Color::new(0.35, 0.8, 0.4, 1.0));
 
     // Action bar (below the token).
     let ay = sy + r + 2.0;
     draw_rectangle(bx, ay, bw, bh, Color::new(0.15, 0.15, 0.17, 1.0));
-    let ab = action_bar.clamp(0.0, 1.0);
+    let ab = e.action_bar.clamp(0.0, 1.0);
     draw_rectangle(bx, ay, bw * ab, bh, Color::new(0.95, 0.85, 0.3, 1.0));
 
     // MP bar (thin, just under the action bar). Shows the resource skills spend
@@ -468,7 +436,7 @@ fn draw_entity(world: World, e: &Entity, casting: bool, prev: Snap, alpha: f32) 
     if e.max_mp > 0.0 {
         let mh = 4.0;
         draw_rectangle(bx, next_y, bw, mh, Color::new(0.06, 0.08, 0.16, 1.0));
-        let mp_frac = (mp / e.max_mp).clamp(0.0, 1.0);
+        let mp_frac = (e.mp / e.max_mp).clamp(0.0, 1.0);
         draw_rectangle(bx, next_y, bw * mp_frac, mh, Color::new(0.3, 0.6, 0.95, 1.0));
         next_y += mh + 2.0;
     }
@@ -481,6 +449,53 @@ fn draw_entity(world: World, e: &Entity, casting: bool, prev: Snap, alpha: f32) 
             .map(|st| format!("{:?}x{}", st.kind, st.stacks))
             .collect();
         draw_text(&s.join(" "), bx, next_y + 12.0, 14.0, Color::new(0.8, 0.7, 0.9, 1.0));
+    }
+}
+
+/// Draw one entity's *intent* — what it is trying to do before anything
+/// resolves. Movement intent is a chosen destination, not a target: the dim
+/// line + ring marks the stand point the gambit picked, and the colored lines
+/// show what it is positioning relative to (red = drawn toward, teal = pushed
+/// away — drawn from the threat *through* the mover so the flee reads as a
+/// push, not a pursuit). A rooted caster instead gets a gold line to each
+/// committed target. No lines at all = holding position by choice.
+fn draw_intent(world: World, e: &Entity, combat: &Combat) {
+    let (sx, sy) = world_to_screen(world, e.pos.x, e.pos.y);
+
+    // Casting: movement is suppressed, the committed targets are the intent.
+    if let Some(targets) = combat.cast_targets(e.id) {
+        for &t in targets {
+            let tp = combat.state.entity(t).pos;
+            let (tx, ty) = world_to_screen(world, tp.x, tp.y);
+            draw_line(sx, sy, tx, ty, 1.5, INTENT_CAST);
+        }
+        return;
+    }
+
+    let Some(intent) = combat.move_intent(e.id) else {
+        return;
+    };
+    // Where it's heading — always truthful, even for reference-free intents
+    // like seeking high ground.
+    let (gx, gy) = world_to_screen(world, intent.goal.x, intent.goal.y);
+    draw_line(sx, sy, gx, gy, 1.5, INTENT_GOAL);
+    draw_circle_lines(gx, gy, 4.0, 1.5, INTENT_GOAL);
+    // What it's positioning relative to.
+    for &(r, pull) in &intent.refs {
+        let (rx, ry) = world_to_screen(world, r.x, r.y);
+        match pull {
+            Pull::Toward => draw_line(sx, sy, rx, ry, 1.5, INTENT_TOWARD),
+            Pull::Away => {
+                let (dx, dy) = (e.pos.x - r.x, e.pos.y - r.y);
+                let len = (dx * dx + dy * dy).sqrt().max(f32::EPSILON);
+                let (ex, ey) = world_to_screen(
+                    world,
+                    e.pos.x + dx / len * AWAY_STUB,
+                    e.pos.y + dy / len * AWAY_STUB,
+                );
+                draw_line(rx, ry, ex, ey, 1.5, INTENT_AWAY);
+            }
+        }
     }
 }
 
@@ -563,7 +578,7 @@ fn draw_hud(combat: &Combat, paused: bool, scenario: &str) {
         "RUNNING"
     };
     let hud = format!(
-        "{scenario}  |  tick {}  [{}]   —   Space: pause · R: restart · M: menu",
+        "{scenario}  |  tick {}  [{}]   —   Space: pause · R: restart · I: intent · M: menu",
         combat.time, state
     );
     draw_text(&hud, 20.0, 28.0, 22.0, WHITE);

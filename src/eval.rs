@@ -70,6 +70,32 @@ const STICKINESS: f32 = 0.25;
 /// breaks ties rather than fighting real preferences.
 const TRAVEL_COST: f32 = 0.02;
 
+/// Whether a movement term pulls the mover *toward* its reference point or
+/// pushes it *away* — the distinction the viewer paints intent lines by. A
+/// negative weight flips a term's natural pull (e.g. negative `SightOf` =
+/// hide from it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pull {
+    Toward,
+    Away,
+}
+
+/// One movement decision with the *why* kept: where the mover is ultimately
+/// heading and which reference points it is steering relative to. The sim
+/// only consumes `step` (via [`decide_move`]); the rest exists for the
+/// viewer's intent lines.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MoveIntent {
+    /// The chosen stand point (the scoring argmax) — where the mover is heading.
+    pub goal: Pos,
+    /// This tick's one-`move_speed` step toward the goal (A\*-routed).
+    pub step: Pos,
+    /// Each active term's reference point, tagged by pull and deduplicated
+    /// (e.g. `Near` + `SightOf` of the same target is one entry). Empty when
+    /// only reference-free terms (`HighGround`) are active.
+    pub refs: Vec<(Pos, Pull)>,
+}
+
 /// Decide where `actor` drifts this tick from its movement gambit, independent
 /// of the action gambit. Scores every reachable candidate stand point as the
 /// gambit's weighted term sum and steers one `move_speed` step toward the
@@ -80,6 +106,19 @@ const TRAVEL_COST: f32 = 0.02;
 /// query matched anything to position against. Pure — mutation is the
 /// caller's job.
 pub fn decide_move(gambit: &MoveGambit, actor: EntityId, state: &BattleState) -> Option<Pos> {
+    move_intent(gambit, actor, state, 1.0).map(|i| i.step)
+}
+
+/// [`decide_move`] with the intent kept — goal, step and term references —
+/// and the step scaled to the tick-fraction `dt` that is elapsing (so the
+/// combat loop can integrate movement continuously). Returns `None` exactly
+/// when `decide_move` does: holding is "no intent".
+pub fn move_intent(
+    gambit: &MoveGambit,
+    actor: EntityId,
+    state: &BattleState,
+    dt: f32,
+) -> Option<MoveIntent> {
     // Resolve each term's reference point once — references are actor-relative
     // (the query engine), not candidate-relative. Movement stays rangeless &
     // sightless: the whole point is to *reach* a position, so references are
@@ -140,7 +179,24 @@ pub fn decide_move(gambit: &MoveGambit, actor: EntityId, state: &BattleState) ->
     if best_p == from {
         return None; // standing still is (still) the best option
     }
-    Some(nav_toward(actor, best_p, state))
+
+    let mut refs: Vec<(Pos, Pull)> = Vec::new();
+    for (term, w, reference) in &active {
+        let Some(r) = reference else { continue };
+        let toward = match term {
+            Term::AwayFrom(_) => *w < 0.0,
+            _ => *w >= 0.0,
+        };
+        let entry = (*r, if toward { Pull::Toward } else { Pull::Away });
+        if !refs.contains(&entry) {
+            refs.push(entry);
+        }
+    }
+    Some(MoveIntent {
+        goal: best_p,
+        step: nav_toward(actor, best_p, state, dt),
+        refs,
+    })
 }
 
 /// The stand points a mover considers this tick. With terrain: the reachable
@@ -213,11 +269,12 @@ fn step_point(from: Pos, aim: Pos, speed: f32, state: &BattleState) -> Pos {
 /// the actor's tile to the goal's and steer toward the next waypoint's centre;
 /// on a flat arena (or once in the goal tile) we aim straight at the precise
 /// point so melee can close exactly. Steering here is "follow the route"; the
-/// caller resolves fine contact and separation.
-fn nav_toward(actor: EntityId, point: Pos, state: &BattleState) -> Pos {
+/// caller resolves fine contact and separation. The step covers `dt` ticks'
+/// worth of `move_speed`.
+fn nav_toward(actor: EntityId, point: Pos, state: &BattleState, dt: f32) -> Pos {
     let a = state.entity(actor);
     let from = a.pos;
-    let speed = a.effective_move_speed();
+    let speed = a.effective_move_speed() * dt;
 
     if let Some(t) = state.terrain.as_ref() {
         let start = t.tile_of(from);
@@ -789,6 +846,32 @@ mod tests {
         // Gap already comfortable (>= saturation range): hold, don't corner-camp.
         w.ent(enemy).pos.x = 59.5; // 9.5 away
         assert_eq!(decide_move(&gambit, hero, &w.state), None);
+    }
+
+    /// The intent surface the viewer draws from: pursuit exposes its target
+    /// as a `Toward` reference and a goal that closes the gap; a flee exposes
+    /// the threat as an `Away` reference and a goal that opens it.
+    #[test]
+    fn move_intent_exposes_goal_and_refs() {
+        let mut w = World::new();
+        let hero = w.add("hero", Team::Player, 100.0, 50.0);
+        let enemy = w.add("enemy", Team::Enemy, 100.0, 60.0);
+        w.ent(hero).pos.y = 50.0;
+        w.ent(enemy).pos.y = 50.0;
+        w.ent(hero).move_speed = 1.0;
+        let target = w.state.entity(enemy).pos;
+        let from = w.state.entity(hero).pos;
+
+        let pursue = MoveGambit::toward(nearest_enemy());
+        let intent = move_intent(&pursue, hero, &w.state, 1.0).expect("should pursue");
+        assert_eq!(intent.refs, vec![(target, Pull::Toward)]);
+        assert!(intent.goal.dist(target) < from.dist(target), "goal closes the gap");
+        assert_eq!(Some(intent.step), decide_move(&pursue, hero, &w.state));
+
+        w.ent(enemy).pos.x = 53.0; // close threat
+        let flee = MoveGambit::new(vec![(Term::AwayFrom(nearest_enemy()), 1.0)]);
+        let intent = move_intent(&flee, hero, &w.state, 1.0).expect("should flee");
+        assert_eq!(intent.refs, vec![(w.state.entity(enemy).pos, Pull::Away)]);
     }
 
     /// A gambit whose every query matches nothing holds position rather than
