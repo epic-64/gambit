@@ -1,9 +1,9 @@
-//! The combat loop: an ATB (active-time-battle) driver in continuous time
+﻿//! The combat loop: an ATB (active-time-battle) driver in continuous time
 //! measured in ticks. `step(dt)` integrates the continuous quantities
 //! (movement, bar fill, MP regen) over any fraction of a tick and fires the
 //! discrete phases (statuses, cooldowns, cast resolution, gambit decisions
 //! via [`decide`]) on whole-tick boundaries; `tick()` = `step(1.0)`.
-//! Engine-agnostic — no Macroquad — so the whole fight is testable.
+//! Engine-agnostic â€” no Macroquad â€” so the whole fight is testable.
 
 use std::collections::HashMap;
 
@@ -23,19 +23,23 @@ const POISON_PER_STACK: f32 = 3.0;
 const BURN_PER_STACK: f32 = 5.0;
 const REGEN_PER_STACK: f32 = 4.0;
 /// Fraction of incoming damage a `Shield` status absorbs (flat, regardless of
-/// stacks — like `SNARE_SLOW`, magnitude isn't per-status yet).
+/// stacks â€” like `SNARE_SLOW`, magnitude isn't per-status yet).
 const SHIELD_REDUCTION: f32 = 0.5;
 /// Outgoing skill-damage bonus while the attacker is `Enrage`d. DoT pulses are
 /// unaffected (they have no attacker at pulse time).
 const ENRAGE_BONUS: f32 = 0.5;
 /// Fraction of dealt damage an [`Effect::Drain`] returns to the actor as healing.
 pub const DRAIN_RATIO: f32 = 0.5;
+/// Fraction of incoming healing a [`StatusKind::MortalWound`] on the recipient
+/// cuts away â€” every source (Heal, Regen pulse, aura drip, drain-return) is
+/// reduced alike. Flat regardless of stacks, like `SHIELD_REDUCTION`.
+pub const WOUND_HEAL_REDUCTION: f32 = 0.5;
 /// World-unit radius of every aura (see [`StatusKind::is_aura`]): teammates
 /// within this distance of a bearer get the aura's benefit, teammates outside
-/// don't. Uniform for now — one knob, like `ENTITY_RADIUS`.
+/// don't. Uniform for now â€” one knob, like `ENTITY_RADIUS`.
 pub const AURA_RADIUS: f32 = 6.0;
 /// HP a `RegenAura` restores per tick to each covered teammate. Deliberately
-/// weak next to a Heal (38) or Regen stacks (4/stack) — steady drip, not triage.
+/// weak next to a Heal (38) or Regen stacks (4/stack) â€” steady drip, not triage.
 /// Tune with care: it multiplies across the whole covered team, so it's
 /// effectively another fraction of a healer (1.5 here once let the red team
 /// sweep the skirmish without a single loss). Continuous (integrates over
@@ -44,17 +48,17 @@ const AURA_REGEN_PER_TICK: f32 = 0.75;
 /// Outgoing damage bonus for attackers covered by a teammate's `MightAura`.
 const AURA_MIGHT_BONUS: f32 = 0.05;
 /// A hit at or under this distance lands immediately (you're in contact);
-/// anything farther is a projectile that has to *travel* — its effects apply
+/// anything farther is a projectile that has to *travel* â€” its effects apply
 /// on impact, not at fire. Per shot, not per skill: a long-range skill fired
 /// point-blank still connects instantly.
 pub const MELEE_RANGE: f32 = 3.0;
 /// World units a projectile flies per tick (homing on its target).
 const PROJECTILE_SPEED: f32 = 12.0;
-/// World units a gap-closer travels per tick — a fast, visible lunge, not a
+/// World units a gap-closer travels per tick â€” a fast, visible lunge, not a
 /// teleport. Well above any `move_speed`, so a dash always catches its mark.
 const DASH_SPEED: f32 = 8.0;
 
-/// Something that happened during a tick — a log for tests and (later) the UI.
+/// Something that happened during a tick â€” a log for tests and (later) the UI.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
     Acted {
@@ -70,7 +74,7 @@ pub enum Event {
         amount: f32,
         weakness: bool,
         /// The element the hit carried (None for untyped hits and DoT pulses).
-        /// Purely informational — weakness is already resolved into `amount`.
+        /// Purely informational â€” weakness is already resolved into `amount`.
         dmg_type: Option<DamageType>,
     },
     Heal {
@@ -78,7 +82,7 @@ pub enum Event {
         amount: f32,
     },
     /// A spell ward on `bearer` ate an incoming damage spell and re-cast it at
-    /// `attacker` — the rebound's own Damage/Inflicted events follow. The ward
+    /// `attacker` â€” the rebound's own Damage/Inflicted events follow. The ward
     /// charge is already consumed at this point.
     Reflected {
         bearer: EntityId,
@@ -106,7 +110,7 @@ pub enum Event {
         target: EntityId,
     },
     /// MP was stolen from the target (already credited to the drainer). Only
-    /// emitted when something was actually taken — a dry pool drains nothing.
+    /// emitted when something was actually taken â€” a dry pool drains nothing.
     MpDrained {
         target: EntityId,
         amount: f32,
@@ -138,7 +142,7 @@ struct Cast {
 }
 
 /// A fired attack in flight: it homes on its committed target at
-/// [`PROJECTILE_SPEED`] and the skill's effects land on impact — damage is a
+/// [`PROJECTILE_SPEED`] and the skill's effects land on impact â€” damage is a
 /// consequence of the hit *arriving*, never of the trigger pull. Its `pos` is
 /// sim state; the viewer draws it directly.
 pub struct Flight {
@@ -149,7 +153,7 @@ pub struct Flight {
 }
 
 /// A gap-closer in progress: the actor lunges at its primary target at
-/// [`DASH_SPEED`] (continuous — not a teleport), and the skill's effects land
+/// [`DASH_SPEED`] (continuous â€” not a teleport), and the skill's effects land
 /// at contact. `budget` is the travel allowance left (the `Effect::Dash` max);
 /// exhausting it delivers the hit from wherever the lunge ended.
 struct DashRun {
@@ -179,7 +183,7 @@ pub struct Combat {
     move_intents: HashMap<EntityId, MoveIntent>,
     /// Whole-tick boundaries crossed so far.
     pub time: u32,
-    /// Fractional progress (0..1) toward the next tick boundary — the
+    /// Fractional progress (0..1) toward the next tick boundary â€” the
     /// accumulator `step` integrates continuous phases against.
     frac: f32,
     over: bool,
@@ -221,7 +225,7 @@ impl Combat {
         self.casts.get(&id).map(|c| c.remaining)
     }
 
-    /// The committed targets of `id`'s in-flight cast, if any — the cast's
+    /// The committed targets of `id`'s in-flight cast, if any â€” the cast's
     /// intent, drawn by the viewer while the caster is rooted.
     pub fn cast_targets(&self, id: EntityId) -> Option<&[EntityId]> {
         self.casts.get(&id).map(|c| c.action.targets.as_slice())
@@ -233,7 +237,7 @@ impl Combat {
         self.move_intents.get(&id)
     }
 
-    /// Projectiles currently in the air — sim state the viewer draws directly.
+    /// Projectiles currently in the air â€” sim state the viewer draws directly.
     pub fn flights(&self) -> &[Flight] {
         &self.flights
     }
@@ -261,7 +265,7 @@ impl Combat {
         log
     }
 
-    /// Advance the simulation by exactly one whole tick — the unit all
+    /// Advance the simulation by exactly one whole tick â€” the unit all
     /// durations (cast times, cooldowns, statuses, per-tick DoT) are authored
     /// in. Equivalent to `step(1.0)`; tests use this for exact, reproducible
     /// stepping.
@@ -269,7 +273,7 @@ impl Combat {
         self.step(1.0)
     }
 
-    /// Advance the simulation by `dt` *ticks* — fractions welcome; the viewer
+    /// Advance the simulation by `dt` *ticks* â€” fractions welcome; the viewer
     /// passes real frame time scaled by its tick interval. The sim is the
     /// single source of truth for rendering (the viewer draws `state`
     /// verbatim), so smoothness lives *here*, not in the renderer:
@@ -297,7 +301,7 @@ impl Combat {
     /// The between-boundaries phases, each scaled by the tick-fraction `dt`
     /// that elapsed: drift movement, dash lunges, projectile flight, action-bar
     /// fill, and MP regen. Dash contacts and projectile impacts deliver their
-    /// effects *here*, mid-slice — landing is a moment in continuous time.
+    /// effects *here*, mid-slice â€” landing is a moment in continuous time.
     fn advance_continuous(&mut self, dt: f32, events: &mut Vec<Event>) {
         // Movement integrates before each boundary, so a caster stays rooted
         // through the tick its cast resolves on ("rooted until it resolves")
@@ -326,7 +330,7 @@ impl Combat {
 
     /// Regen-aura upkeep: every living entity covered by a teammate's
     /// `RegenAura` (see [`covered_by_aura`]) recovers `AURA_REGEN_PER_TICK`,
-    /// scaled by the slice. Continuous like MP regen — a steady drip the HP
+    /// scaled by the slice. Continuous like MP regen â€” a steady drip the HP
     /// bar shows directly, with no per-pulse events to spam the log. Coverage
     /// is sampled per slice, so drifting out of the radius cuts the drip that
     /// instant.
@@ -349,7 +353,13 @@ impl Combat {
                 .iter()
                 .any(|&(team, pos)| team == e.team && pos.dist(e.pos) <= AURA_RADIUS);
             if covered {
-                e.hp = (e.hp + AURA_REGEN_PER_TICK * dt).min(e.max_hp);
+                // The aura drip is healing too â€” a MortalWound cuts it alike.
+                let mult = if e.status(StatusKind::MortalWound).is_some() {
+                    1.0 - WOUND_HEAL_REDUCTION
+                } else {
+                    1.0
+                };
+                e.hp = (e.hp + AURA_REGEN_PER_TICK * mult * dt).min(e.max_hp);
             }
         }
     }
@@ -404,14 +414,14 @@ impl Combat {
             match decision {
                 Some(action) => {
                     let skill = self.state.skill(action.skill).clone();
-                    // Acting breaks stealth: committing to any action — an
-                    // instant or a cast start — reveals a sneaking actor.
+                    // Acting breaks stealth: committing to any action â€” an
+                    // instant or a cast start â€” reveals a sneaking actor.
                     // (A sneak skill re-applies its status a moment later,
                     // when its own effects resolve.)
                     self.state.entities[actor.0]
                         .statuses
                         .retain(|s| s.kind != StatusKind::Sneak);
-                    // Spend the turn and commit MP + cooldown up front — this is
+                    // Spend the turn and commit MP + cooldown up front â€” this is
                     // "commit at cast start" for cast-time skills.
                     self.commit_cost(actor, action.skill, &skill);
                     self.state.entities[actor.0].action_bar = 0.0;
@@ -432,7 +442,7 @@ impl Combat {
                         );
                     } else {
                         // Instant: the *decision* resolves now, but the effects
-                        // land when the attack does — immediately at point-blank,
+                        // land when the attack does â€” immediately at point-blank,
                         // on impact for a projectile, at contact for a dash.
                         events.push(Event::Acted {
                             actor,
@@ -455,7 +465,7 @@ impl Combat {
     /// Drift every alive, non-casting entity along its movement gambit, scaled
     /// by the tick-fraction `dt`.
     fn tick_movement(&mut self, dt: f32) {
-        // Intents describe *this* slice's movement only — stale ones (a mover
+        // Intents describe *this* slice's movement only â€” stale ones (a mover
         // that died, started casting, or now holds) must not linger.
         self.move_intents.clear();
         let movers: Vec<EntityId> = self
@@ -475,7 +485,22 @@ impl Combat {
         for id in movers {
             if let Some(gambit) = self.move_gambits.get(&id) {
                 if let Some(intent) = eval::move_intent(gambit, id, &self.state, dt) {
-                    let resolved = self.resolve_collisions(id, intent.step);
+                    let from = self.state.entity(id).pos;
+                    let mut resolved = self.resolve_collisions(id, intent.step);
+                    // A step eaten by a body merely standing *in the way*
+                    // slides along that body's tangent instead of halting, so
+                    // a unit shoulders past a scrum toward its goal. Movers
+                    // still stop at their actual quarry (see
+                    // [`slide_around_block`]) â€” this only unblocks through
+                    // traffic.
+                    if resolved.dist(from) < 0.25 * from.dist(intent.step)
+                        && let Some(d) = self.slide_around_block(id, intent.step, intent.goal)
+                    {
+                        let slid = self.resolve_collisions(id, d);
+                        if slid.dist(from) > resolved.dist(from) {
+                            resolved = slid;
+                        }
+                    }
                     self.state.entities[id.0].pos = resolved;
                     self.move_intents.insert(id, intent);
                 }
@@ -483,12 +508,69 @@ impl Combat {
         }
     }
 
+    /// When a drift step stalls against another unit's body, find the
+    /// tangential detour around it. `step_dest` is the blocked one-slice step,
+    /// `goal` the stand point the mover is ultimately heading for. Returns a
+    /// slide destination, or `None` when halting is the *correct* outcome:
+    /// nothing is actually in front, or the blocker is the mover's own quarry
+    /// (the goal sits on its body â€” you stop at what you're hunting, you slide
+    /// around what's merely in the way).
+    fn slide_around_block(&self, mover: EntityId, step_dest: Pos, goal: Pos) -> Option<Pos> {
+        let from = self.state.entity(mover).pos;
+        let (vx, vy) = (step_dest.x - from.x, step_dest.y - from.y);
+        let vlen = (vx * vx + vy * vy).sqrt();
+        if vlen <= f32::EPSILON {
+            return None;
+        }
+        let min_dist = 2.0 * ENTITY_RADIUS;
+        // The body in the way: the nearest other unit ahead of the motion and
+        // close enough for this step to have run into it.
+        let blocker = self
+            .state
+            .living()
+            .filter(|&o| o != mover)
+            .map(|o| self.state.entity(o).pos)
+            .filter(|bp| {
+                (bp.x - from.x) * vx + (bp.y - from.y) * vy > 0.0
+                    && from.dist(*bp) <= min_dist + vlen + 1e-3
+            })
+            .min_by(|a, b| from.dist(*a).total_cmp(&from.dist(*b)))?;
+        if goal.dist(blocker) <= min_dist {
+            return None; // the blocker IS the destination â€” halt at contact
+        }
+        let (mut nx, mut ny) = (from.x - blocker.x, from.y - blocker.y);
+        let nlen = (nx * nx + ny * ny).sqrt();
+        if nlen <= f32::EPSILON {
+            return None;
+        }
+        nx /= nlen;
+        ny /= nlen;
+        // Keep the motion's component along the contact tangent, at full step
+        // length. Dead-aligned motion (no tangent component) deflects to
+        // whichever side leads toward the goal.
+        let dot = vx * nx + vy * ny;
+        let (mut tx, mut ty) = (vx - dot * nx, vy - dot * ny);
+        let tlen = (tx * tx + ty * ty).sqrt();
+        if tlen <= vlen * 0.05 {
+            let (px, py) = (-ny, nx);
+            let side = (goal.x - from.x) * px + (goal.y - from.y) * py;
+            let s = if side >= 0.0 { 1.0 } else { -1.0 };
+            (tx, ty) = (px * s, py * s);
+        } else {
+            (tx, ty) = (tx / tlen, ty / tlen);
+        }
+        Some(Pos {
+            x: from.x + tx * vlen,
+            y: from.y + ty * vlen,
+        })
+    }
+
     /// Radius-aware separation for a moving entity: keep its circle inside the
     /// arena and out of every other living entity's circle. Only the mover is
     /// displaced (movers are resolved one at a time, in id order), so this is
     /// order-stable and always terminates. A few relaxation passes settle the
     /// common case of touching several neighbours at once. This is the "don't
-    /// obliviously stack on top of each other" sanity — true steering/avoidance
+    /// obliviously stack on top of each other" sanity â€” true steering/avoidance
     /// arrives with the terrain layer.
     fn resolve_collisions(&self, mover: EntityId, dest: Pos) -> Pos {
         let r = ENTITY_RADIUS;
@@ -540,7 +622,7 @@ impl Combat {
 
         // Terrain backstop (the implicit "don't walk into a wall" sanity): if
         // entity separation shoved the mover onto an impassable tile or across a
-        // cliff, hold at the start position instead — `from` was valid. A* and
+        // cliff, hold at the start position instead â€” `from` was valid. A* and
         // the flee/steer step already avoid walls; this only catches the rare
         // push-into-wall case, so a plain hold is enough (no re-search needed).
         if let Some(t) = self.state.terrain.as_ref()
@@ -557,7 +639,7 @@ impl Combat {
         let mut completed: Vec<(EntityId, Action)> = Vec::new();
         for id in casting {
             if !self.state.entity(id).is_alive() {
-                self.casts.remove(&id); // caster died mid-cast — the cast is lost
+                self.casts.remove(&id); // caster died mid-cast â€” the cast is lost
                 continue;
             }
             let cast = self.casts.get_mut(&id).unwrap();
@@ -608,7 +690,7 @@ impl Combat {
 
     // --- resolution ------------------------------------------------------
 
-    /// Pay a skill's MP cost and start its cooldown. Done at action time —
+    /// Pay a skill's MP cost and start its cooldown. Done at action time â€”
     /// which for a cast-time skill is *cast start*, not resolution.
     fn commit_cost(&mut self, actor: EntityId, skill_id: SkillId, skill: &Skill) {
         let a = &mut self.state.entities[actor.0];
@@ -622,7 +704,7 @@ impl Combat {
     /// target beyond [`MELEE_RANGE`] gets a projectile spawned at the actor;
     /// a point-blank target takes the effects immediately. Cost/cooldown are
     /// paid separately (see [`commit_cost`]) so cast completions don't pay
-    /// twice. Damage/heal/status land when the attack *arrives* — the sim owns
+    /// twice. Damage/heal/status land when the attack *arrives* â€” the sim owns
     /// impact timing; the viewer just draws it.
     fn deliver(&mut self, actor: EntityId, action: Action, skill: &Skill, events: &mut Vec<Event>) {
         let dash_max = skill.effects.iter().find_map(|e| match e {
@@ -650,7 +732,7 @@ impl Combat {
     }
 
     /// Advance every dash lunge by `dt` ticks' worth of [`DASH_SPEED`]: chase
-    /// the target's *current* position (straight-line — a lunge is committed,
+    /// the target's *current* position (straight-line â€” a lunge is committed,
     /// not routed), and deliver the skill's effects at contact or when the
     /// travel budget runs out. A dash whose target dies mid-lunge fizzles;
     /// a stunned dasher is held mid-lunge until the stun wears off.
@@ -698,7 +780,7 @@ impl Combat {
             let run = self.dashes.get_mut(&id).unwrap();
             run.budget -= step;
             // Budget always shrinks by the intended step, so a lunge blocked by
-            // a wall or a body still terminates — the hit lands from wherever
+            // a wall or a body still terminates â€” the hit lands from wherever
             // the lunge ended, exactly like an out-of-budget one.
             if arrives || run.budget <= f32::EPSILON {
                 let run = self.dashes.remove(&id).unwrap();
@@ -726,7 +808,7 @@ impl Combat {
                 let f = &self.flights[i];
                 (f.target, f.pos)
             };
-            // Sneaking does NOT shake a projectile already in the air —
+            // Sneaking does NOT shake a projectile already in the air â€”
             // stealth blocks new targeting, not physics (invisibility, not
             // invulnerability). Only death fizzles a flight.
             if !self.state.entity(target).is_alive() {
@@ -752,7 +834,7 @@ impl Combat {
         }
     }
 
-    /// Apply a skill's per-target effects (damage/heal/status) to one target —
+    /// Apply a skill's per-target effects (damage/heal/status) to one target â€”
     /// the moment an attack lands. `actor` is whoever landed the hit (for
     /// enrage scaling and drain return). `Effect::Dash` is actor-centric and
     /// handled by the dash run, never here.
@@ -774,7 +856,7 @@ impl Combat {
                 Effect::ChainDamage { base, jumps, falloff, jump_range } => {
                     // Full damage on the primary target, then arc: each jump
                     // strikes the nearest not-yet-struck foe within range and
-                    // sight of the *last victim*, at falloff× the previous hit.
+                    // sight of the *last victim*, at falloffÃ— the previous hit.
                     // Nearest-first with ties broken by entity order keeps the
                     // arc path deterministic.
                     let mut amount = *base;
@@ -795,7 +877,7 @@ impl Combat {
                                     && from_pos.dist(e.pos) <= *jump_range
                                     && self.state.line_of_sight(from_pos, e.pos)
                                 // No visibility check: an arc is loose energy,
-                                // not aimed targeting — it finds a sneaking
+                                // not aimed targeting â€” it finds a sneaking
                                 // foe just fine (invisibility, not
                                 // invulnerability).
                             })
@@ -819,15 +901,15 @@ impl Combat {
                     }
                 }
                 Effect::ExecuteDamage(base) => {
-                    // 1% more per 1% of the target's missing HP: ×1 at full
-                    // health up to ×2 at death's door. Scaled off HP *before*
+                    // 1% more per 1% of the target's missing HP: Ã—1 at full
+                    // health up to Ã—2 at death's door. Scaled off HP *before*
                     // this hit, then fed through the normal multiplier stack.
                     let missing = 1.0 - self.state.entity(target).hp_pct();
                     let amount = base * (1.0 + missing.clamp(0.0, 1.0));
                     self.apply_damage(Some(actor), target, amount, skill.damage_type, events);
                 }
                 Effect::Drain(base) => {
-                    // Heal back a cut of what actually landed — a resisted or
+                    // Heal back a cut of what actually landed â€” a resisted or
                     // shielded hit returns less, a dead-target hit nothing.
                     let dealt =
                         self.apply_damage(Some(actor), target, *base, skill.damage_type, events);
@@ -861,7 +943,7 @@ impl Combat {
 
     /// The `SpellWard` parry: if a hostile damage *spell* (elemental,
     /// non-physical damage type) lands on a warded target, burn one ward
-    /// charge and re-cast the whole skill from the bearer at the attacker —
+    /// charge and re-cast the whole skill from the bearer at the attacker â€”
     /// so a reflected chain arcs on through the attacker's side, a reflected
     /// drain feeds the bearer, and any status riders land on the caster.
     /// Returns true if the hit was consumed. A warded attacker bounces the
@@ -938,19 +1020,50 @@ impl Combat {
             * if weak { WEAKNESS_MULT } else { 1.0 }
             * if shielded { 1.0 - SHIELD_REDUCTION } else { 1.0 };
         e.hp = (e.hp - amount).max(0.0);
+        let died = !e.is_alive();
         events.push(Event::Damage {
             target,
             amount,
             weakness: weak,
             dmg_type,
         });
-        if !e.is_alive() {
+        if died {
             events.push(Event::Died(target));
+            // A kill refreshes the killer's stealth (see
+            // [`reset_stealth_cooldowns`]). DoT deaths have no killer at pulse
+            // time (`source` is None), so a poison bleed-out refreshes nothing.
+            if let Some(killer) = source {
+                self.reset_stealth_cooldowns(killer);
+            }
         }
         amount
     }
 
-    /// Whether `id` sits inside a living teammate's aura of the given kind —
+    /// The assassin-genre kill reset: every skill the killer knows that grants
+    /// [`StatusKind::Sneak`] comes off cooldown immediately. Keyed on the
+    /// *skill's effect*, never on an entity type â€” any unit equipping a
+    /// stealth skill gets the reset (like `is_aura`, a rule of the status
+    /// itself).
+    fn reset_stealth_cooldowns(&mut self, killer: EntityId) {
+        let refreshed: Vec<SkillId> = self.state.entities[killer.0]
+            .skills
+            .iter()
+            .copied()
+            .filter(|&sid| {
+                self.state.skill(sid).effects.iter().any(|e| {
+                    matches!(
+                        e,
+                        Effect::Inflict { kind: StatusKind::Sneak, .. }
+                    )
+                })
+            })
+            .collect();
+        for sid in refreshed {
+            self.state.entities[killer.0].cooldowns.remove(&sid);
+        }
+    }
+
+    /// Whether `id` sits inside a living teammate's aura of the given kind â€”
     /// distance measured at *this* instant (bearer included: its own aura
     /// always covers it). Multiple bearers don't stack; coverage is coverage.
     fn covered_by_aura(&self, id: EntityId, kind: StatusKind) -> bool {
@@ -982,6 +1095,13 @@ impl Combat {
         if !e.is_alive() {
             return;
         }
+        // A grievous wound cuts what actually arrives; the event reports the
+        // reduced amount (what the bar really gained).
+        let amount = if e.status(StatusKind::MortalWound).is_some() {
+            amount * (1.0 - WOUND_HEAL_REDUCTION)
+        } else {
+            amount
+        };
         e.hp = (e.hp + amount).min(e.max_hp);
         events.push(Event::Heal { target, amount });
     }
@@ -1003,7 +1123,7 @@ impl Combat {
         if kind.is_aura() {
             e.statuses.retain(|s| s.kind == kind || !s.kind.is_aura());
         }
-        // Stack onto an existing status of the same kind, refreshing duration —
+        // Stack onto an existing status of the same kind, refreshing duration â€”
         // except auras, which refresh without stacking (re-singing the same
         // chant sustains the field, it doesn't intensify it).
         if let Some(s) = e.statuses.iter_mut().find(|s| s.kind == kind) {
@@ -1069,7 +1189,7 @@ impl Combat {
 
     /// Regenerate MP: every alive entity recovers its `mp_regen` per tick, capped
     /// at `max_mp`. This is what keeps a costed skill (e.g. a healer's mend) from
-    /// permanently drying up — and the hook future MP-drain / regen-aura effects
+    /// permanently drying up â€” and the hook future MP-drain / regen-aura effects
     /// will push against. Casting units regen too (a cast doesn't stop the clock).
     fn tick_mp(&mut self, dt: f32) {
         for e in &mut self.state.entities {
@@ -1237,6 +1357,240 @@ mod tests {
         assert_eq!(dmg.0, 30.0); // 20 * 1.5
     }
 
+    /// Regression for the ogre-parked-in-the-void bug: with a `Crowd` +
+    /// `Near(nearest)` blend, a mover amid *spread-out* foes (no crowd
+    /// anywhere) commits to the nearest one instead of idling at their empty
+    /// centroid with nobody in reach.
+    #[test]
+    fn crowd_mover_commits_to_a_foe_instead_of_the_empty_middle() {
+        let mut a = Arena::new();
+        let mover = a.add_at("mover", Team::Player, 100.0, 0.0, 23.0, 1.0);
+        let near_foe = a.add_at("near_foe", Team::Enemy, 100.0, 0.0, 10.0, 0.0);
+        let far_a = a.add_at("far_a", Team::Enemy, 100.0, 0.0, 30.0, 0.0);
+        let far_b = a.add_at("far_b", Team::Enemy, 100.0, 0.0, 30.0, 0.0);
+        a.ent(mover).pos.y = 30.0; // â‰ˆ the trio's centroid
+        a.ent(near_foe).pos.y = 30.0;
+        a.ent(far_a).pos.y = 12.0;
+        a.ent(far_b).pos.y = 48.0;
+        a.move_gambit(
+            mover,
+            MoveGambit::new(vec![
+                (Term::Crowd(TargetQuery::new(Pool::Enemies).pick(Pick::All), 5.0), 2.5),
+                (
+                    Term::Near(
+                        TargetQuery::new(Pool::Enemies).sort(SortKey::Distance, Order::Asc),
+                        0.0,
+                    ),
+                    1.0,
+                ),
+            ]),
+        );
+        let mut combat = a.into_combat();
+
+        combat.run(40);
+
+        let m = combat.state.entity(mover).pos;
+        let closest = combat.state.entity(near_foe).pos;
+        assert!(
+            m.dist(closest) < 2.2,
+            "should stand beside the nearest foe, not at the empty middle: {m:?}"
+        );
+    }
+
+    /// The other half of the blend: a *clump* within reach outscores a nearer
+    /// loner, so the mover wades into the pack â€” where a 360Â° sweep pays â€”
+    /// rather than duelling at the edge.
+    #[test]
+    fn crowd_mover_prefers_the_clump_over_a_nearer_loner() {
+        let mut a = Arena::new();
+        let mover = a.add_at("mover", Team::Player, 100.0, 0.0, 20.0, 1.0);
+        let loner = a.add_at("loner", Team::Enemy, 100.0, 0.0, 16.0, 0.0);
+        let c1 = a.add_at("c1", Team::Enemy, 100.0, 0.0, 26.0, 0.0);
+        let c2 = a.add_at("c2", Team::Enemy, 100.0, 0.0, 27.0, 0.0);
+        let c3 = a.add_at("c3", Team::Enemy, 100.0, 0.0, 27.0, 0.0);
+        for id in [mover, loner, c1] {
+            a.ent(id).pos.y = 30.0;
+        }
+        a.ent(c2).pos.y = 29.0;
+        a.ent(c3).pos.y = 31.0;
+        a.move_gambit(
+            mover,
+            MoveGambit::new(vec![
+                (Term::Crowd(TargetQuery::new(Pool::Enemies).pick(Pick::All), 5.0), 2.5),
+                (
+                    Term::Near(
+                        TargetQuery::new(Pool::Enemies).sort(SortKey::Distance, Order::Asc),
+                        0.0,
+                    ),
+                    1.0,
+                ),
+            ]),
+        );
+        let mut combat = a.into_combat();
+
+        combat.run(40);
+
+        let m = combat.state.entity(mover).pos;
+        assert!(
+            m.dist(combat.state.entity(c1).pos) < 2.5,
+            "should wade to the clump, got {m:?}"
+        );
+        assert!(
+            m.dist(combat.state.entity(loner).pos) > 5.0,
+            "not duel the nearer loner, got {m:?}"
+        );
+    }
+
+    /// A mover whose path is blocked by a body merely standing in the way
+    /// slides around it and carries on â€” no more bodyblock pin. It still
+    /// stops at contact with its actual quarry.
+    #[test]
+    fn mover_slides_around_a_body_in_the_way() {
+        let mut a = Arena::new();
+        let mover = a.add_at("mover", Team::Player, 100.0, 0.0, 0.0, 1.0);
+        let bystander = a.add_at("bystander", Team::Player, 100.0, 0.0, 3.0, 0.0);
+        let quarry = a.add_at("quarry", Team::Enemy, 100.0, 0.0, 10.0, 0.0);
+        a.ent(mover).pos.y = 5.0;
+        a.ent(bystander).pos.y = 5.0; // dead on the line to the quarry
+        a.ent(quarry).pos.y = 5.0;
+        a.move_gambit(
+            mover,
+            MoveGambit::toward(TargetQuery::new(Pool::Enemies).sort(SortKey::Distance, Order::Asc)),
+        );
+        let mut combat = a.into_combat();
+
+        combat.run(30);
+
+        let m = combat.state.entity(mover).pos;
+        assert!(
+            m.x > 4.0,
+            "the mover should round the bystander instead of pinning on it, got {m:?}"
+        );
+        // It carries on to the quarry and settles beside it (the lattice
+        // argmax can park a fraction shy of exact contact), never inside it.
+        let sep = m.dist(combat.state.entity(quarry).pos);
+        let contact = 2.0 * ENTITY_RADIUS;
+        assert!(
+            (contact - 1e-3..2.0).contains(&sep),
+            "should end beside its quarry, got {sep}"
+        );
+    }
+
+    /// A grievous wound halves incoming healing while it lasts, and healing
+    /// returns to full strength once it expires.
+    #[test]
+    fn mortal_wound_halves_incoming_healing() {
+        let mut a = Arena::new();
+        let healer = a.add("healer", Team::Player, 100.0, 1.0);
+        let patient = a.add("patient", Team::Player, 100.0, 0.0);
+        let _foe = a.add("foe", Team::Enemy, 100.0, 0.0); // keeps the battle live
+        a.ent(patient).hp = 20.0;
+        a.ent(patient).statuses.push(Status {
+            kind: StatusKind::MortalWound,
+            stacks: 1,
+            duration: 2,
+        });
+        let mend = a.skill(Skill {
+            name: "Mend".into(),
+            cost: 0,
+            range: 100.0,
+            cooldown: 2,
+            cast_time: 0,
+            damage_type: None,
+            effects: vec![Effect::Heal(40.0)],
+        });
+        a.gambit(
+            healer,
+            Node::act(
+                TargetQuery::new(Pool::Allies).filter(Filter::HpPctBelow(0.9)),
+                mend,
+            ),
+        );
+        let mut combat = a.into_combat();
+
+        let log = combat.tick(); // heal lands through the wound
+        let healed = log.iter().find_map(|e| match e {
+            Event::Heal { amount, .. } => Some(*amount),
+            _ => None,
+        });
+        assert_eq!(healed, Some(20.0), "the wound halves the mend");
+        assert_eq!(combat.state.entity(patient).hp, 40.0);
+
+        combat.tick(); // wound expires; cooldown runs
+        combat.tick(); // second mend at full strength
+        assert_eq!(combat.state.entity(patient).hp, 80.0, "20 + 20 halved + 40 full");
+    }
+
+    /// A kill refreshes stealth: the killer's Sneak-granting skill comes off
+    /// cooldown the moment its hit fells an enemy.
+    #[test]
+    fn a_kill_resets_the_killers_sneak_cooldown() {
+        let mut a = Arena::new();
+        let rogue = a.add("rogue", Team::Player, 100.0, 1.0);
+        let victim = a.add("victim", Team::Enemy, 10.0, 0.0);
+        let vanish = a.skill(Skill {
+            name: "Vanish".into(),
+            cost: 0,
+            range: 100.0,
+            cooldown: 80,
+            cast_time: 0,
+            damage_type: None,
+            effects: vec![Effect::Inflict {
+                kind: StatusKind::Sneak,
+                stacks: 1,
+                duration: 20,
+            }],
+        });
+        let hit = a.skill(damage_skill("Hit", 20.0, None, 0));
+        a.ent(rogue).skills = vec![vanish, hit];
+        a.ent(rogue).cooldowns.insert(vanish, 50); // deep mid-cooldown
+        a.gambit(rogue, Node::act(TargetQuery::new(Pool::Enemies), hit));
+        let mut combat = a.into_combat();
+
+        let log = combat.tick(); // the hit kills the 10-HP victim
+
+        assert!(log.contains(&Event::Died(victim)));
+        assert_eq!(
+            combat.state.entity(rogue).cooldown_remaining(vanish),
+            0,
+            "the kill should hand Sneak straight back"
+        );
+    }
+
+    /// A 360Â° point-blank AoE (`Pick::All` + short range): every foe inside
+    /// the reach takes the hit in the same action; one outside is untouched.
+    #[test]
+    fn aoe_hits_everyone_in_reach_at_once() {
+        let mut a = Arena::new();
+        let ogre = a.add("ogre", Team::Player, 100.0, 1.0);
+        let near_east = a.add_at("near_east", Team::Enemy, 100.0, 0.0, 2.0, 0.0);
+        let near_west = a.add_at("near_west", Team::Enemy, 100.0, 0.0, 1.0, 0.0);
+        let far = a.add_at("far", Team::Enemy, 100.0, 0.0, 10.0, 0.0);
+        let rend = a.skill(Skill {
+            name: "Rend".into(),
+            cost: 0,
+            range: 3.0,
+            cooldown: 40,
+            cast_time: 0,
+            damage_type: None,
+            effects: vec![Effect::Damage(14.0)],
+        });
+        a.gambit(ogre, Node::act(TargetQuery::new(Pool::Enemies).pick(Pick::All), rend));
+        let mut combat = a.into_combat();
+
+        let log = combat.tick();
+
+        assert_eq!(combat.state.entity(near_east).hp, 86.0);
+        assert_eq!(combat.state.entity(near_west).hp, 86.0);
+        assert_eq!(combat.state.entity(far).hp, 100.0, "out of the sweep's reach");
+        let both_at_once = log.iter().any(|e| matches!(
+            e,
+            Event::Acted { targets, .. }
+                if targets.contains(&near_east) && targets.contains(&near_west)
+        ));
+        assert!(both_at_once, "one action, every foe in reach");
+    }
+
     /// A sneaking entity doesn't exist to hostile targeting: an enemy with a
     /// ready attack simply waits (nothing visible to hit), and takes nothing.
     #[test]
@@ -1285,7 +1639,7 @@ mod tests {
     }
 
     /// Invisibility, not invulnerability: sneaking does not shake a projectile
-    /// that is already in the air — it still homes in and lands.
+    /// that is already in the air â€” it still homes in and lands.
     #[test]
     fn sneak_does_not_dodge_a_projectile_in_the_air() {
         let mut a = Arena::new();
@@ -1313,7 +1667,7 @@ mod tests {
     }
 
     /// Sneaking mid-cast dodges the committed nuke: the resolving cast finds
-    /// its mark vanished and fizzles — unlike a projectile, nothing has
+    /// its mark vanished and fizzles â€” unlike a projectile, nothing has
     /// launched yet.
     #[test]
     fn sneaking_mid_cast_fizzles_the_committed_nuke() {
@@ -1340,7 +1694,7 @@ mod tests {
             duration: 10,
         });
         combat.tick();
-        let log = combat.tick(); // cast completes — into thin air
+        let log = combat.tick(); // cast completes â€” into thin air
 
         assert!(
             log.iter().any(|e| matches!(e, Event::Fizzled { actor, .. } if *actor == caster)),
@@ -1351,7 +1705,7 @@ mod tests {
 
     /// A spell ward eats the next hostile damage spell and hurls it back: the
     /// bearer takes nothing, the caster takes its own hit, the charge is
-    /// consumed — and the next spell lands normally.
+    /// consumed â€” and the next spell lands normally.
     #[test]
     fn spell_ward_reflects_one_damage_spell() {
         let mut a = Arena::new();
@@ -1579,7 +1933,7 @@ mod tests {
     }
 
     /// A unit with a movement gambit but too short a range drifts into melee
-    /// over several ticks and only then lands a hit — movement and the action
+    /// over several ticks and only then lands a hit â€” movement and the action
     /// bar advance concurrently, never one instead of the other.
     #[test]
     fn movement_closes_into_melee_range() {
@@ -1653,7 +2007,7 @@ mod tests {
         assert!(m.x < b.x, "mover should stop before the blocker, not pass it");
     }
 
-    /// A unit fleeing to the arena edge keeps its whole body in — its centre
+    /// A unit fleeing to the arena edge keeps its whole body in â€” its centre
     /// stops a radius short of the wall, never past it.
     #[test]
     fn movement_keeps_body_inside_bounds() {
@@ -1674,7 +2028,7 @@ mod tests {
         let mut combat = a.into_combat();
         combat.run(20);
 
-        // Fled west into the wall region: the radius keeps the whole body in —
+        // Fled west into the wall region: the radius keeps the whole body in â€”
         // both coordinates sit at least a radius from every edge.
         let p = combat.state.entity(runner).pos;
         assert!(p.x < 5.0, "runner should have fled away from the chaser, x = {}", p.x);
@@ -1725,7 +2079,7 @@ mod tests {
     }
 
     /// Casting roots a unit that would otherwise drift: no movement from the
-    /// tick after the cast begins through — and including — the tick it
+    /// tick after the cast begins through â€” and including â€” the tick it
     /// resolves on. (The drift on the start tick itself is fine: it happened
     /// before the actor's bar fired.)
     #[test]
@@ -1757,7 +2111,7 @@ mod tests {
         assert!(combat.is_casting(caster));
         assert_eq!(combat.state.entity(caster).pos, rooted_at);
 
-        combat.tick(); // resolves this tick — still no drift
+        combat.tick(); // resolves this tick â€” still no drift
         assert!(!combat.is_casting(caster));
         assert_eq!(combat.flights().len(), 1, "the nuke is on its way to the far target");
         assert_eq!(
@@ -1771,7 +2125,7 @@ mod tests {
     }
 
     /// If every committed target becomes invalid mid-cast (here: killed by an
-    /// ally), the cast fizzles instead of resolving — the interrupt/counterplay.
+    /// ally), the cast fizzles instead of resolving â€” the interrupt/counterplay.
     #[test]
     fn cast_fizzles_when_target_dies_midcast() {
         let mut a = Arena::new();
@@ -1807,7 +2161,7 @@ mod tests {
             e,
             Event::Fizzled { actor, skill } if *actor == caster && *skill == nuke
         )));
-        // The dead victim never absorbed the nuke's 50 damage — only the 20s.
+        // The dead victim never absorbed the nuke's 50 damage â€” only the 20s.
         assert!(!log.iter().any(|e| matches!(
             e,
             Event::Damage { target, amount, .. } if *target == victim && *amount == 50.0
@@ -1815,7 +2169,7 @@ mod tests {
     }
 
     /// A mover routes *around* an impassable wall (down through a gap and back
-    /// up) to reach a target it couldn't walk to in a straight line — the payoff
+    /// up) to reach a target it couldn't walk to in a straight line â€” the payoff
     /// of A\* over pure steering, which would jam into the wall and stop.
     #[test]
     fn pathfinding_routes_around_a_wall() {
@@ -1829,7 +2183,7 @@ mod tests {
         a.ent(mover).pos.y = 0.5;
         a.ent(target).pos.y = 0.5;
 
-        // 6×3 grid; wall at column 3 across rows 0..=1, leaving row 2 open.
+        // 6Ã—3 grid; wall at column 3 across rows 0..=1, leaving row 2 open.
         let mut terrain = Terrain::flat(6, 3, 1.0);
         for r in 0..=1 {
             terrain.set(3, r, Tile3 { elevation: 4, passable: false });
@@ -1924,7 +2278,7 @@ mod tests {
         let sep = combat.state.entity(hero).pos.dist(combat.state.entity(enemy).pos);
         let contact = 2.0 * ENTITY_RADIUS;
         assert!((sep - contact).abs() < 1e-3, "should stop at contact, sep = {sep}");
-        // The hit and the stun both landed — at contact, not at commit.
+        // The hit and the stun both landed â€” at contact, not at commit.
         assert_eq!(combat.state.entity(enemy).hp, 85.0);
         assert!(combat.state.entity(enemy).is_stunned());
     }
@@ -1951,7 +2305,7 @@ mod tests {
         a.gambit(hero, Node::act(TargetQuery::new(Pool::Enemies), dash));
 
         let mut combat = a.into_combat();
-        combat.tick(); // commit — still at the start
+        combat.tick(); // commit â€” still at the start
         assert_eq!(combat.state.entity(hero).pos.x, 0.0);
 
         combat.tick(); // one tick of DASH_SPEED: 12-unit gap not yet closed
@@ -1997,12 +2351,12 @@ mod tests {
         assert_eq!(combat.state.entity(mark).hp, 100.0, "still in the air");
         assert_eq!(combat.flights().len(), 1);
 
-        combat.tick(); // within reach — impact
+        combat.tick(); // within reach â€” impact
         assert!(combat.flights().is_empty());
         assert_eq!(combat.state.entity(mark).hp, 90.0, "landed");
     }
 
-    /// A point-blank hit (inside MELEE_RANGE) is contact — it lands the moment
+    /// A point-blank hit (inside MELEE_RANGE) is contact â€” it lands the moment
     /// the actor acts, with no flight involved.
     #[test]
     fn point_blank_hits_land_immediately() {
@@ -2019,7 +2373,7 @@ mod tests {
         assert_eq!(combat.state.entity(enemy).hp, 90.0);
     }
 
-    /// A stunned unit can neither act nor move, and its action bar is frozen —
+    /// A stunned unit can neither act nor move, and its action bar is frozen â€”
     /// until the stun expires, after which it behaves normally again.
     #[test]
     fn stun_freezes_action_and_movement() {
@@ -2057,7 +2411,7 @@ mod tests {
     }
 
     /// MP regenerates each tick up to `max_mp`, and a costed skill becomes
-    /// feasible again once enough has recovered — so a healer that spent itself
+    /// feasible again once enough has recovered â€” so a healer that spent itself
     /// dry starts healing again instead of falling through to its plink forever.
     #[test]
     fn mp_regenerates_and_reenables_a_costed_skill() {
@@ -2092,7 +2446,7 @@ mod tests {
         );
 
         let mut combat = a.into_combat();
-        // Tick 1: only 5 MP (+3 regen = 8) — still under 10, so it plinks.
+        // Tick 1: only 5 MP (+3 regen = 8) â€” still under 10, so it plinks.
         let log = combat.tick();
         assert!(log.iter().any(|e| matches!(e, Event::Acted { skill, .. } if *skill == plink)));
         assert!(combat.state.entity(hero).mp < 10.0);
@@ -2121,7 +2475,7 @@ mod tests {
     }
 
     /// Execute damage scales with the target's *missing* HP: +1% per 1% missing,
-    /// so a half-dead target takes 1.5× the base and a full-HP one just the base.
+    /// so a half-dead target takes 1.5Ã— the base and a full-HP one just the base.
     #[test]
     fn execute_damage_scales_with_missing_hp() {
         let mut a = Arena::new();
@@ -2192,7 +2546,7 @@ mod tests {
         assert_eq!(combat.state.entity(tank).hp, 90.0, "20 halved to 10 by the shield");
     }
 
-    /// An enraged attacker deals `1 + ENRAGE_BONUS` times damage — and the bonus
+    /// An enraged attacker deals `1 + ENRAGE_BONUS` times damage â€” and the bonus
     /// stacks multiplicatively with a weakness hit.
     #[test]
     fn enrage_boosts_outgoing_damage() {
@@ -2296,7 +2650,7 @@ mod tests {
         assert_eq!(combat.state.entity(ally2).hp, 70.0);
     }
 
-    /// A regen aura drips HP to teammates inside its radius — and only those:
+    /// A regen aura drips HP to teammates inside its radius â€” and only those:
     /// an ally beyond `AURA_RADIUS` and an enemy standing right in the field
     /// both get nothing.
     #[test]
@@ -2320,7 +2674,7 @@ mod tests {
         assert_eq!(hp(foe), 50.0, "enemies never benefit");
     }
 
-    /// A might aura scales an attacker's damage by 5% — but only while the
+    /// A might aura scales an attacker's damage by 5% â€” but only while the
     /// attacker stands inside the field.
     #[test]
     fn might_aura_boosts_allies_inside_the_radius_only() {
@@ -2346,7 +2700,7 @@ mod tests {
         }
     }
 
-    /// An entity holds one aura at a time — a new chant replaces the old — and
+    /// An entity holds one aura at a time â€” a new chant replaces the old â€” and
     /// re-singing the same chant refreshes its duration without stacking.
     #[test]
     fn one_aura_at_a_time_and_no_aura_stacking() {
@@ -2382,7 +2736,7 @@ mod tests {
         combat.tick(); // sings Life Chant
         assert!(combat.state.entity(chanter).status(StatusKind::RegenAura).is_some());
 
-        combat.tick(); // sings War Chant — which must displace the regen aura
+        combat.tick(); // sings War Chant â€” which must displace the regen aura
         let e = combat.state.entity(chanter);
         assert!(e.status(StatusKind::RegenAura).is_none(), "one aura at a time");
         assert!(e.status(StatusKind::MightAura).is_some());
@@ -2391,7 +2745,7 @@ mod tests {
         assert_eq!(combat.state.entity(chanter).status_stacks(StatusKind::MightAura), 1);
     }
 
-    /// An MP drain steals up to its amount — capped by what the target has —
+    /// An MP drain steals up to its amount â€” capped by what the target has â€”
     /// and credits it to the actor.
     #[test]
     fn drain_mp_steals_capped_by_the_targets_pool() {

@@ -59,6 +59,11 @@ pub enum StatusKind {
     /// A movement slow: cuts the victim's `move_speed` by [`SNARE_SLOW`] while it
     /// lasts. It can still act — only its drift is throttled (the anti-kite tool).
     Snare,
+    /// Grievous wound: incoming healing on the bearer is cut by
+    /// [`crate::combat::WOUND_HEAL_REDUCTION`] while it lasts — Heals, Regen
+    /// pulses, aura drip and drain-return alike. The anti-sustain tool that
+    /// makes a healer-backed target killable; cleansable like any harm.
+    MortalWound,
     /// Spell counter: each stack is a charge that eats the next hostile damage
     /// *spell* (elemental, non-physical damage) to land on the bearer and
     /// re-casts it at the attacker instead (see `combat::try_reflect`). The
@@ -102,6 +107,7 @@ impl StatusKind {
                 | StatusKind::Silence
                 | StatusKind::Stun
                 | StatusKind::Snare
+                | StatusKind::MortalWound
         )
     }
 }

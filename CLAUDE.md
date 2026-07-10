@@ -280,10 +280,12 @@ positional-scoring terms — see the revised bullet below) drive continuous drif
   inside `bounds` (`clamp_within`) and pushes the mover out of any other unit's circle to
   just-touching (only the mover is displaced; movers resolve one at a time in id order, so it's
   deterministic and terminating). This is the "don't obliviously stack up / walk off the map"
-  spatial sanity — the always-on, never hand-authored kind. **True steering / local avoidance**
-  (sliding around obstacles rather than just stopping at contact) is deliberately deferred to the
-  terrain layer, which brings A* + steering; today a blocked mover simply halts at the contact
-  point.
+  spatial sanity — the always-on, never hand-authored kind. **Body avoidance is a tangent slide**
+  (`combat::slide_around_block`): a drift step eaten by a unit merely standing *in the way*
+  redirects along that body's contact tangent (dead-aligned motion deflects toward the goal
+  side), so units shoulder past a scrum instead of pinning at first contact — but a mover whose
+  *goal* sits on the blocker (its actual quarry) still halts at contact, and dash lunges stay
+  straight-line committed. Added when a bodyblocking brawler could permanently pin the ogre.
 - **Cast-time / rooting.** Some skills have `cast_time > 0` (ticks). Selecting one puts the
   unit in a **Casting** state: rooted (movement suppressed — "stand still"), ATB not filling,
   not re-deciding, until it resolves. Idle drifts, Casting stands still — one small state

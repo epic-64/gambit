@@ -254,13 +254,22 @@ pub enum Term {
     /// weight; blind ones score zero. A *negative* weight turns this into
     /// "hide from the target" (break line-of-sight) for free.
     SightOf(TargetQuery),
+    /// Sum, over *every* entity the query selects, of a linear proximity
+    /// kernel: 1 at a body, fading to 0 at the given radius. A stand point
+    /// touching several of them outscores one near a single body, and the
+    /// empty midpoint between spread-out references scores *nothing* — unlike
+    /// `Near` on a `Pick::All` query, whose centroid reference is exactly
+    /// such a midpoint. "Be amid the crowd, when there is one." Pair it with
+    /// a `Near(nearest)` pull for the long-range gradient the bounded kernel
+    /// lacks.
+    Crowd(TargetQuery, f32),
 }
 
 impl Term {
     /// The query this term selects its reference entity from, if it has one.
     pub fn query(&self) -> Option<&TargetQuery> {
         match self {
-            Term::Near(q, _) | Term::AwayFrom(q) | Term::SightOf(q) => Some(q),
+            Term::Near(q, _) | Term::AwayFrom(q) | Term::SightOf(q) | Term::Crowd(q, _) => Some(q),
             Term::HighGround => None,
         }
     }

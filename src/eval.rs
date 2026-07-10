@@ -119,20 +119,23 @@ pub fn move_intent(
     state: &BattleState,
     dt: f32,
 ) -> Option<MoveIntent> {
-    // Resolve each term's reference point once — references are actor-relative
+    // Resolve each term's references once — references are actor-relative
     // (the query engine), not candidate-relative. Movement stays rangeless &
     // sightless: the whole point is to *reach* a position, so references are
     // never pre-filtered by range or LoS. Terms whose query matches nothing
     // drop out; if everything drops, there is nothing to position against.
-    let active: Vec<(&Term, f32, Option<Pos>)> = gambit
+    // Point-terms (`Near`/`AwayFrom`/`SightOf`) collapse their matches to the
+    // centroid; `Crowd` keeps the full set (its kernel sums over every body).
+    let active: Vec<(&Term, f32, Vec<Pos>, Option<Pos>)> = gambit
         .terms
         .iter()
         .filter_map(|(term, weight)| match term.query() {
             Some(q) => {
                 let refs = select(q, actor, state, &[], None);
-                centroid(&refs, state).map(|point| (term, *weight, Some(point)))
+                let pts: Vec<Pos> = refs.iter().map(|&id| state.entity(id).pos).collect();
+                centroid(&refs, state).map(|point| (term, *weight, pts, Some(point)))
             }
-            None => Some((term, *weight, None)),
+            None => Some((term, *weight, Vec::new(), None)),
         })
         .collect();
     if active.is_empty() {
@@ -141,7 +144,7 @@ pub fn move_intent(
 
     let score = |p: Pos| -> f32 {
         let mut total = 0.0;
-        for (term, w, reference) in &active {
+        for (term, w, pts, reference) in &active {
             let s = match term {
                 Term::Near(_, ideal) => {
                     let Some(r) = reference else { continue };
@@ -156,6 +159,10 @@ pub fn move_intent(
                     let Some(r) = reference else { continue };
                     if state.line_of_sight(p, *r) { 1.0 } else { 0.0 }
                 }
+                Term::Crowd(_, radius) => pts
+                    .iter()
+                    .map(|r| (1.0 - p.dist(*r) / radius).max(0.0))
+                    .sum::<f32>(),
             };
             total += w * s;
         }
@@ -181,15 +188,23 @@ pub fn move_intent(
     }
 
     let mut refs: Vec<(Pos, Pull)> = Vec::new();
-    for (term, w, reference) in &active {
-        let Some(r) = reference else { continue };
+    for (term, w, pts, reference) in &active {
         let toward = match term {
             Term::AwayFrom(_) => *w < 0.0,
             _ => *w >= 0.0,
         };
-        let entry = (*r, if toward { Pull::Toward } else { Pull::Away });
-        if !refs.contains(&entry) {
-            refs.push(entry);
+        let pull = if toward { Pull::Toward } else { Pull::Away };
+        // A crowd term is pulled by each body, not their (possibly empty)
+        // midpoint — show every one.
+        let term_refs: &[Pos] = match term {
+            Term::Crowd(..) => pts,
+            _ => reference.as_slice(),
+        };
+        for r in term_refs {
+            let entry = (*r, pull);
+            if !refs.contains(&entry) {
+                refs.push(entry);
+            }
         }
     }
     Some(MoveIntent {
