@@ -48,6 +48,9 @@ pub enum Event {
         target: EntityId,
         amount: f32,
         weakness: bool,
+        /// The element the hit carried (None for untyped hits and DoT pulses).
+        /// Purely informational — weakness is already resolved into `amount`.
+        dmg_type: Option<DamageType>,
     },
     Heal {
         target: EntityId,
@@ -691,6 +694,7 @@ impl Combat {
             target,
             amount,
             weakness: weak,
+            dmg_type,
         });
         if !e.is_alive() {
             events.push(Event::Died(target));
