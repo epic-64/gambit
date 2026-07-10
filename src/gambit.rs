@@ -46,6 +46,14 @@ pub enum Filter {
     WeakTo(DamageType),
     IsSelf,
     NotSelf,
+    /// The candidate is visible to the actor across the terrain. Redundant for a
+    /// skill's own targets (line-of-sight is already an implicit feasibility
+    /// check) but useful in *conditions* — e.g. "flee if an enemy that can see me
+    /// exists". Always true on a flat, terrain-free arena.
+    HasLineOfSight,
+    /// The candidate stands on higher ground than the actor. Never true when
+    /// flat. Its negation (`Not(OnHigherGround)`) covers "same-or-lower ground".
+    OnHigherGround,
     Not(Box<Filter>),
 }
 
@@ -56,6 +64,9 @@ pub enum SortKey {
     MaxHp,
     /// Distance from the actor.
     Distance,
+    /// Ground elevation the candidate stands on. `Order::Desc` prefers the
+    /// high-ground target. Flat everywhere on a terrain-free arena.
+    Elevation,
     StatusStacks(StatusKind),
 }
 
@@ -207,20 +218,36 @@ pub struct Node {
 #[derive(Debug, Clone)]
 pub enum MoveIntent {
     /// Drift toward the selected target (stops on arrival — never overshoots).
+    /// Routes around terrain obstacles via A\*.
     Toward(TargetQuery),
-    /// Drift directly away from the selected target.
+    /// Drift directly away from the selected target, sliding along walls rather
+    /// than jamming into them.
     Away(TargetQuery),
+    /// Seek the highest reachable tile that still has line-of-sight to the
+    /// selected target — "get to the high ground and keep the shot". A terrain
+    /// intent: on a flat arena there is no high ground, so it holds. (See
+    /// CLAUDE.md — the payoff that makes terrain worth its cost.)
+    SeekHighGround(TargetQuery),
+    /// Move to the nearest reachable tile that *breaks* line-of-sight to the
+    /// selected threat — duck behind cover. Holds on a flat arena.
+    BreakLoS(TargetQuery),
 }
 
 impl MoveIntent {
     /// The query this intent selects its reference entity from.
     pub fn query(&self) -> &TargetQuery {
         match self {
-            MoveIntent::Toward(q) | MoveIntent::Away(q) => q,
+            MoveIntent::Toward(q)
+            | MoveIntent::Away(q)
+            | MoveIntent::SeekHighGround(q)
+            | MoveIntent::BreakLoS(q) => q,
         }
     }
 
-    /// True for `Toward`, false for `Away`.
+    /// True for intents that close on their reference (`Toward`), false for the
+    /// ones that retreat from it (`Away`). The tile-seeking intents resolve to a
+    /// tile goal rather than a straight toward/away drift, so they are handled
+    /// explicitly by the movement evaluator and don't use this.
     pub fn is_toward(&self) -> bool {
         matches!(self, MoveIntent::Toward(_))
     }

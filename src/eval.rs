@@ -10,8 +10,11 @@ use std::cmp::Ordering;
 
 use crate::battle::{BattleState, EntityId, Pos, SkillId};
 use crate::gambit::{
-    Body, Condition, Filter, GroupMode, MoveRule, Node, Order, Pick, Pool, SortKey, TargetQuery,
+    Body, Condition, Filter, GroupMode, MoveIntent, MoveRule, Node, Order, Pick, Pool, SortKey,
+    TargetQuery,
 };
+use crate::nav;
+use crate::terrain::Tile;
 
 /// The action a character commits to for this turn.
 #[derive(Debug, Clone, PartialEq)]
@@ -56,13 +59,23 @@ pub fn decide_move(gambit: &[MoveRule], actor: EntityId, state: &BattleState) ->
         if !passed {
             continue;
         }
-        // Movement is rangeless: the whole point is to *reach* range, so we
-        // don't pre-filter the reference set by any skill's range.
+        // Movement is rangeless & sightless: the whole point is to *reach* a
+        // position, so we don't pre-filter the reference set by range or LoS.
         let refs = select(rule.intent.query(), actor, state, &matched, None);
         let Some(point) = centroid(&refs, state) else {
             continue; // nothing to move relative to — try the next rule
         };
-        return Some(step(rule.intent.is_toward(), actor, point, state));
+        let dest = match &rule.intent {
+            MoveIntent::Toward(_) => Some(nav_toward(actor, point, state)),
+            MoveIntent::Away(_) => Some(flee(actor, point, state)),
+            // Tile-seeking intents can decline (no better tile / flat arena);
+            // then we fall through to the next rule rather than forcing a hold.
+            MoveIntent::SeekHighGround(_) => seek_high_ground(actor, point, state),
+            MoveIntent::BreakLoS(_) => break_los(actor, point, state),
+        };
+        if let Some(dest) = dest {
+            return Some(dest);
+        }
     }
     None
 }
@@ -83,40 +96,152 @@ fn centroid(ids: &[EntityId], state: &BattleState) -> Option<Pos> {
     Some(Pos { x: x / n, y: y / n })
 }
 
-/// One `move_speed` step toward or away from `point`, bounds-clamped. Toward
-/// never overshoots (stops on arrival); away always advances a full step.
-fn step(toward: bool, actor: EntityId, point: Pos, state: &BattleState) -> Pos {
+/// Reachable-tile search radius (A\* cost units ≈ tiles) for the tile-seeking
+/// movement intents. Bounds the per-tick neighbourhood scan.
+const TILE_SEEK_RADIUS: f32 = 8.0;
+
+/// One `move_speed` step from `from` toward `aim`, never overshooting it, then
+/// bounds-clamped. Entity-vs-entity separation and the terrain backstop are the
+/// caller's job (`combat::resolve_collisions`); here we only clamp the point.
+fn step_point(from: Pos, aim: Pos, speed: f32, state: &BattleState) -> Pos {
+    let (dx, dy) = (aim.x - from.x, aim.y - from.y);
+    let dist = (dx * dx + dy * dy).sqrt();
+    let dest = if dist <= speed || dist <= f32::EPSILON {
+        aim
+    } else {
+        Pos { x: from.x + dx / dist * speed, y: from.y + dy / dist * speed }
+    };
+    state.clamp_pos(dest)
+}
+
+/// Close on `point`, routing around terrain obstacles. With terrain we A\* from
+/// the actor's tile to the goal's and steer toward the next waypoint's centre;
+/// on a flat arena (or once in the goal tile) we aim straight at the precise
+/// point so melee can close exactly. Steering here is "follow the route"; the
+/// caller resolves fine contact and separation.
+fn nav_toward(actor: EntityId, point: Pos, state: &BattleState) -> Pos {
     let a = state.entity(actor);
     let from = a.pos;
     let speed = a.move_speed;
 
-    let (mut dx, mut dy) = (point.x - from.x, point.y - from.y);
-    if !toward {
-        dx = -dx;
-        dy = -dy;
+    if let Some(t) = state.terrain.as_ref() {
+        let start = t.tile_of(from);
+        let goal = t.tile_of(point);
+        // Cap the step at the next waypoint's centre so we stay on the routed
+        // tiles instead of cutting the corner into a wall. If we're already in the
+        // goal tile or there's no route (walled off), fall through to a straight
+        // nudge — the collision backstop keeps the mover out of the wall.
+        if start != goal
+            && let Some(path) = nav::find_path(t, start, goal)
+            && path.len() >= 2
+        {
+            return step_point(from, t.tile_center(path[1]), speed, state);
+        }
     }
-    let dist = (dx * dx + dy * dy).sqrt();
+    step_point(from, point, speed, state)
+}
 
-    let dest = if dist <= f32::EPSILON {
-        // On top of the reference point. Toward → stay; away → break the tie
-        // deterministically so overlapping units can still separate.
-        if toward {
-            from
-        } else {
-            Pos { x: from.x + speed, y: from.y }
+/// Retreat from `threat`. Prefer a straight-away step; when terrain blocks it
+/// (wall or cliff) rotate the heading progressively to *slide along* the
+/// obstacle instead of stopping dead. On a flat arena the straight-away branch
+/// always wins, reproducing the pre-terrain behaviour exactly.
+fn flee(actor: EntityId, threat: Pos, state: &BattleState) -> Pos {
+    let a = state.entity(actor);
+    let from = a.pos;
+    let speed = a.move_speed;
+
+    // Base "directly away" heading; a deterministic fallback when we're on top
+    // of the threat lets overlapping units still separate.
+    let (ax, ay) = (from.x - threat.x, from.y - threat.y);
+    let mag = (ax * ax + ay * ay).sqrt();
+    let (bx, by) = if mag > f32::EPSILON { (ax / mag, ay / mag) } else { (1.0, 0.0) };
+
+    // Straight away first, then widening rotations to either side (never past
+    // perpendicular, so a rotated step never heads back toward the threat).
+    const HEADINGS: [f32; 9] = [0.0, 30.0, -30.0, 45.0, -45.0, 60.0, -60.0, 90.0, -90.0];
+    for deg in HEADINGS {
+        let (nx, ny) = rotate(bx, by, deg);
+        let dest = state.clamp_pos(Pos { x: from.x + nx * speed, y: from.y + ny * speed });
+        if terrain_step_ok(state, from, dest) {
+            return dest;
         }
-    } else if toward && dist <= speed {
-        point // would overshoot — land exactly on the target
-    } else {
-        Pos {
-            x: from.x + dx / dist * speed,
-            y: from.y + dy / dist * speed,
+    }
+    from // hemmed in on every heading — hold
+}
+
+fn rotate(x: f32, y: f32, degrees: f32) -> (f32, f32) {
+    let (s, c) = degrees.to_radians().sin_cos();
+    (x * c - y * s, x * s + y * c)
+}
+
+/// Whether a small step from `from` to `dest` is allowed by the terrain
+/// (passable destination, no cliff between the tiles). Vacuously true when flat.
+/// Assumes a step shorter than a tile — true for `move_speed` drift.
+fn terrain_step_ok(state: &BattleState, from: Pos, dest: Pos) -> bool {
+    match state.terrain.as_ref() {
+        None => true,
+        Some(t) => t.walkable(t.tile_of(from), t.tile_of(dest)),
+    }
+}
+
+/// Move toward the highest reachable tile that still has line-of-sight to
+/// `target` — take the high ground while keeping the shot. Returns `None` (hold,
+/// try the next rule) on a flat arena or when no reachable tile improves on the
+/// current elevation.
+fn seek_high_ground(actor: EntityId, target: Pos, state: &BattleState) -> Option<Pos> {
+    let t = state.terrain.as_ref()?;
+    let from = state.entity(actor).pos;
+    let start = t.tile_of(from);
+    let cur_elev = t.elevation(start);
+    let reach = nav::reachable(t, start, TILE_SEEK_RADIUS);
+
+    // Highest reachable tile that can see the target; ties → the nearer tile.
+    let mut best: Option<(i32, f32, Tile)> = None;
+    for (&tile, &cost) in &reach {
+        let center = t.tile_center(tile);
+        if !t.line_of_sight(center, target) {
+            continue;
         }
-    };
-    // Keep the destination on the field. Radius-aware bounds and entity-vs-entity
-    // collision are resolved by the caller (`combat::resolve_collisions`), which
-    // has the other entities; here we just clamp the point.
-    state.clamp_pos(dest)
+        let elev = t.elevation(tile);
+        let better = match best {
+            None => true,
+            Some((be, bc, _)) => elev > be || (elev == be && cost < bc),
+        };
+        if better {
+            best = Some((elev, cost, tile));
+        }
+    }
+
+    let (best_elev, _, goal) = best?;
+    if goal == start || best_elev <= cur_elev {
+        return None; // already as high as we can usefully get
+    }
+    Some(nav_toward(actor, t.tile_center(goal), state))
+}
+
+/// Move toward the nearest reachable tile from which `threat` can no longer see
+/// us — duck behind cover. Returns `None` (hold) when flat, already hidden, or no
+/// reachable tile breaks line-of-sight.
+fn break_los(actor: EntityId, threat: Pos, state: &BattleState) -> Option<Pos> {
+    let t = state.terrain.as_ref()?;
+    let from = state.entity(actor).pos;
+    let start = t.tile_of(from);
+    if !t.line_of_sight(t.tile_center(start), threat) {
+        return None; // already out of sight
+    }
+    let reach = nav::reachable(t, start, TILE_SEEK_RADIUS);
+
+    let mut best: Option<(f32, Tile)> = None;
+    for (&tile, &cost) in &reach {
+        if tile == start || t.line_of_sight(t.tile_center(tile), threat) {
+            continue;
+        }
+        if best.is_none_or(|(bc, _)| cost < bc) {
+            best = Some((cost, tile));
+        }
+    }
+    let (_, goal) = best?;
+    Some(nav_toward(actor, t.tile_center(goal), state))
 }
 
 fn eval_node(node: &Node, actor: EntityId, state: &BattleState) -> Outcome {
@@ -265,8 +390,15 @@ fn candidates(
 
     base.into_iter()
         .filter(|&id| query.filters.iter().all(|f| pass_filter(f, id, actor, state)))
+        // A skill's `range` is supplied only for action feasibility (never for
+        // condition/movement queries). When it is, both range *and* line-of-sight
+        // gate the target: you can't hit what you can't reach or can't see. LoS is
+        // the implicit spatial-sanity check terrain adds, alongside range/cost/cd.
         .filter(|&id| match range {
-            Some(r) => state.entity(actor).pos.dist(state.entity(id).pos) <= r,
+            Some(r) => {
+                let (ap, tp) = (state.entity(actor).pos, state.entity(id).pos);
+                ap.dist(tp) <= r && state.line_of_sight(ap, tp)
+            }
             None => true,
         })
         .collect()
@@ -283,6 +415,10 @@ fn pass_filter(filter: &Filter, id: EntityId, actor: EntityId, state: &BattleSta
         Filter::WeakTo(dt) => e.weaknesses.contains(dt),
         Filter::IsSelf => id == actor,
         Filter::NotSelf => id != actor,
+        Filter::HasLineOfSight => state.line_of_sight(state.entity(actor).pos, e.pos),
+        Filter::OnHigherGround => {
+            state.elevation_at(e.pos) > state.elevation_at(state.entity(actor).pos)
+        }
         Filter::Not(inner) => !pass_filter(inner, id, actor, state),
     }
 }
@@ -313,6 +449,7 @@ fn sort_value(key: SortKey, id: EntityId, actor_pos: crate::battle::Pos, state: 
         SortKey::HpPct => e.hp_pct(),
         SortKey::MaxHp => e.max_hp,
         SortKey::Distance => actor_pos.dist(e.pos),
+        SortKey::Elevation => state.elevation_at(e.pos) as f32,
         SortKey::StatusStacks(k) => e.status_stacks(k) as f32,
     }
 }
@@ -359,6 +496,7 @@ mod tests {
                     entities: Vec::new(),
                     skills: Vec::new(),
                     bounds: (1000.0, 1000.0),
+                    terrain: None,
                 },
             }
         }
@@ -616,6 +754,66 @@ mod tests {
         w.ent(hero).move_speed = 1.0;
         // No enemies exist.
         let gambit = vec![MoveRule::new(MoveIntent::Toward(nearest_enemy()))];
+        assert_eq!(decide_move(&gambit, hero, &w.state), None);
+    }
+
+    // --- terrain: line-of-sight & high ground ---------------------------
+
+    use crate::terrain::{Terrain, Tile3};
+
+    /// A tall wall between actor and target blocks the shot: line-of-sight is an
+    /// implicit feasibility check, so the rule falls through to no action. Clear
+    /// the terrain and the same rule fires.
+    #[test]
+    fn line_of_sight_gates_a_ranged_skill() {
+        let mut w = World::new();
+        let hero = w.add("hero", Team::Player, 100.0, 0.5);
+        let _enemy = w.add("enemy", Team::Enemy, 100.0, 4.5);
+        let bolt = w.add_skill("Bolt", 0, 100.0, None); // plenty of range
+
+        let mut terrain = Terrain::flat(5, 1, 1.0);
+        terrain.set(2, 0, Tile3 { elevation: 4, passable: false }); // wall between them
+        w.state.terrain = Some(terrain);
+
+        let rule = Node::act(TargetQuery::new(Pool::Enemies), bolt);
+        assert_eq!(decide(&rule, hero, &w.state), None, "wall should block the shot");
+
+        // Same geometry, no terrain -> in sight -> fires.
+        w.state.terrain = None;
+        assert!(decide(&rule, hero, &w.state).is_some());
+    }
+
+    /// `SeekHighGround` walks the actor toward the highest reachable tile that
+    /// still sees the target, gaining elevation.
+    #[test]
+    fn seek_high_ground_climbs_toward_a_hill() {
+        let mut w = World::new();
+        let hero = w.add("hero", Team::Player, 100.0, 0.5);
+        let _enemy = w.add("enemy", Team::Enemy, 100.0, 4.5);
+        w.ent(hero).move_speed = 1.0;
+
+        // A two-step hill just east of the actor; the far side is a cliff, so the
+        // crest (col 2) is the highest reachable tile — and it sees the target.
+        let mut terrain = Terrain::flat(5, 1, 1.0);
+        terrain.set(1, 0, Tile3 { elevation: 1, passable: true });
+        terrain.set(2, 0, Tile3 { elevation: 2, passable: true });
+        w.state.terrain = Some(terrain);
+
+        let gambit = vec![MoveRule::new(MoveIntent::SeekHighGround(nearest_enemy()))];
+        let dest = decide_move(&gambit, hero, &w.state).expect("should head for the hill");
+        assert!(dest.x > 0.5, "should move east toward the high ground, got {}", dest.x);
+    }
+
+    /// On a flat, terrain-free arena there is no high ground, so `SeekHighGround`
+    /// declines (holds / falls to the next rule).
+    #[test]
+    fn seek_high_ground_holds_when_flat() {
+        let mut w = World::new();
+        let hero = w.add("hero", Team::Player, 100.0, 0.5);
+        let _enemy = w.add("enemy", Team::Enemy, 100.0, 4.5);
+        w.ent(hero).move_speed = 1.0;
+
+        let gambit = vec![MoveRule::new(MoveIntent::SeekHighGround(nearest_enemy()))];
         assert_eq!(decide_move(&gambit, hero, &w.state), None);
     }
 

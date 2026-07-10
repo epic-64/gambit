@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use crate::battle::*;
 use crate::combat::Combat;
 use crate::gambit::*;
+use crate::terrain::{Terrain, Tile3};
 
 fn push_skill(skills: &mut Vec<Skill>, s: Skill) -> SkillId {
     let id = SkillId(skills.len());
@@ -89,17 +90,22 @@ pub fn demo() -> Combat {
     let ogre = EntityId(3);
     //         id  name      team          hp     atb   move  x     y     weak
     let entities = vec![
-        mk(0, "Hero", Team::Player, 80.0, 0.30, 0.40, 5.0, 3.5, &[]),
-        mk(1, "Mage", Team::Player, 50.0, 0.22, 0.30, 5.0, 8.5, &[]),
-        mk(2, "Goblin", Team::Enemy, 40.0, 0.28, 0.45, 15.0, 3.5, &[DamageType::Fire]),
-        mk(3, "Ogre", Team::Enemy, 120.0, 0.18, 0.25, 15.0, 8.5, &[]),
+        // Players start on the west side; enemies on the east. A wall splits the
+        // field, so both must funnel through the southern gap — except the mage,
+        // who can climb the hill and shoot over the wall.
+        mk(0, "Hero", Team::Player, 80.0, 0.30, 0.40, 3.0, 9.5, &[]),
+        mk(1, "Mage", Team::Player, 50.0, 0.22, 0.30, 2.5, 4.5, &[]),
+        mk(2, "Goblin", Team::Enemy, 40.0, 0.28, 0.45, 17.0, 9.5, &[DamageType::Fire]),
+        mk(3, "Ogre", Team::Enemy, 120.0, 0.18, 0.25, 17.0, 4.5, &[]),
     ];
-    // Arena extent in world units — matches the viewer's WORLD_W × WORLD_H, so
-    // drifting units can't wander off the drawn field.
+    let terrain = demo_terrain();
+    // The grid *is* the playable field — take bounds straight from its extent so
+    // drift can't wander off the drawn map.
     let state = BattleState {
+        bounds: terrain.world_extent(),
         entities,
         skills,
-        bounds: (20.0, 12.0),
+        terrain: Some(terrain),
     };
 
     let mut gambits = HashMap::new();
@@ -154,13 +160,48 @@ pub fn demo() -> Combat {
     let nearest_enemy = || TargetQuery::new(Pool::Enemies).sort(SortKey::Distance, Order::Asc);
 
     let mut move_gambits = HashMap::new();
-    // Melee closes on the nearest foe; the mage kites away from it.
+    // Melee closes on the nearest foe (A* routes it through the gap). The mage
+    // seeks the high ground to shoot over the wall, kiting only if it can't climb.
     move_gambits.insert(hero, vec![MoveRule::new(MoveIntent::Toward(nearest_enemy()))]);
-    move_gambits.insert(mage, vec![MoveRule::new(MoveIntent::Away(nearest_enemy()))]);
+    move_gambits.insert(
+        mage,
+        vec![
+            MoveRule::new(MoveIntent::SeekHighGround(nearest_enemy())),
+            MoveRule::new(MoveIntent::Away(nearest_enemy())),
+        ],
+    );
     move_gambits.insert(goblin, vec![MoveRule::new(MoveIntent::Toward(nearest_enemy()))]);
     move_gambits.insert(ogre, vec![MoveRule::new(MoveIntent::Toward(nearest_enemy()))]);
 
     Combat::new(state, gambits).with_movement(move_gambits)
+}
+
+/// The demo map: a 20×12 tile arena split by a north wall with a southern gap,
+/// plus a stepped hill on the players' side whose crest rises *above* the wall —
+/// so the high ground can see (and fire) over it while everyone else funnels
+/// through the gap. Showcases pathfinding (routing around the wall), cliffs
+/// (the hill's climbable steps vs. the impassable wall), and line-of-sight.
+fn demo_terrain() -> Terrain {
+    let mut t = Terrain::flat(20, 12, 1.0);
+    let ground = |elevation| Tile3 { elevation, passable: true };
+
+    // Dividing wall at column 10, rows 0..=7 — impassable, elevation 3. Rows
+    // 8..=11 are left open as the gap.
+    for r in 0..=7 {
+        t.set(10, r, Tile3 { elevation: 3, passable: false });
+    }
+
+    // A stepped hill west of the wall, climbing 1→2→3→4 toward it. Each step is a
+    // single elevation up (walkable); the crest (elevation 4) overtops the wall
+    // (elevation 3), so a unit on top has line-of-sight across it.
+    for r in 3..=6 {
+        t.set(6, r, ground(1));
+        t.set(7, r, ground(2));
+        t.set(8, r, ground(3));
+        t.set(9, r, ground(4));
+    }
+
+    t
 }
 
 #[cfg(test)]

@@ -5,6 +5,8 @@
 
 use std::collections::HashMap;
 
+use crate::terrain::Terrain;
+
 /// Every entity is a circle of this radius (world units). Uniform for now — a
 /// single knob keeps movement/collision simple; if size ever needs to vary it
 /// should come from equipment, not a per-entity field (see CLAUDE.md).
@@ -166,8 +168,14 @@ pub struct BattleState {
     pub skills: Vec<Skill>,
     /// Playable arena size in world units, `(width, height)`. Movement is
     /// clamped to `0..=width` × `0..=height` so drifting units can't leave the
-    /// field. (When terrain lands this becomes the tile-grid extent.)
+    /// field. When `terrain` is present this equals its `world_extent`.
     pub bounds: (f32, f32),
+    /// The tile grid the fight plays out on: obstacles, elevation, cliffs, and
+    /// the line-of-sight/pathfinding they imply. `None` == a featureless flat
+    /// arena (the pre-terrain behaviour): everything passable, elevation 0, and
+    /// unobstructed sight everywhere. The queries below hide that fallback so the
+    /// rest of the engine never branches on it.
+    pub terrain: Option<Terrain>,
 }
 
 impl BattleState {
@@ -192,6 +200,25 @@ impl BattleState {
 
     pub fn skill(&self, id: SkillId) -> &Skill {
         &self.skills[id.0]
+    }
+
+    // --- terrain queries (flat-arena fallbacks when there is no terrain) ---
+
+    /// Ground height at a world point (0 on a flat arena).
+    pub fn elevation_at(&self, p: Pos) -> i32 {
+        self.terrain.as_ref().map_or(0, |t| t.elevation_at(p))
+    }
+
+    /// Whether `a` can see `b` across the terrain (always true when flat). This
+    /// is the implicit line-of-sight feasibility check for skills.
+    pub fn line_of_sight(&self, a: Pos, b: Pos) -> bool {
+        self.terrain.as_ref().is_none_or(|t| t.line_of_sight(a, b))
+    }
+
+    /// Whether a unit may stand on the tile under a world point (always true when
+    /// flat).
+    pub fn passable_at(&self, p: Pos) -> bool {
+        self.terrain.as_ref().is_none_or(|t| t.passable_at(p))
     }
 
     /// All *living* entity ids, in stable order.
