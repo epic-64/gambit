@@ -381,9 +381,12 @@ Implementation notes / decisions made while building:
   `ELEV_LIFT` tiles per level — tiles show lifted top faces, exposed south faces (striated per
   level, sunlit lip, darkening toward the ground), rim lines on drop-off edges, and contact
   shadows under taller neighbours. Units/bars/vfx project through the same `View` (bilinear
-  elevation smoothing, cliff-clamped, so units walk *up* steps instead of popping) and always
-  draw after terrain, so nothing gameplay-relevant hides behind a wall — tall terrain only
-  overlaps dead ground to its north. A full isometric/2.5D (FFT-style) projection remains a
-  possible future upgrade if height still reads too weakly.
+  elevation smoothing, cliff-clamped, so units walk *up* steps instead of popping). Units are
+  depth-sorted into the terrain (`draw_units`): they paint north → south (nearer the viewer =
+  drawn later), and any tile that rises above an already-drawn unit's ground is repainted over
+  it, so a unit behind a wall or below a hill edge is genuinely occluded — one whose token
+  centre is covered ghosts through as a team-colored silhouette ring, so it stays trackable.
+  Vfx and projectiles still draw on top of everything. A full isometric/2.5D (FFT-style)
+  projection remains a possible future upgrade if height still reads too weakly.
 - **Terrain authoring is undecided** — how maps are defined (hand-authored data files, an
   in-engine editor, procedural). Not needed until we build the terrain layer.
