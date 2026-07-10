@@ -387,6 +387,105 @@ pub fn skirmish() -> Combat {
             ],
         },
     );
+    // Assassin's finisher: +1% damage per 1% of the target's missing HP — the
+    // base of 10 grows toward 20 as the mark bleeds out. Cheap and quick so
+    // it's the kill-securing rhythm hit once a dive has done its work; the
+    // gambit gates it to already-hurt targets where the scaling actually pays.
+    let reap = push_skill(
+        &mut skills,
+        Skill {
+            name: "Reap".into(),
+            cost: 5,
+            range: 2.5,
+            cooldown: 4,
+            cast_time: 0,
+            damage_type: Some(DamageType::Physical),
+            effects: vec![Effect::ExecuteDamage(10.0)],
+        },
+    );
+    // Cleric's group heal: mends every hurt ally within 8m at once, but costs a
+    // 2-tick rooted cast and a deep MP bite — the tank-up button when the whole
+    // party is bleeding, not a better single-target Heal (which stays instant
+    // and cheaper for triage).
+    let prayer = push_skill(
+        &mut skills,
+        Skill {
+            name: "Prayer".into(),
+            cost: 40,
+            range: 8.0,
+            cooldown: 14,
+            cast_time: 2,
+            damage_type: None,
+            effects: vec![Effect::Heal(24.0)],
+        },
+    );
+    // Cleric's barrier: a 3s (12-tick) shield that halves incoming damage —
+    // pre-mitigation to Heal's after-the-fact triage. Cooldown outlasts the
+    // buff so it's a window, not a permanent state.
+    let barrier = push_skill(
+        &mut skills,
+        Skill {
+            name: "Barrier".into(),
+            cost: 20,
+            range: 100.0,
+            cooldown: 16,
+            cast_time: 0,
+            damage_type: None,
+            effects: vec![Effect::Inflict {
+                kind: StatusKind::Shield,
+                stacks: 1,
+                duration: 12,
+            }],
+        },
+    );
+    // Cleric's cleanse: strips every harmful status (the assassin's poison and
+    // snare, a landed stun) off an ally. Cheap and fast — the counter-tool that
+    // makes DoT/CC attrition answerable instead of inevitable.
+    let purify = push_skill(
+        &mut skills,
+        Skill {
+            name: "Purify".into(),
+            cost: 10,
+            range: 100.0,
+            cooldown: 4,
+            cast_time: 0,
+            damage_type: None,
+            effects: vec![Effect::Cleanse],
+        },
+    );
+    // Shaman's drain: damage that returns half of what lands as self-healing —
+    // the enemy healer sustains itself by hurting you. A 1-tick channel and a
+    // real cooldown keep it a woven rhythm hit, not a free-sustain faucet.
+    let siphon = push_skill(
+        &mut skills,
+        Skill {
+            name: "Siphon".into(),
+            cost: 15,
+            range: 9.0,
+            cooldown: 8,
+            cast_time: 1,
+            damage_type: None,
+            effects: vec![Effect::Drain(12.0)],
+        },
+    );
+    // Ogre's war cry: self-enrage (+50% outgoing damage for 3s). Fired only
+    // once a foe is in reach so the window isn't wasted on the approach march.
+    let war_cry = push_skill(
+        &mut skills,
+        Skill {
+            name: "War Cry".into(),
+            cost: 10,
+            range: 100.0,
+            cooldown: 24,
+            cast_time: 0,
+            damage_type: None,
+            effects: vec![Effect::Inflict {
+                kind: StatusKind::Enrage,
+                stacks: 1,
+                duration: 12,
+            }],
+        },
+    );
 
     let mk = |id: usize,
               name: &str,
@@ -422,11 +521,11 @@ pub fn skirmish() -> Combat {
         mk(0, "Brawler", Team::Player, 150.0, 0.26, 0.42, 3.5, 7.0, vec![charge, bash], &[]),
         mk(1, "Archer", Team::Player, 65.0, 0.30, 0.36, 2.0, 2.5, vec![shot], &[]),
         mk(2, "Mage", Team::Player, 50.0, 0.22, 0.30, 2.0, 11.0, vec![fireball, shot], &[]),
-        mk(3, "Cleric", Team::Player, 60.0, 0.24, 0.34, 2.0, 7.0, vec![heal, shot], &[]),
-        mk(4, "Ogre", Team::Enemy, 160.0, 0.20, 0.30, 20.5, 7.0, vec![bash], &[DamageType::Fire]),
-        mk(5, "Assassin", Team::Enemy, 55.0, 0.34, 0.50, 22.0, 2.5, vec![dash, backstab, strike], &[]),
+        mk(3, "Cleric", Team::Player, 60.0, 0.24, 0.34, 2.0, 7.0, vec![prayer, heal, barrier, purify, shot], &[]),
+        mk(4, "Ogre", Team::Enemy, 160.0, 0.20, 0.30, 20.5, 7.0, vec![war_cry, bash], &[DamageType::Fire]),
+        mk(5, "Assassin", Team::Enemy, 55.0, 0.34, 0.50, 22.0, 2.5, vec![dash, reap, backstab, strike], &[]),
         mk(6, "Raider", Team::Enemy, 62.0, 0.30, 0.36, 22.0, 11.0, vec![shot], &[]),
-        mk(7, "Shaman", Team::Enemy, 60.0, 0.24, 0.34, 22.0, 7.0, vec![heal, shot], &[DamageType::Holy]),
+        mk(7, "Shaman", Team::Enemy, 60.0, 0.24, 0.34, 22.0, 7.0, vec![heal, siphon, shot], &[DamageType::Holy]),
     ];
     let terrain = skirmish_terrain();
     let state = BattleState {
@@ -463,17 +562,6 @@ pub fn skirmish() -> Combat {
             .filter(Filter::HpPctBelow(0.7))
             .sort(SortKey::HpPct, Order::Asc)
     };
-    // Heal the worst-off ally; if none needs it, fall through to plinking.
-    let healer_gambit = |heal: SkillId, shot: SkillId| {
-        Node::context(
-            Condition::Always,
-            GroupMode::Fallthrough,
-            vec![
-                Node::act(hurt_ally(), heal),
-                Node::act(nearest_enemy(), shot),
-            ],
-        )
-    };
 
     let mut gambits = HashMap::new();
     // Brawler: protect first — if a foe is on a teammate, charge it (the stun is
@@ -495,8 +583,26 @@ pub fn skirmish() -> Combat {
             ],
         ),
     );
-    // Ogre: wade in and bash whoever is closest.
-    gambits.insert(EntityId(4), Node::act(nearest_enemy(), bash));
+    // Ogre: roar once a foe is in reach (the enrage window opens exactly when
+    // there's something to swing at), then wade in and bash whoever is closest.
+    // War Cry's cooldown (24) outlasts the buff (12), so feasibility alone
+    // paces the re-roar; no "am I already enraged?" plumbing needed.
+    gambits.insert(
+        EntityId(4),
+        Node::context(
+            Condition::Always,
+            GroupMode::Fallthrough,
+            vec![
+                Node::act(TargetQuery::new(Pool::Myself), war_cry).when(Condition::Exists(
+                    TargetQuery::new(Pool::Enemies).filter(Filter::WithinDistanceOf(
+                        Box::new(TargetQuery::new(Pool::Myself)),
+                        4.0,
+                    )),
+                )),
+                Node::act(nearest_enemy(), bash),
+            ],
+        ),
+    );
     // Archers focus-fire the weakest foe to secure kills.
     gambits.insert(EntityId(1), Node::act(weakest_enemy(), shot));
     gambits.insert(EntityId(6), Node::act(weakest_enemy(), shot));
@@ -513,10 +619,12 @@ pub fn skirmish() -> Combat {
         ),
     );
     // Assassin dives the weakest player: dash in (gap-close + snare so it can't
-    // kite away) when off cooldown, otherwise backstab (poison). Same implicit
-    // feasibility split — the dash's 5m range/cooldown vs. the melee backstab.
-    // Strike is the always-feasible floor: with dash AND backstab both on
-    // cooldown, it still swings instead of idling with a full bar.
+    // kite away) when off cooldown, then finish or wear down. Reap outranks
+    // backstab but only against marks already under 65% HP — that's where its
+    // missing-HP scaling beats backstab's flat hit + poison; on healthier
+    // targets it falls through to backstab (stack the DoT first). Strike is the
+    // always-feasible floor: with everything on cooldown it still swings
+    // instead of idling with a full bar.
     gambits.insert(
         EntityId(5),
         Node::context(
@@ -524,14 +632,74 @@ pub fn skirmish() -> Combat {
             GroupMode::Fallthrough,
             vec![
                 Node::act(weakest_enemy(), dash),
+                Node::act(
+                    TargetQuery::new(Pool::Enemies)
+                        .filter(Filter::HpPctBelow(0.65))
+                        .sort(SortKey::HpPct, Order::Asc),
+                    reap,
+                ),
                 Node::act(weakest_enemy(), backstab),
                 Node::act(nearest_enemy(), strike),
             ],
         ),
     );
-    // Both healers mend-first.
-    gambits.insert(EntityId(3), healer_gambit(heal, shot));
-    gambits.insert(EntityId(7), healer_gambit(heal, shot));
+    // Cleric: group-heal when the party (2+ allies) is bleeding, else triage the
+    // worst-off ally; shield whoever is deepest in trouble before topping them
+    // up is affordable again; strip the assassin's poison/snare off anyone
+    // carrying it; and plink when nobody needs anything.
+    let poisoned_ally = |kind: StatusKind| {
+        TargetQuery::new(Pool::Allies)
+            .filter(Filter::HasStatus(kind))
+            .sort(SortKey::HpPct, Order::Asc)
+    };
+    gambits.insert(
+        EntityId(3),
+        Node::context(
+            Condition::Always,
+            GroupMode::Fallthrough,
+            vec![
+                Node::act(
+                    TargetQuery::new(Pool::Allies)
+                        .filter(Filter::HpPctBelow(0.7))
+                        .pick(Pick::All),
+                    prayer,
+                )
+                .when(Condition::Count {
+                    q: TargetQuery::new(Pool::Allies)
+                        .filter(Filter::HpPctBelow(0.7))
+                        .pick(Pick::All),
+                    cmp: Cmp::Ge,
+                    n: 2,
+                }),
+                Node::act(hurt_ally(), heal),
+                Node::act(
+                    TargetQuery::new(Pool::Allies)
+                        .filter(Filter::HpPctBelow(0.5))
+                        .filter(Filter::Not(Box::new(Filter::HasStatus(StatusKind::Shield))))
+                        .sort(SortKey::HpPct, Order::Asc),
+                    barrier,
+                ),
+                Node::act(poisoned_ally(StatusKind::Poison), purify),
+                Node::act(poisoned_ally(StatusKind::Snare), purify),
+                Node::act(nearest_enemy(), shot),
+            ],
+        ),
+    );
+    // Shaman: mend-first like any healer, but its filler is the drain — hurting
+    // the nearest player is also how it keeps itself topped up. Plain Shot
+    // remains the floor while Siphon recharges.
+    gambits.insert(
+        EntityId(7),
+        Node::context(
+            Condition::Always,
+            GroupMode::Fallthrough,
+            vec![
+                Node::act(hurt_ally(), heal),
+                Node::act(nearest_enemy(), siphon),
+                Node::act(nearest_enemy(), shot),
+            ],
+        ),
+    );
 
     // --- movement gambits (run every tick, independent of the action bar) ---
     // Ranged units hold a standoff band: `Near(ideal 6.5)` pushes in when out
@@ -705,6 +873,27 @@ mod tests {
         assert!(acted_skill("Dash"), "the assassin should dash at least once");
         assert!(inflicted(StatusKind::Stun), "a charge should land a stun");
         assert!(inflicted(StatusKind::Snare), "a dash should land a snare");
+    }
+
+    /// The expanded kits actually see use over a full skirmish: the ogre roars,
+    /// the shaman drains, the assassin executes, and the cleric group-heals.
+    #[test]
+    fn skirmish_expanded_kits_see_use() {
+        let mut combat = skirmish();
+        let log = combat.run(4000);
+
+        let used = |name: &str| {
+            log.iter().any(|e| matches!(
+                e,
+                Event::Acted { skill, .. } | Event::StartedCast { skill, .. }
+                    if combat.state.skill(*skill).name == name
+            ))
+        };
+
+        assert!(used("War Cry"), "the ogre should enrage once a foe closes in");
+        assert!(used("Siphon"), "the shaman should weave its drain");
+        assert!(used("Reap"), "the assassin should execute a hurt target");
+        assert!(used("Prayer"), "the cleric should group-heal a bleeding party");
     }
 
     /// Livelock invariant: no unit may sit *ready-but-idle* (`Waited`) for a

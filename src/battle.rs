@@ -61,6 +61,21 @@ pub enum StatusKind {
     Snare,
 }
 
+impl StatusKind {
+    /// Whether the status hurts its bearer — the set [`Effect::Cleanse`] strips.
+    /// The beneficial ones (Regen, Shield, Enrage) are never cleansed off an ally.
+    pub fn is_harmful(self) -> bool {
+        matches!(
+            self,
+            StatusKind::Poison
+                | StatusKind::Burn
+                | StatusKind::Silence
+                | StatusKind::Stun
+                | StatusKind::Snare
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Status {
     pub kind: StatusKind,
@@ -74,8 +89,21 @@ pub struct Status {
 pub enum Effect {
     /// Raw damage; multiplied if the target is weak to the skill's `damage_type`.
     Damage(f32),
+    /// Execute-style damage: the base is scaled up by the target's *missing* HP
+    /// fraction — 1% more damage per 1% missing, so a full-HP target takes the
+    /// base and one at death's door takes ~2×. The finisher's counterpart to
+    /// opener burst; weakness/enrage/shield multipliers apply on top.
+    ExecuteDamage(f32),
+    /// Damage the target and heal the *actor* for [`crate::combat::DRAIN_RATIO`]
+    /// of the damage actually dealt (after all multipliers) — nothing comes back
+    /// from a hit that lands for zero.
+    Drain(f32),
     /// Restore HP (capped at `max_hp`).
     Heal(f32),
+    /// Strip every harmful status (see [`StatusKind::is_harmful`]) from the
+    /// target — the counter-tool to poison/snare/stun attrition. Beneficial
+    /// statuses (Regen, Shield, Enrage) are untouched.
+    Cleanse,
     /// Apply (or stack) a status on the target.
     Inflict {
         kind: StatusKind,

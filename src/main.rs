@@ -242,6 +242,10 @@ fn spawn_impact_vfx(
             };
             push_text(vfx, at, text, 17.0, status_color(*kind));
         }
+        Event::Cleansed { target } => {
+            let at = combat.state.entity(*target).pos;
+            push_text(vfx, at, "cleansed".into(), 17.0, Color::new(1.0, 0.96, 0.72, 1.0));
+        }
         Event::Fizzled { actor, .. } => {
             let at = combat.state.entity(*actor).pos;
             push_text(vfx, at, "fizzle".into(), 16.0, Color::new(0.6, 0.62, 0.66, 1.0));
@@ -821,6 +825,7 @@ fn format_event(c: &Combat, ev: &Event) -> String {
         Event::Inflicted { target, kind, stacks } => {
             format!("   {} {kind:?} x{stacks}", name(*target))
         }
+        Event::Cleansed { target } => format!("   {} cleansed", name(*target)),
         Event::StartedCast { actor, skill: s, targets } => {
             let ts: Vec<String> = targets.iter().map(|&t| name(t)).collect();
             format!("{} begins {} @ {}", name(*actor), skill(*s), ts.join(", "))

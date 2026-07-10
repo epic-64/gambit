@@ -22,6 +22,14 @@ const WEAKNESS_MULT: f32 = 1.5;
 const POISON_PER_STACK: f32 = 3.0;
 const BURN_PER_STACK: f32 = 5.0;
 const REGEN_PER_STACK: f32 = 4.0;
+/// Fraction of incoming damage a `Shield` status absorbs (flat, regardless of
+/// stacks — like `SNARE_SLOW`, magnitude isn't per-status yet).
+const SHIELD_REDUCTION: f32 = 0.5;
+/// Outgoing skill-damage bonus while the attacker is `Enrage`d. DoT pulses are
+/// unaffected (they have no attacker at pulse time).
+const ENRAGE_BONUS: f32 = 0.5;
+/// Fraction of dealt damage an [`Effect::Drain`] returns to the actor as healing.
+pub const DRAIN_RATIO: f32 = 0.5;
 /// A hit at or under this distance lands immediately (you're in contact);
 /// anything farther is a projectile that has to *travel* — its effects apply
 /// on impact, not at fire. Per shot, not per skill: a long-range skill fired
@@ -60,6 +68,11 @@ pub enum Event {
         target: EntityId,
         kind: StatusKind,
         stacks: u32,
+    },
+    /// One or more harmful statuses were stripped off the target by a Cleanse.
+    /// Only emitted when something was actually removed.
+    Cleansed {
+        target: EntityId,
     },
     /// A cast-time skill was begun; the actor is now rooted until it resolves.
     /// MP and cooldown are already committed at this point.
@@ -553,7 +566,7 @@ impl Combat {
                     pos: from,
                 });
             } else {
-                self.apply_effects_to(tgt, skill, events);
+                self.apply_effects_to(actor, tgt, skill, events);
             }
         }
     }
@@ -613,7 +626,7 @@ impl Combat {
                 let run = self.dashes.remove(&id).unwrap();
                 let skill = self.state.skill(run.action.skill).clone();
                 for &t in &run.action.targets {
-                    self.apply_effects_to(t, &skill, events);
+                    self.apply_effects_to(id, t, &skill, events);
                 }
                 self.check_over(events);
             }
@@ -646,7 +659,7 @@ impl Combat {
                 // Impact this slice.
                 let f = self.flights.swap_remove(i);
                 let skill = self.state.skill(f.skill).clone();
-                self.apply_effects_to(f.target, &skill, events);
+                self.apply_effects_to(f.actor, f.target, &skill, events);
                 self.check_over(events);
                 continue;
             }
@@ -659,36 +672,74 @@ impl Combat {
     }
 
     /// Apply a skill's per-target effects (damage/heal/status) to one target —
-    /// the moment an attack lands. `Effect::Dash` is actor-centric and handled
-    /// by the dash run, never here.
-    fn apply_effects_to(&mut self, target: EntityId, skill: &Skill, events: &mut Vec<Event>) {
+    /// the moment an attack lands. `actor` is whoever landed the hit (for
+    /// enrage scaling and drain return). `Effect::Dash` is actor-centric and
+    /// handled by the dash run, never here.
+    fn apply_effects_to(
+        &mut self,
+        actor: EntityId,
+        target: EntityId,
+        skill: &Skill,
+        events: &mut Vec<Event>,
+    ) {
         for effect in &skill.effects {
             match effect {
-                Effect::Damage(base) => self.apply_damage(target, *base, skill.damage_type, events),
+                Effect::Damage(base) => {
+                    self.apply_damage(Some(actor), target, *base, skill.damage_type, events);
+                }
+                Effect::ExecuteDamage(base) => {
+                    // 1% more per 1% of the target's missing HP: ×1 at full
+                    // health up to ×2 at death's door. Scaled off HP *before*
+                    // this hit, then fed through the normal multiplier stack.
+                    let missing = 1.0 - self.state.entity(target).hp_pct();
+                    let amount = base * (1.0 + missing.clamp(0.0, 1.0));
+                    self.apply_damage(Some(actor), target, amount, skill.damage_type, events);
+                }
+                Effect::Drain(base) => {
+                    // Heal back a cut of what actually landed — a resisted or
+                    // shielded hit returns less, a dead-target hit nothing.
+                    let dealt =
+                        self.apply_damage(Some(actor), target, *base, skill.damage_type, events);
+                    if dealt > 0.0 {
+                        self.apply_heal(actor, dealt * DRAIN_RATIO, events);
+                    }
+                }
                 Effect::Heal(amount) => self.apply_heal(target, *amount, events),
                 Effect::Inflict {
                     kind,
                     stacks,
                     duration,
                 } => self.apply_status(target, *kind, *stacks, *duration, events),
+                Effect::Cleanse => self.apply_cleanse(target, events),
                 Effect::Dash { .. } => {}
             }
         }
     }
 
+    /// Resolve one landed hit: enrage scales it up, weakness multiplies it,
+    /// a shield on the target soaks half. `source` is the attacking entity
+    /// (None for DoT pulses, which have no attacker at pulse time and thus no
+    /// enrage scaling). Returns the damage actually dealt.
     fn apply_damage(
         &mut self,
+        source: Option<EntityId>,
         target: EntityId,
         base: f32,
         dmg_type: Option<DamageType>,
         events: &mut Vec<Event>,
-    ) {
+    ) -> f32 {
+        let enraged = source
+            .is_some_and(|s| self.state.entity(s).status(StatusKind::Enrage).is_some());
         let e = &mut self.state.entities[target.0];
         if !e.is_alive() {
-            return;
+            return 0.0;
         }
         let weak = matches!(dmg_type, Some(dt) if e.weaknesses.contains(&dt));
-        let amount = base * if weak { WEAKNESS_MULT } else { 1.0 };
+        let shielded = e.status(StatusKind::Shield).is_some();
+        let amount = base
+            * if enraged { 1.0 + ENRAGE_BONUS } else { 1.0 }
+            * if weak { WEAKNESS_MULT } else { 1.0 }
+            * if shielded { 1.0 - SHIELD_REDUCTION } else { 1.0 };
         e.hp = (e.hp - amount).max(0.0);
         events.push(Event::Damage {
             target,
@@ -698,6 +749,21 @@ impl Combat {
         });
         if !e.is_alive() {
             events.push(Event::Died(target));
+        }
+        amount
+    }
+
+    /// Strip every harmful status off the target; emits `Cleansed` only if
+    /// something actually came off.
+    fn apply_cleanse(&mut self, target: EntityId, events: &mut Vec<Event>) {
+        let e = &mut self.state.entities[target.0];
+        if !e.is_alive() {
+            return;
+        }
+        let before = e.statuses.len();
+        e.statuses.retain(|s| !s.kind.is_harmful());
+        if e.statuses.len() < before {
+            events.push(Event::Cleansed { target });
         }
     }
 
@@ -758,7 +824,7 @@ impl Combat {
             }
             let id = self.state.entities[i].id;
             if dmg > 0.0 {
-                self.apply_damage(id, dmg, None, events);
+                self.apply_damage(None, id, dmg, None, events);
             }
             if heal > 0.0 && self.state.entities[i].is_alive() {
                 self.apply_heal(id, heal, events);
@@ -1564,6 +1630,182 @@ mod tests {
         let mut combat = a.into_combat();
         combat.run(10);
         assert_eq!(combat.state.entity(hero).mp, 100.0, "regen shouldn't exceed max_mp");
+    }
+
+    /// Execute damage scales with the target's *missing* HP: +1% per 1% missing,
+    /// so a half-dead target takes 1.5× the base and a full-HP one just the base.
+    #[test]
+    fn execute_damage_scales_with_missing_hp() {
+        let mut a = Arena::new();
+        let hero = a.add("hero", Team::Player, 100.0, 1.0);
+        let hurt = a.add("hurt", Team::Enemy, 50.0, 0.0); // at 50% of max_hp 100
+        let reap = a.skill(Skill {
+            name: "Reap".into(),
+            cost: 0,
+            range: 1000.0,
+            cooldown: 0,
+            cast_time: 0,
+            damage_type: None,
+            effects: vec![Effect::ExecuteDamage(10.0)],
+        });
+        a.gambit(hero, Node::act(TargetQuery::new(Pool::Enemies), reap));
+
+        let log = a.into_combat().tick();
+
+        let amount = log
+            .iter()
+            .find_map(|e| match e {
+                Event::Damage { amount, .. } => Some(*amount),
+                _ => None,
+            })
+            .expect("a damage event");
+        assert_eq!(amount, 15.0, "10 base * (1 + 0.5 missing)");
+    }
+
+    /// A drain heals the actor for `DRAIN_RATIO` of the damage actually dealt.
+    #[test]
+    fn drain_heals_the_attacker_for_half_the_damage() {
+        let mut a = Arena::new();
+        let vamp = a.add("vamp", Team::Player, 60.0, 1.0); // hurt: room to heal into
+        let victim = a.add("victim", Team::Enemy, 100.0, 0.0);
+        let siphon = a.skill(Skill {
+            name: "Siphon".into(),
+            cost: 0,
+            range: 1000.0,
+            cooldown: 0,
+            cast_time: 0,
+            damage_type: None,
+            effects: vec![Effect::Drain(20.0)],
+        });
+        a.gambit(vamp, Node::act(TargetQuery::new(Pool::Enemies), siphon));
+
+        let mut combat = a.into_combat();
+        combat.tick();
+
+        assert_eq!(combat.state.entity(victim).hp, 80.0);
+        assert_eq!(combat.state.entity(vamp).hp, 70.0, "healed for half of 20 dealt");
+    }
+
+    /// A Shield status halves incoming damage while it lasts.
+    #[test]
+    fn shield_halves_incoming_damage() {
+        let mut a = Arena::new();
+        let hero = a.add("hero", Team::Player, 100.0, 1.0);
+        let tank = a.add("tank", Team::Enemy, 100.0, 0.0);
+        a.ent(tank)
+            .statuses
+            .push(Status { kind: StatusKind::Shield, stacks: 1, duration: 10 });
+        let hit = a.skill(damage_skill("Hit", 20.0, None, 0));
+        a.gambit(hero, Node::act(TargetQuery::new(Pool::Enemies), hit));
+
+        let mut combat = a.into_combat();
+        combat.tick();
+
+        assert_eq!(combat.state.entity(tank).hp, 90.0, "20 halved to 10 by the shield");
+    }
+
+    /// An enraged attacker deals `1 + ENRAGE_BONUS` times damage — and the bonus
+    /// stacks multiplicatively with a weakness hit.
+    #[test]
+    fn enrage_boosts_outgoing_damage() {
+        let mut a = Arena::new();
+        let bruiser = a.add("bruiser", Team::Player, 100.0, 1.0);
+        let victim = a.add("victim", Team::Enemy, 100.0, 0.0);
+        a.ent(bruiser)
+            .statuses
+            .push(Status { kind: StatusKind::Enrage, stacks: 1, duration: 10 });
+        a.ent(victim).weaknesses.push(DamageType::Fire);
+        let burn = a.skill(damage_skill("Burn", 10.0, Some(DamageType::Fire), 0));
+        a.gambit(bruiser, Node::act(TargetQuery::new(Pool::Enemies), burn));
+
+        let mut combat = a.into_combat();
+        combat.tick();
+
+        // 10 * 1.5 (enrage) * 1.5 (weakness) = 22.5
+        assert_eq!(combat.state.entity(victim).hp, 77.5);
+    }
+
+    /// Cleanse strips every harmful status but leaves beneficial ones alone.
+    #[test]
+    fn cleanse_strips_harmful_statuses_only() {
+        let mut a = Arena::new();
+        let cleric = a.add("cleric", Team::Player, 100.0, 1.0);
+        let ally = a.add("ally", Team::Player, 100.0, 0.0);
+        let _enemy = a.add("enemy", Team::Enemy, 100.0, 0.0);
+        for kind in [StatusKind::Poison, StatusKind::Snare] {
+            a.ent(ally).statuses.push(Status { kind, stacks: 2, duration: 10 });
+        }
+        a.ent(ally)
+            .statuses
+            .push(Status { kind: StatusKind::Regen, stacks: 1, duration: 10 });
+        let purify = a.skill(Skill {
+            name: "Purify".into(),
+            cost: 0,
+            range: 1000.0,
+            cooldown: 0,
+            cast_time: 0,
+            damage_type: None,
+            effects: vec![Effect::Cleanse],
+        });
+        a.gambit(
+            cleric,
+            Node::act(
+                TargetQuery::new(Pool::Allies).filter(Filter::HasStatus(StatusKind::Poison)),
+                purify,
+            ),
+        );
+
+        let mut combat = a.into_combat();
+        let log = combat.tick();
+
+        assert!(log.contains(&Event::Cleansed { target: ally }));
+        let statuses = &combat.state.entity(ally).statuses;
+        assert!(
+            statuses.iter().all(|s| !s.kind.is_harmful()),
+            "harmful statuses should be gone, got {statuses:?}"
+        );
+        assert!(
+            statuses.iter().any(|s| s.kind == StatusKind::Regen),
+            "the beneficial Regen must survive the cleanse"
+        );
+    }
+
+    /// A `Pick::All` heal is a group heal: every hurt ally in range is mended by
+    /// the one action.
+    #[test]
+    fn pick_all_heal_mends_the_whole_group() {
+        let mut a = Arena::new();
+        let cleric = a.add("cleric", Team::Player, 100.0, 1.0);
+        let ally1 = a.add("ally1", Team::Player, 40.0, 0.0);
+        let ally2 = a.add("ally2", Team::Player, 60.0, 0.0);
+        let _enemy = a.add("enemy", Team::Enemy, 100.0, 0.0);
+        // Point-blank so both heals land instantly (no flights to wait out).
+        a.ent(ally1).pos.x = 1.0;
+        a.ent(ally2).pos.x = 2.0;
+        let prayer = a.skill(Skill {
+            name: "Prayer".into(),
+            cost: 0,
+            range: 8.0,
+            cooldown: 0,
+            cast_time: 0,
+            damage_type: None,
+            effects: vec![Effect::Heal(10.0)],
+        });
+        a.gambit(
+            cleric,
+            Node::act(
+                TargetQuery::new(Pool::Allies)
+                    .filter(Filter::HpPctBelow(0.9))
+                    .pick(Pick::All),
+                prayer,
+            ),
+        );
+
+        let mut combat = a.into_combat();
+        combat.tick();
+
+        assert_eq!(combat.state.entity(ally1).hp, 50.0);
+        assert_eq!(combat.state.entity(ally2).hp, 70.0);
     }
 
     /// A snare cuts drift by `SNARE_SLOW`: a snared mover covers only the reduced
