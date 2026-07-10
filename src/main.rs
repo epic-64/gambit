@@ -30,15 +30,8 @@ const TICK_INTERVAL: f32 = 0.25;
 /// Width reserved on the right for the event log.
 const LOG_W: f32 = 300.0;
 
-/// Lifetime (real seconds) of a ranged projectile — the time it takes to fly
-/// from shooter to target.
-const PROJECTILE_LIFE: f32 = 0.18;
 /// Lifetime (real seconds) of a melee pierce-beam before it fades out.
 const PIERCE_LIFE: f32 = 0.22;
-/// Skills reaching past this many world units read as *ranged* (shoot a
-/// projectile); at or under it they're *melee* (a pierce-line). Gap-closers
-/// (Dash/Charge) are always melee — they close to contact before they hit.
-const MELEE_RANGE: f32 = 3.0;
 
 // Intent-line palette (toggled with I). Kept faint so the lines read as an
 // overlay under the tokens, and off the team colors so a red line means
@@ -64,11 +57,11 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
 }
 
-/// A transient attack visual, animated in real time (independent of the sim
-/// tick) and dropped once it ages past its `life`. Spawned whenever a skill
-/// resolves (an `Acted` event) — one per target it hits.
+/// A transient melee-hit visual — a pierce-beam that snaps from the attacker
+/// through the target and fades. Animated in real time, dropped once it ages
+/// past `life`. Decorates an *already-resolved* point-blank hit; projectiles
+/// are NOT vfx — they're sim state, drawn live in [`draw_flights`].
 struct Vfx {
-    kind: VfxKind,
     /// World position the attack originates from (the actor).
     from: Pos,
     /// World position it lands on (a target).
@@ -78,21 +71,6 @@ struct Vfx {
     age: f32,
     /// Total lifetime in seconds.
     life: f32,
-}
-
-enum VfxKind {
-    /// A shot that travels from `from` to `to` across its lifetime (ranged skills).
-    Projectile,
-    /// A beam that snaps from `from` through `to` and fades in place (melee attacks).
-    Pierce,
-}
-
-/// Whether a skill reads as ranged (shoots a projectile) rather than melee (a
-/// pierce-line). Gap-closers dash to contact first, so they're melee regardless
-/// of their reach; otherwise anything with more than melee range shoots.
-fn is_ranged(skill: &Skill) -> bool {
-    let gap_closer = skill.effects.iter().any(|e| matches!(e, Effect::Dash { .. }));
-    !gap_closer && skill.range > MELEE_RANGE
 }
 
 /// Tint an attack visual by its element (heals/utility with no damage type get
@@ -109,27 +87,26 @@ fn skill_color(skill: &Skill) -> Color {
     }
 }
 
-/// Spawn attack visuals for an `Acted` event: a projectile per target for ranged
-/// skills, a pierce-beam per target for melee. Positions are read from the
-/// current (post-resolution) world, so a dash's beam fires from where it landed.
+/// Spawn hit visuals for an `Acted` event: point-blank targets get a
+/// pierce-beam (their hit landed this instant). Farther targets got a sim
+/// projectile — drawn live in [`draw_flights`] until it lands — and a
+/// gap-closer's visual is the lunge itself.
 fn spawn_attack_vfx(combat: &Combat, ev: &Event, vfx: &mut Vec<Vfx>) {
     let Event::Acted { actor, skill, targets } = ev else {
         return;
     };
     let s = combat.state.skill(*skill);
+    if s.effects.iter().any(|e| matches!(e, Effect::Dash { .. })) {
+        return;
+    }
     let from = combat.state.entity(*actor).pos;
     let color = skill_color(s);
-    let ranged = is_ranged(s);
     for &t in targets {
         let to = combat.state.entity(t).pos;
-        vfx.push(Vfx {
-            kind: if ranged { VfxKind::Projectile } else { VfxKind::Pierce },
-            from,
-            to,
-            color,
-            age: 0.0,
-            life: if ranged { PROJECTILE_LIFE } else { PIERCE_LIFE },
-        });
+        if from.dist(to) > combat::MELEE_RANGE {
+            continue; // in flight — the sim's projectile draws it
+        }
+        vfx.push(Vfx { from, to, color, age: 0.0, life: PIERCE_LIFE });
     }
 }
 
@@ -247,10 +224,12 @@ async fn main() {
                 for e in &combat.state.entities {
                     draw_entity(world, e, combat.is_casting(e.id));
                 }
-                // Attack visuals ride on top of the tokens.
+                // Attack visuals ride on top of the tokens: fading pierce-beams
+                // (event decoration) and live projectiles (sim state).
                 for v in &vfx {
                     draw_vfx(world, v);
                 }
+                draw_flights(world, combat);
                 draw_log(&log);
                 draw_hud(combat, paused, scenarios[current].0);
             }
@@ -462,6 +441,14 @@ fn draw_entity(world: World, e: &Entity, casting: bool) {
 fn draw_intent(world: World, e: &Entity, combat: &Combat) {
     let (sx, sy) = world_to_screen(world, e.pos.x, e.pos.y);
 
+    // Mid-lunge: the dash is the intent — mark who it's diving on.
+    if let Some(t) = combat.dash_target(e.id) {
+        let tp = combat.state.entity(t).pos;
+        let (tx, ty) = world_to_screen(world, tp.x, tp.y);
+        draw_line(sx, sy, tx, ty, 2.0, INTENT_TOWARD);
+        return;
+    }
+
     // Casting: movement is suppressed, the committed targets are the intent.
     if let Some(targets) = combat.cast_targets(e.id) {
         for &t in targets {
@@ -499,45 +486,45 @@ fn draw_intent(world: World, e: &Entity, combat: &Combat) {
     }
 }
 
-/// Draw one attack visual: a glowing projectile lerping toward its target, or a
-/// melee pierce-beam that snaps through the target and fades.
+/// Draw one melee pierce-beam: it snaps from the actor through the target and
+/// fades over its life.
 fn draw_vfx(world: World, v: &Vfx) {
     let t = (v.age / v.life).clamp(0.0, 1.0);
     let scale = world_scale(world);
-    match v.kind {
-        VfxKind::Projectile => {
-            // The head travels from source to target across the projectile's life.
-            let cx = lerp(v.from.x, v.to.x, t);
-            let cy = lerp(v.from.y, v.to.y, t);
-            let (hx, hy) = world_to_screen(world, cx, cy);
-            // A short trail a few frames behind the head.
-            let tail_t = (t - 0.3).max(0.0);
-            let (tx, ty) = world_to_screen(
-                world,
-                lerp(v.from.x, v.to.x, tail_t),
-                lerp(v.from.y, v.to.y, tail_t),
-            );
-            let r = (ENTITY_RADIUS * scale * 0.5).max(4.0);
-            draw_line(tx, ty, hx, hy, r * 0.9, with_alpha(v.color, 0.35));
-            draw_circle(hx, hy, r * 1.8, with_alpha(v.color, 0.25)); // glow
-            draw_circle(hx, hy, r, v.color);
-            draw_circle(hx, hy, r * 0.5, WHITE); // hot core
-        }
-        VfxKind::Pierce => {
-            // A beam from the actor through the target; fades over its life.
-            let a = 1.0 - t;
-            let dx = v.to.x - v.from.x;
-            let dy = v.to.y - v.from.y;
-            let len = (dx * dx + dy * dy).sqrt().max(f32::EPSILON);
-            let (nx, ny) = (dx / len, dy / len);
-            // Extend a little past the target so it reads as piercing through it.
-            let ext = 2.0 * ENTITY_RADIUS;
-            let (sx, sy) = world_to_screen(world, v.from.x, v.from.y);
-            let (ex, ey) = world_to_screen(world, v.to.x + nx * ext, v.to.y + ny * ext);
-            let w = (ENTITY_RADIUS * scale * 0.5).max(3.0);
-            draw_line(sx, sy, ex, ey, w * 1.6, with_alpha(v.color, 0.28 * a)); // glow
-            draw_line(sx, sy, ex, ey, w * 0.7, with_alpha(WHITE, a)); // bright core
-        }
+    let a = 1.0 - t;
+    let dx = v.to.x - v.from.x;
+    let dy = v.to.y - v.from.y;
+    let len = (dx * dx + dy * dy).sqrt().max(f32::EPSILON);
+    let (nx, ny) = (dx / len, dy / len);
+    // Extend a little past the target so it reads as piercing through it.
+    let ext = 2.0 * ENTITY_RADIUS;
+    let (sx, sy) = world_to_screen(world, v.from.x, v.from.y);
+    let (ex, ey) = world_to_screen(world, v.to.x + nx * ext, v.to.y + ny * ext);
+    let w = (ENTITY_RADIUS * scale * 0.5).max(3.0);
+    draw_line(sx, sy, ex, ey, w * 1.6, with_alpha(v.color, 0.28 * a)); // glow
+    draw_line(sx, sy, ex, ey, w * 0.7, with_alpha(WHITE, a)); // bright core
+}
+
+/// Draw the sim's in-flight projectiles: a glowing head with a short trail
+/// back along the inbound path. Their positions ARE sim state — when a shot
+/// lands here, its damage lands in the same instant.
+fn draw_flights(world: World, combat: &Combat) {
+    let scale = world_scale(world);
+    for f in combat.flights() {
+        let color = skill_color(combat.state.skill(f.skill));
+        let (hx, hy) = world_to_screen(world, f.pos.x, f.pos.y);
+        // Trail points back away from the target it's homing on.
+        let tp = combat.state.entity(f.target).pos;
+        let (dx, dy) = (f.pos.x - tp.x, f.pos.y - tp.y);
+        let len = (dx * dx + dy * dy).sqrt().max(f32::EPSILON);
+        let tail = 1.2; // world units
+        let (tx, ty) =
+            world_to_screen(world, f.pos.x + dx / len * tail, f.pos.y + dy / len * tail);
+        let r = (ENTITY_RADIUS * scale * 0.5).max(4.0);
+        draw_line(tx, ty, hx, hy, r * 0.9, with_alpha(color, 0.35));
+        draw_circle(hx, hy, r * 1.8, with_alpha(color, 0.25)); // glow
+        draw_circle(hx, hy, r, color);
+        draw_circle(hx, hy, r * 0.5, WHITE); // hot core
     }
 }
 

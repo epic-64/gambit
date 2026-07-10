@@ -71,8 +71,16 @@ looks choppy, make the *sim* quantity continuous instead). Only transient event 
   (`decide_move`) — concurrent with the ATB, never move-*or*-act. Movement checks casting per
   slice, so a caster roots the instant its cast starts and stays rooted through the boundary
   the cast resolves on.
+- **Projectiles in flight:** effects land on *impact*, never at fire. A hit on a target
+  beyond `MELEE_RANGE` (3.0, per shot — a long-range skill fired point-blank connects
+  instantly) spawns a `Flight` that homes on its target at `PROJECTILE_SPEED`; reaching the
+  body applies the skill's effects there and then. Target dies first → the flight fizzles.
+- **Dash lunges:** `Effect::Dash` gap-closers are continuous, **not teleports**: the actor
+  rushes its mark at `DASH_SPEED` (committed — no gambit movement, ATB frozen), and the
+  skill's damage/status land at contact (or when the travel budget runs out). Target dies
+  mid-lunge → fizzle. `Acted` is emitted at commit; `Damage`/`Inflicted` arrive at landing.
 - **Fill bars:** `action_bar += atb_speed·dt`, capped at `READY` (1.0). **Casting entities are
-  frozen** (bar stays put until the cast resolves), stunned ones too.
+  frozen** (bar stays put until the cast resolves), stunned and dashing ones too.
 - **MP regen:** `mp += mp_regen·dt`, capped at `max_mp`.
 
 Crossing a **whole-tick boundary** fires the discrete phases, in order:
