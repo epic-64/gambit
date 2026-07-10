@@ -204,6 +204,8 @@ fn status_color(kind: StatusKind) -> Color {
         StatusKind::Silence => Color::new(0.75, 0.6, 0.95, 1.0),
         StatusKind::Stun => Color::new(0.95, 0.85, 0.3, 1.0),
         StatusKind::Snare => Color::new(0.5, 0.7, 0.95, 1.0),
+        StatusKind::SpellWard => Color::new(0.8, 0.55, 1.0, 1.0),
+        StatusKind::Sneak => Color::new(0.55, 0.6, 0.7, 1.0),
         StatusKind::RegenAura => Color::new(0.45, 0.9, 0.6, 1.0),
         StatusKind::MightAura => Color::new(1.0, 0.6, 0.3, 1.0),
     }
@@ -303,6 +305,32 @@ fn spawn_impact_vfx(
             };
             push_text(vfx, at, text, size, color);
             flash.insert(*target, (FLASH_LIFE, mix(WHITE, color, 0.35)));
+        }
+        Event::Reflected { bearer, attacker, dmg_type } => {
+            // The parry reads as a popup on the bearer plus the spell's beam
+            // snapping *back* toward its caster; the rebound's own Damage
+            // event supplies the burst and number on the attacker.
+            let a = combat.state.entity(*bearer).pos;
+            let b = combat.state.entity(*attacker).pos;
+            push_text(vfx, a, "reflected!".into(), 19.0, status_color(StatusKind::SpellWard));
+            vfx.push(Vfx {
+                kind: VfxKind::Beam { from: a, to: b },
+                color: damage_color(*dmg_type),
+                age: 0.0,
+                life: PIERCE_LIFE,
+            });
+        }
+        Event::Chained { from, to, dmg_type } => {
+            // The arc between two chain victims — the same snap-and-fade beam
+            // as a melee pierce, tinted by the element it carries.
+            let a = combat.state.entity(*from).pos;
+            let b = combat.state.entity(*to).pos;
+            vfx.push(Vfx {
+                kind: VfxKind::Beam { from: a, to: b },
+                color: damage_color(*dmg_type),
+                age: 0.0,
+                life: PIERCE_LIFE,
+            });
         }
         Event::Heal { target, amount } => {
             let at = combat.state.entity(*target).pos;
@@ -951,8 +979,15 @@ fn draw_entity(
         col = mix(col, fc, 0.75 * k.clamp(0.0, 1.0));
         draw_circle_lines(sx, sy, r + 2.5, 2.5, with_alpha(fc, 0.8 * k));
     }
-    draw_circle(sx, sy, r, col);
-    draw_circle_lines(sx, sy, r, 2.0, Color::new(0.0, 0.0, 0.0, 0.4));
+    // A sneaking unit ghosts: the omniscient viewer still tracks it, but the
+    // faded token reads as "the other team can't see this".
+    if alive && e.status(StatusKind::Sneak).is_some() {
+        draw_circle(sx, sy, r, with_alpha(col, 0.22));
+        draw_circle_lines(sx, sy, r, 2.0, with_alpha(col, 0.6));
+    } else {
+        draw_circle(sx, sy, r, col);
+        draw_circle_lines(sx, sy, r, 2.0, Color::new(0.0, 0.0, 0.0, 0.4));
+    }
 
     // A casting unit is rooted mid-spell — ring it and label it.
     if alive && casting {
@@ -1232,6 +1267,12 @@ fn format_event(c: &Combat, ev: &Event) -> String {
         Event::Damage { target, amount, weakness, .. } => {
             let tag = if *weakness { " (weak!)" } else { "" };
             format!("   {} -{amount:.0}{tag}", name(*target))
+        }
+        Event::Reflected { bearer, attacker, .. } => {
+            format!("   {} reflects the spell at {}", name(*bearer), name(*attacker))
+        }
+        Event::Chained { from, to, .. } => {
+            format!("   {} arcs to {}", name(*from), name(*to))
         }
         Event::Heal { target, amount } => format!("   {} +{amount:.0} hp", name(*target)),
         Event::Inflicted { target, kind, stacks } => {

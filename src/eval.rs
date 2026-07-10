@@ -438,6 +438,10 @@ fn candidates(
     };
 
     base.into_iter()
+        // Stealth is implicit infeasibility, like range and LoS: a sneaking
+        // entity simply doesn't exist to hostile queries — targets, conditions
+        // and movement references alike. Teammates still see it.
+        .filter(|&id| state.visible_to(actor, id))
         .filter(|&id| query.filters.iter().all(|f| pass_filter(f, id, actor, state)))
         // A skill's `range` is supplied only for action feasibility (never for
         // condition/movement queries). When it is, both range *and* line-of-sight

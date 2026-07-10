@@ -320,6 +320,28 @@ pub fn skirmish() -> Combat {
             effects: vec![Effect::Damage(34.0)],
         },
     );
+    // Mage's chain lightning: a modest bolt that arcs to nearby foes — each
+    // jump strikes the nearest unstruck enemy within 5m of the last victim for
+    // 70% of the previous hit. The anti-clump nuke (death-balling now has a
+    // price); against a spread line it's just a weak fireball, so the gambit
+    // only fires it at a target standing near another enemy.
+    let chain_lightning = push_skill(
+        &mut skills,
+        Skill {
+            name: "Chain Lightning".into(),
+            cost: 25,
+            range: 100.0,
+            cooldown: 10,
+            cast_time: 2,
+            damage_type: Some(DamageType::Lightning),
+            effects: vec![Effect::ChainDamage {
+                base: 15.0,
+                jumps: 3,
+                falloff: 0.7,
+                jump_range: 5.0,
+            }],
+        },
+    );
     // Archer's aimed shot: a 4-tick draw for roughly 2.5× a plink Shot. Range
     // 12 (not map-wide) so a mark that walks away mid-aim fizzles it — and the
     // gambit only takes the shot when no foe is within melee threat range,
@@ -421,6 +443,52 @@ pub fn skirmish() -> Combat {
                     duration: 8,
                 },
             ],
+        },
+    );
+    // Assassin's spell counter: a 3s (12-tick) one-charge ward that eats the
+    // next hostile damage *spell* (elemental, non-physical) to land and hurls
+    // it back at its caster. The anti-mage tool for the very frame every
+    // enemy nuke hunts (squishiest-first targeting finds the assassin) —
+    // physical arrows and swords ignore it entirely. Deliberately a *window*,
+    // not a stance: the 1-tick cast is a visible tell that roots the assassin,
+    // and the cooldown is twice the ward, so it's down more than it's up and
+    // an enemy can time a nuke into the gap.
+    let spell_counter = push_skill(
+        &mut skills,
+        Skill {
+            name: "Spell Counter".into(),
+            cost: 10,
+            range: 100.0,
+            cooldown: 24,
+            cast_time: 1,
+            damage_type: None,
+            effects: vec![Effect::Inflict {
+                kind: StatusKind::SpellWard,
+                stacks: 1,
+                duration: 12,
+            }],
+        },
+    );
+    // Assassin's sneak: vanish for 5s (20 ticks). While hidden the other team
+    // can't target or chase it, and an unresolved cast loses a vanished mark —
+    // but it's invisibility, not invulnerability: projectiles already flying,
+    // lunges underway, and chain arcs still connect. The panic button for a
+    // dive gone wrong; taking any action breaks it, so cashing it in on a kill
+    // is a choice. The 20s (80-tick) cooldown makes it once a fight-phase.
+    let sneak = push_skill(
+        &mut skills,
+        Skill {
+            name: "Sneak".into(),
+            cost: 15,
+            range: 100.0,
+            cooldown: 80,
+            cast_time: 0,
+            damage_type: None,
+            effects: vec![Effect::Inflict {
+                kind: StatusKind::Sneak,
+                stacks: 1,
+                duration: 20,
+            }],
         },
     );
     // Assassin's finisher: +1% damage per 1% of the target's missing HP — the
@@ -635,10 +703,10 @@ pub fn skirmish() -> Combat {
         // Players muster on the west edge; the enemy on the east.
         mk(0, "Brawler", Team::Player, 150.0, 0.26, 0.42, 3.5, 7.0, vec![charge, bash], &[]),
         mk(1, "Archer", Team::Player, 65.0, 0.30, 0.36, 2.0, 2.5, vec![snipe, shot], &[]),
-        mk(2, "Mage", Team::Player, 50.0, 0.22, 0.30, 2.0, 11.0, vec![ice_lance, fireball, shot], &[]),
+        mk(2, "Mage", Team::Player, 50.0, 0.22, 0.30, 2.0, 11.0, vec![ice_lance, chain_lightning, fireball, shot], &[]),
         mk(3, "Cleric", Team::Player, 70.0, 0.24, 0.34, 2.0, 7.0, vec![prayer, heal, barrier, purify, shot], &[]),
         mk(4, "Ogre", Team::Enemy, 160.0, 0.20, 0.30, 20.5, 7.0, vec![war_cry, bash], &[DamageType::Fire]),
-        mk(5, "Assassin", Team::Enemy, 55.0, 0.34, 0.50, 22.0, 2.5, vec![dash, reap, backstab, strike], &[]),
+        mk(5, "Assassin", Team::Enemy, 55.0, 0.34, 0.50, 22.0, 2.5, vec![sneak, spell_counter, dash, reap, backstab, strike], &[]),
         mk(6, "Raider", Team::Enemy, 62.0, 0.30, 0.36, 22.0, 11.0, vec![snipe, shot], &[]),
         mk(7, "Shaman", Team::Enemy, 60.0, 0.24, 0.34, 22.0, 7.0, vec![heal, siphon, shot], &[DamageType::Holy]),
         // The chanters: one per side, mirrored roles. Blue sings the offensive
@@ -754,6 +822,19 @@ pub fn skirmish() -> Combat {
     // into a healed 480-HP ogre evaporate, which is what the old
     // toughest-first rule amounted to. Falls to plinking when the pool dries.
     let squishiest_enemy = || TargetQuery::new(Pool::Enemies).sort(SortKey::MaxHp, Order::Asc);
+    // A foe with company: an enemy standing within arc range of *another*
+    // enemy (the nested reference never matches the candidate itself, so lone
+    // stragglers don't qualify) — the clump a chain lightning cashes in on.
+    // Squishiest-first so the full-strength primary hit lands on the frailest
+    // frame and the falloff arcs sweep its neighbours.
+    let clustered_enemy = || {
+        TargetQuery::new(Pool::Enemies)
+            .filter(Filter::WithinDistanceOf(
+                Box::new(TargetQuery::new(Pool::Enemies).pick(Pick::All)),
+                5.0,
+            ))
+            .sort(SortKey::MaxHp, Order::Asc)
+    };
     gambits.insert(
         EntityId(2),
         Node::context(
@@ -761,6 +842,7 @@ pub fn skirmish() -> Combat {
             GroupMode::Fallthrough,
             vec![
                 Node::act(squishiest_enemy(), ice_lance),
+                Node::act(clustered_enemy(), chain_lightning),
                 Node::act(squishiest_enemy(), fireball),
                 Node::act(nearest_enemy(), shot),
             ],
@@ -773,13 +855,59 @@ pub fn skirmish() -> Combat {
     // targets it falls through to backstab (stack the DoT first). Strike is the
     // always-feasible floor: with everything on cooldown it still swings
     // instead of idling with a full bar.
+    // A kill-ready mark for a stealth opening: an enemy already bleeding out.
+    let weak_mark = || {
+        TargetQuery::new(Pool::Enemies)
+            .filter(Filter::HpPctBelow(0.4))
+            .sort(SortKey::HpPct, Order::Asc)
+    };
     gambits.insert(
         EntityId(5),
         Node::context(
             Condition::Always,
             GroupMode::Fallthrough,
             vec![
-                Node::act(weakest_enemy(), dash),
+                // Swarmed? Vanish. Two foes in melee reach of this frame is
+                // already lethal pressure — survival outranks everything.
+                Node::act(TargetQuery::new(Pool::Myself), sneak).when(Condition::Count {
+                    q: TargetQuery::new(Pool::Enemies).filter(Filter::WithinDistance(4.0)),
+                    cmp: Cmp::Ge,
+                    n: 2,
+                }),
+                // While hidden, only a kill justifies breaking stealth: dash
+                // out of the shadows onto a bleeding mark, or finish one in
+                // reach. Commit — with no such mark it *waits*, staying
+                // hidden while the movement gambit slips it out of the press,
+                // instead of falling through to the ordinary rotation.
+                Node::context(
+                    Condition::Exists(
+                        TargetQuery::new(Pool::Myself).filter(Filter::HasStatus(StatusKind::Sneak)),
+                    ),
+                    GroupMode::Commit,
+                    vec![
+                        Node::act(weak_mark(), dash),
+                        Node::act(weak_mark(), reap),
+                        Node::act(weak_mark(), backstab),
+                    ],
+                ),
+                // Re-raise the ward whenever it has lapsed (the chanter's
+                // re-sing pattern; the cooldown alone paces it and keeps it
+                // down more than up).
+                Node::act(
+                    TargetQuery::new(Pool::Myself)
+                        .filter(Filter::Not(Box::new(Filter::HasStatus(StatusKind::SpellWard)))),
+                    spell_counter,
+                ),
+                // Dive only once the fight has actually formed: 2+ foes tied
+                // up in melee with teammates (2 is "most" of the players who
+                // ever frontline — the rest hold a ranged standoff). Until
+                // then the assassin stalks instead of opening the battle solo;
+                // its melee kit below still answers anyone who comes to *it*.
+                Node::act(weakest_enemy(), dash).when(Condition::Count {
+                    q: ally_attacker(),
+                    cmp: Cmp::Ge,
+                    n: 2,
+                }),
                 // 0.7 is Reap's break-even vs Backstab (10 x 1.3 = 13 flat) —
                 // below that, the execute scaling wins.
                 Node::act(
@@ -950,8 +1078,44 @@ pub fn skirmish() -> Combat {
     move_gambits.insert(EntityId(6), ranged_move());
     move_gambits.insert(EntityId(3), ranged_move());
     move_gambits.insert(EntityId(7), ranged_move());
-    // The assassin dives the squishiest target directly.
-    move_gambits.insert(EntityId(5), MoveGambit::toward(weakest_enemy()));
+    // The assassin stalks, then dives — the movement mirror of its dash gate.
+    // The dive pull homes on the squishiest foe already trading blows with a
+    // teammate; before the lines meet that query matches nothing and drops
+    // out, leaving only the pack-riding term, so the assassin never marches
+    // out ahead to open the battle alone.
+    move_gambits.insert(
+        EntityId(5),
+        MoveGambit::new(vec![
+            // While sneaking, slip out of the press: the reference query only
+            // matches when the nested self-query does (i.e. the assassin is
+            // actually hidden), so the whole term drops out while visible —
+            // the same query-drops-out gating as the dive pull below.
+            (
+                Term::AwayFrom(
+                    TargetQuery::new(Pool::Enemies)
+                        .filter(Filter::WithinDistanceOf(
+                            Box::new(
+                                TargetQuery::new(Pool::Myself)
+                                    .filter(Filter::HasStatus(StatusKind::Sneak)),
+                            ),
+                            6.0,
+                        ))
+                        .sort(SortKey::Distance, Order::Asc),
+                ),
+                2.5,
+            ),
+            (Term::Near(ally_attacker(), 0.0), 1.5),
+            (
+                Term::Near(
+                    TargetQuery::new(Pool::Allies)
+                        .filter(Filter::NotSelf)
+                        .sort(SortKey::Distance, Order::Asc),
+                    2.0,
+                ),
+                0.8,
+            ),
+        ]),
+    );
     // Chanters ride with the pack — but "the pack" must mean where their
     // touch-range kit has work, not merely the nearest teammate (v1 hugged
     // the backline at a polite 6-unit standoff from the fight, leaving both
@@ -1162,6 +1326,9 @@ mod tests {
         assert!(used("Prayer"), "the cleric should group-heal a bleeding party");
         assert!(used("Snipe"), "an archer should take the aimed shot while unthreatened");
         assert!(used("Ice Lance"), "the mage should commit to its heavy nuke");
+        assert!(used("Chain Lightning"), "the mage should arc a bolt through a clump");
+        assert!(used("Spell Counter"), "the assassin should raise its spell ward");
+        assert!(used("Sneak"), "the assassin should vanish when swarmed");
         assert!(used("War Chant"), "the blue chanter should raise its might aura");
         assert!(used("Life Chant"), "the red chanter should raise its regen aura");
         assert!(used("Mana Rend"), "the blue chanter should tear MP in melee");
