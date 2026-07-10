@@ -45,9 +45,14 @@ src/
               A*-routed around terrain. (unit tests)
   combat.rs   Combat: the ATB loop + movement + cast-time state machine + action resolution. (unit tests)
   scenario.rs Hand-built demo battle + demo map (temporary, until real encounters exist).
+  editor.rs   Engine-agnostic support for the gambit editor: describe-as-text for every gambit
+              value, the preset catalogs the editor cycles through (presets over raw knobs, per
+              the UX principle), and path-addressed structural edits on the rule tree. (unit tests)
   main.rs     Macroquad viewer: feeds real frame time to Combat::step and draws combat.state
               verbatim — terrain (elevation/walls/pits), HP/action bars, movement + casting,
-              intent lines, log. No render-side interpolation.
+              intent lines, log. No render-side interpolation. Also hosts the gambit editor
+              screen (G in battle): roster → one character at a time, action-tree + movement
+              panels; edits mutate the live Combat and survive R-restarts.
 ```
 
 Run `cargo test` for the behaviour specs and `cargo run` for the live viewer
