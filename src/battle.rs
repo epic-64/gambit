@@ -79,12 +79,21 @@ pub enum StatusKind {
     /// (enforced in the combat loop).
     Sneak,
     /// Aura: teammates within [`crate::combat::AURA_RADIUS`] of the bearer
-    /// (bearer included) regenerate HP continuously — weak, steady sustain that
-    /// rewards fighting near the chanter. See the aura rules on [`StatusKind::is_aura`].
+    /// (bearer included) recover a small HP pulse every
+    /// [`crate::combat::AURA_REGEN_PULSE_PERIOD`]-th tick — weak, steady
+    /// sustain that rewards fighting near the chanter. See the aura rules on
+    /// [`StatusKind::is_aura`].
     RegenAura,
     /// Aura: teammates within [`crate::combat::AURA_RADIUS`] of the bearer
     /// (bearer included) deal `1 + AURA_MIGHT_BONUS` times damage.
     MightAura,
+    /// Aura: a crackling storm field centred on the bearer — every *foe*
+    /// within [`crate::combat::STORM_RADIUS`] takes
+    /// [`crate::combat::STORM_DAMAGE_PER_PULSE`] every
+    /// [`crate::combat::STORM_PULSE_PERIOD`]-th tick. The hostile mirror
+    /// of the chanter auras: same one-at-a-time / refresh rules, but the
+    /// bearer must carry the field into contact for it to bite.
+    StormAura,
     /// Cracked guard: the bearer takes [`crate::combat::EXPOSED_DAMAGE_BONUS`]
     /// more damage from *every* source — skill hits and DoT pulses alike — while
     /// it lasts. The focus-fire amplifier: flat regardless of stacks (like
@@ -104,7 +113,10 @@ impl StatusKind {
     /// (a new chant replaces the old), and re-applying one refreshes its
     /// duration without stacking.
     pub fn is_aura(self) -> bool {
-        matches!(self, StatusKind::RegenAura | StatusKind::MightAura)
+        matches!(
+            self,
+            StatusKind::RegenAura | StatusKind::MightAura | StatusKind::StormAura
+        )
     }
 
     /// Whether the status hurts its bearer — the set [`Effect::Cleanse`] strips.
