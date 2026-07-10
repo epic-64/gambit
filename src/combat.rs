@@ -22,6 +22,16 @@ const WEAKNESS_MULT: f32 = 1.5;
 const POISON_PER_STACK: f32 = 3.0;
 const BURN_PER_STACK: f32 = 5.0;
 const REGEN_PER_STACK: f32 = 4.0;
+/// A hit at or under this distance lands immediately (you're in contact);
+/// anything farther is a projectile that has to *travel* — its effects apply
+/// on impact, not at fire. Per shot, not per skill: a long-range skill fired
+/// point-blank still connects instantly.
+pub const MELEE_RANGE: f32 = 3.0;
+/// World units a projectile flies per tick (homing on its target).
+const PROJECTILE_SPEED: f32 = 12.0;
+/// World units a gap-closer travels per tick — a fast, visible lunge, not a
+/// teleport. Well above any `move_speed`, so a dash always catches its mark.
+const DASH_SPEED: f32 = 8.0;
 
 /// Something that happened during a tick — a log for tests and (later) the UI.
 #[derive(Debug, Clone, PartialEq)]
@@ -55,8 +65,9 @@ pub enum Event {
         skill: SkillId,
         targets: Vec<EntityId>,
     },
-    /// A cast completed but no committed target was still valid (dead or moved
-    /// out of range) — it produces no effect. The counterplay to a big cast.
+    /// An attack came to nothing: a completed cast with no committed target
+    /// still valid (dead or out of range), or a projectile/dash whose target
+    /// died in flight. The counterplay to committing to a big attack.
     Fizzled {
         actor: EntityId,
         skill: SkillId,
@@ -73,6 +84,26 @@ struct Cast {
     remaining: u32,
 }
 
+/// A fired attack in flight: it homes on its committed target at
+/// [`PROJECTILE_SPEED`] and the skill's effects land on impact — damage is a
+/// consequence of the hit *arriving*, never of the trigger pull. Its `pos` is
+/// sim state; the viewer draws it directly.
+pub struct Flight {
+    pub actor: EntityId,
+    pub skill: SkillId,
+    pub target: EntityId,
+    pub pos: Pos,
+}
+
+/// A gap-closer in progress: the actor lunges at its primary target at
+/// [`DASH_SPEED`] (continuous — not a teleport), and the skill's effects land
+/// at contact. `budget` is the travel allowance left (the `Effect::Dash` max);
+/// exhausting it delivers the hit from wherever the lunge ended.
+struct DashRun {
+    action: Action,
+    budget: f32,
+}
+
 /// Owns the mutable battle plus each entity's gambit tree, and advances time.
 pub struct Combat {
     pub state: BattleState,
@@ -84,6 +115,11 @@ pub struct Combat {
     pub move_gambits: HashMap<EntityId, MoveGambit>,
     /// Casts currently in flight, keyed by caster. Presence == "is casting".
     casts: HashMap<EntityId, Cast>,
+    /// Projectiles currently in the air (see [`Flight`]).
+    flights: Vec<Flight>,
+    /// Gap-closer lunges in progress, keyed by the dashing actor. While
+    /// present the actor is committed: no gambit movement, ATB frozen.
+    dashes: HashMap<EntityId, DashRun>,
     /// Each mover's movement intent from the latest tick (goal stand point +
     /// term references), for the viewer's intent lines. Absent while holding
     /// position, casting, stunned, or dead.
@@ -103,6 +139,8 @@ impl Combat {
             gambits,
             move_gambits: HashMap::new(),
             casts: HashMap::new(),
+            flights: Vec::new(),
+            dashes: HashMap::new(),
             move_intents: HashMap::new(),
             time: 0,
             frac: 0.0,
@@ -142,6 +180,21 @@ impl Combat {
         self.move_intents.get(&id)
     }
 
+    /// Projectiles currently in the air — sim state the viewer draws directly.
+    pub fn flights(&self) -> &[Flight] {
+        &self.flights
+    }
+
+    /// Whether `id` is mid-lunge (gap-closer in progress).
+    pub fn is_dashing(&self, id: EntityId) -> bool {
+        self.dashes.contains_key(&id)
+    }
+
+    /// The entity `id` is lunging at, if it is mid-dash.
+    pub fn dash_target(&self, id: EntityId) -> Option<EntityId> {
+        self.dashes.get(&id).and_then(|d| d.action.targets.first().copied())
+    }
+
     /// Run ticks until the battle ends or `max_ticks` is reached, returning the
     /// full event log. The cap is a safety net against never-ending stalemates.
     pub fn run(&mut self, max_ticks: u32) -> Vec<Event> {
@@ -175,7 +228,7 @@ impl Combat {
         let mut events = Vec::new();
         while dt > 0.0 && !self.over {
             let slice = dt.min(1.0 - self.frac);
-            self.advance_continuous(slice);
+            self.advance_continuous(slice, &mut events);
             self.frac += slice;
             dt -= slice;
             // Float-tolerant boundary test: many small frame slices may sum
@@ -189,18 +242,27 @@ impl Combat {
     }
 
     /// The between-boundaries phases, each scaled by the tick-fraction `dt`
-    /// that elapsed: drift movement, action-bar fill, and MP regen.
-    fn advance_continuous(&mut self, dt: f32) {
+    /// that elapsed: drift movement, dash lunges, projectile flight, action-bar
+    /// fill, and MP regen. Dash contacts and projectile impacts deliver their
+    /// effects *here*, mid-slice — landing is a moment in continuous time.
+    fn advance_continuous(&mut self, dt: f32, events: &mut Vec<Event>) {
         // Movement integrates before each boundary, so a caster stays rooted
         // through the tick its cast resolves on ("rooted until it resolves")
         // and roots the instant its cast starts.
         self.tick_movement(dt);
+        self.advance_dashes(dt, events);
+        self.advance_flights(dt, events);
 
         // Fill bars, capped at READY so a waiting entity doesn't accumulate.
-        // Casting units are frozen (bar stays at 0 until the cast resolves), and
-        // so are stunned ones (their bar is held until the stun wears off).
+        // Casting units are frozen (bar stays at 0 until the cast resolves),
+        // stunned ones too (held until the stun wears off), and dashing ones
+        // (committed to the lunge until it connects).
         for e in &mut self.state.entities {
-            if e.is_alive() && !e.is_stunned() && !self.casts.contains_key(&e.id) {
+            if e.is_alive()
+                && !e.is_stunned()
+                && !self.casts.contains_key(&e.id)
+                && !self.dashes.contains_key(&e.id)
+            {
                 e.action_bar = (e.action_bar + e.atb_speed * dt).min(READY);
             }
         }
@@ -278,13 +340,15 @@ impl Combat {
                             },
                         );
                     } else {
-                        // Instant: resolve this tick.
+                        // Instant: the *decision* resolves now, but the effects
+                        // land when the attack does — immediately at point-blank,
+                        // on impact for a projectile, at contact for a dash.
                         events.push(Event::Acted {
                             actor,
                             skill: action.skill,
                             targets: action.targets.clone(),
                         });
-                        self.apply_effects(actor, &action, &skill, events);
+                        self.deliver(actor, action, &skill, events);
                         self.check_over(events);
                     }
                 }
@@ -311,6 +375,7 @@ impl Combat {
                 e.is_alive()
                     && !e.is_stunned()
                     && !self.casts.contains_key(&e.id)
+                    && !self.dashes.contains_key(&e.id) // the lunge owns the legs
                     && self.move_gambits.contains_key(&e.id)
             })
             .map(|e| e.id)
@@ -443,7 +508,7 @@ impl Combat {
             skill: action.skill,
             targets: action.targets.clone(),
         });
-        self.apply_effects(actor, &action, &skill, events);
+        self.deliver(actor, action, &skill, events);
         self.check_over(events);
     }
 
@@ -459,64 +524,153 @@ impl Combat {
         }
     }
 
-    /// Apply a skill's effects to each target. Cost/cooldown are paid separately
-    /// (see [`commit_cost`]) so this can run at cast completion without paying twice.
-    fn apply_effects(
-        &mut self,
-        actor: EntityId,
-        action: &Action,
-        skill: &Skill,
-        events: &mut Vec<Event>,
-    ) {
-        // Actor-centric effects run first: a Dash repositions the actor onto its
-        // primary target before the per-target damage/statuses land, so a charge
-        // hits from contact rather than from where it started.
-        for effect in &skill.effects {
-            if let Effect::Dash { max } = effect
-                && let Some(&primary) = action.targets.first()
-            {
-                self.apply_dash(actor, primary, *max);
-            }
+    /// Hand a resolved action to the world. Gap-closers start a dash run; a
+    /// target beyond [`MELEE_RANGE`] gets a projectile spawned at the actor;
+    /// a point-blank target takes the effects immediately. Cost/cooldown are
+    /// paid separately (see [`commit_cost`]) so cast completions don't pay
+    /// twice. Damage/heal/status land when the attack *arrives* — the sim owns
+    /// impact timing; the viewer just draws it.
+    fn deliver(&mut self, actor: EntityId, action: Action, skill: &Skill, events: &mut Vec<Event>) {
+        let dash_max = skill.effects.iter().find_map(|e| match e {
+            Effect::Dash { max } => Some(*max),
+            _ => None,
+        });
+        if let Some(max) = dash_max {
+            self.dashes.insert(actor, DashRun { action, budget: max });
+            return;
         }
 
+        let from = self.state.entity(actor).pos;
         for &tgt in &action.targets {
-            for effect in &skill.effects {
-                match effect {
-                    Effect::Damage(base) => {
-                        self.apply_damage(tgt, *base, skill.damage_type, events)
-                    }
-                    Effect::Heal(amount) => self.apply_heal(tgt, *amount, events),
-                    Effect::Inflict {
-                        kind,
-                        stacks,
-                        duration,
-                    } => self.apply_status(tgt, *kind, *stacks, *duration, events),
-                    // Actor-centric — already resolved above.
-                    Effect::Dash { .. } => {}
-                }
+            if from.dist(self.state.entity(tgt).pos) > MELEE_RANGE {
+                self.flights.push(Flight {
+                    actor,
+                    skill: action.skill,
+                    target: tgt,
+                    pos: from,
+                });
+            } else {
+                self.apply_effects_to(tgt, skill, events);
             }
         }
     }
 
-    /// Charge `actor` toward `target`, stopping at melee contact and travelling at
-    /// most `max` world units. Reuses [`resolve_collisions`] so the landing spot
-    /// stays in bounds, off other units, and off walls (the terrain backstop
-    /// holds the actor at its start if the straight dash would cross one).
-    fn apply_dash(&mut self, actor: EntityId, target: EntityId, max: f32) {
-        let from = self.state.entity(actor).pos;
-        let tp = self.state.entity(target).pos;
-        let d = from.dist(tp);
-        let contact = 2.0 * ENTITY_RADIUS;
-        let travel = (d - contact).clamp(0.0, max);
-        if travel <= f32::EPSILON {
-            return; // already in contact — nothing to close
+    /// Advance every dash lunge by `dt` ticks' worth of [`DASH_SPEED`]: chase
+    /// the target's *current* position (straight-line — a lunge is committed,
+    /// not routed), and deliver the skill's effects at contact or when the
+    /// travel budget runs out. A dash whose target dies mid-lunge fizzles;
+    /// a stunned dasher is held mid-lunge until the stun wears off.
+    fn advance_dashes(&mut self, dt: f32, events: &mut Vec<Event>) {
+        let mut ids: Vec<EntityId> = self.dashes.keys().copied().collect();
+        ids.sort_unstable_by_key(|id| id.0); // deterministic resolution order
+        for id in ids {
+            if self.over {
+                return;
+            }
+            if !self.state.entity(id).is_alive() {
+                self.dashes.remove(&id); // the dasher died mid-lunge
+                continue;
+            }
+            if self.state.entity(id).is_stunned() {
+                continue;
+            }
+            let run = &self.dashes[&id];
+            let Some(&tgt) = run.action.targets.first() else {
+                self.dashes.remove(&id);
+                continue;
+            };
+            if !self.state.entity(tgt).is_alive() {
+                let run = self.dashes.remove(&id).unwrap();
+                events.push(Event::Fizzled { actor: id, skill: run.action.skill });
+                continue;
+            }
+
+            let from = self.state.entity(id).pos;
+            let tp = self.state.entity(tgt).pos;
+            let contact = 2.0 * ENTITY_RADIUS;
+            let d = from.dist(tp);
+            let step = (DASH_SPEED * dt).min(run.budget);
+            let arrives = d - contact <= step;
+            let travel = (d - contact).clamp(0.0, step);
+            if travel > f32::EPSILON {
+                let dest = Pos {
+                    x: from.x + (tp.x - from.x) / d * travel,
+                    y: from.y + (tp.y - from.y) / d * travel,
+                };
+                let resolved = self.resolve_collisions(id, dest);
+                self.state.entities[id.0].pos = resolved;
+            }
+
+            let run = self.dashes.get_mut(&id).unwrap();
+            run.budget -= step;
+            // Budget always shrinks by the intended step, so a lunge blocked by
+            // a wall or a body still terminates — the hit lands from wherever
+            // the lunge ended, exactly like an out-of-budget one.
+            if arrives || run.budget <= f32::EPSILON {
+                let run = self.dashes.remove(&id).unwrap();
+                let skill = self.state.skill(run.action.skill).clone();
+                for &t in &run.action.targets {
+                    self.apply_effects_to(t, &skill, events);
+                }
+                self.check_over(events);
+            }
         }
-        let dest = Pos {
-            x: from.x + (tp.x - from.x) / d * travel,
-            y: from.y + (tp.y - from.y) / d * travel,
-        };
-        let resolved = self.resolve_collisions(actor, dest);
-        self.state.entities[actor.0].pos = resolved;
+    }
+
+    /// Advance every projectile by `dt` ticks' worth of [`PROJECTILE_SPEED`],
+    /// homing on its target's *current* position. Reaching the target's body
+    /// is the impact: the skill's effects apply there and then. A flight whose
+    /// target died first fizzles away.
+    fn advance_flights(&mut self, dt: f32, events: &mut Vec<Event>) {
+        let step = PROJECTILE_SPEED * dt;
+        let mut i = 0;
+        while i < self.flights.len() {
+            if self.over {
+                return;
+            }
+            let (target, fpos) = {
+                let f = &self.flights[i];
+                (f.target, f.pos)
+            };
+            if !self.state.entity(target).is_alive() {
+                let f = self.flights.swap_remove(i);
+                events.push(Event::Fizzled { actor: f.actor, skill: f.skill });
+                continue;
+            }
+            let tp = self.state.entity(target).pos;
+            let d = fpos.dist(tp);
+            if d <= step + ENTITY_RADIUS {
+                // Impact this slice.
+                let f = self.flights.swap_remove(i);
+                let skill = self.state.skill(f.skill).clone();
+                self.apply_effects_to(f.target, &skill, events);
+                self.check_over(events);
+                continue;
+            }
+            self.flights[i].pos = Pos {
+                x: fpos.x + (tp.x - fpos.x) / d * step,
+                y: fpos.y + (tp.y - fpos.y) / d * step,
+            };
+            i += 1;
+        }
+    }
+
+    /// Apply a skill's per-target effects (damage/heal/status) to one target —
+    /// the moment an attack lands. `Effect::Dash` is actor-centric and handled
+    /// by the dash run, never here.
+    fn apply_effects_to(&mut self, target: EntityId, skill: &Skill, events: &mut Vec<Event>) {
+        for effect in &skill.effects {
+            match effect {
+                Effect::Damage(base) => self.apply_damage(target, *base, skill.damage_type, events),
+                Effect::Heal(amount) => self.apply_heal(target, *amount, events),
+                Effect::Inflict {
+                    kind,
+                    stacks,
+                    duration,
+                } => self.apply_status(target, *kind, *stacks, *duration, events),
+                Effect::Dash { .. } => {}
+            }
+        }
     }
 
     fn apply_damage(
@@ -1047,7 +1201,7 @@ mod tests {
 
         combat.tick(); // resolves this tick — still no drift
         assert!(!combat.is_casting(caster));
-        assert_eq!(combat.state.entity(_enemy).hp, 90.0, "the nuke landed");
+        assert_eq!(combat.flights().len(), 1, "the nuke is on its way to the far target");
         assert_eq!(
             combat.state.entity(caster).pos,
             rooted_at,
@@ -1173,8 +1327,9 @@ mod tests {
         assert_eq!(combat.state.entity(hero).hp, 75.0);
     }
 
-    /// A charge/gap-closer (`Effect::Dash`) rushes the actor to melee contact,
-    /// then the same skill's damage and stun land from there.
+    /// A charge/gap-closer (`Effect::Dash`) is a continuous lunge, not a
+    /// teleport: committing starts the run with nothing landed yet, the actor
+    /// travels at DASH_SPEED, and the skill's damage and stun land at contact.
     #[test]
     fn charge_dashes_to_contact_deals_damage_and_stuns() {
         let mut a = Arena::new();
@@ -1187,7 +1342,7 @@ mod tests {
             name: "Charge".into(),
             cost: 0,
             range: 10.0,
-            cooldown: 0,
+            cooldown: 5, // so landing doesn't chain straight into a re-charge
             cast_time: 0,
             damage_type: Some(DamageType::Physical),
             effects: vec![
@@ -1199,15 +1354,111 @@ mod tests {
         a.gambit(hero, Node::act(TargetQuery::new(Pool::Enemies), charge));
 
         let mut combat = a.into_combat();
-        combat.tick();
 
-        // Closed the 8-unit gap and stopped a hitbox short of the enemy.
+        combat.tick(); // commits to the charge: the lunge begins, nothing landed
+        assert!(combat.is_dashing(hero));
+        assert_eq!(combat.dash_target(hero), Some(enemy));
+        assert_eq!(combat.state.entity(enemy).hp, 100.0, "damage waits for contact");
+        assert!(!combat.state.entity(enemy).is_stunned());
+
+        combat.tick(); // the 8-unit gap is within one tick of DASH_SPEED: contact
+        assert!(!combat.is_dashing(hero));
         let sep = combat.state.entity(hero).pos.dist(combat.state.entity(enemy).pos);
         let contact = 2.0 * ENTITY_RADIUS;
         assert!((sep - contact).abs() < 1e-3, "should stop at contact, sep = {sep}");
-        // The hit and the stun both landed.
+        // The hit and the stun both landed — at contact, not at commit.
         assert_eq!(combat.state.entity(enemy).hp, 85.0);
         assert!(combat.state.entity(enemy).is_stunned());
+    }
+
+    /// The lunge is visibly *in between* on the way: after a partial advance
+    /// the dasher stands strictly between its start and its mark, still
+    /// committed, with the payload still unlanded.
+    #[test]
+    fn dash_travels_continuously_not_teleporting() {
+        let mut a = Arena::new();
+        let hero = a.add_at("hero", Team::Player, 100.0, 1.0, 0.0, 0.0);
+        let enemy = a.add_at("enemy", Team::Enemy, 100.0, 0.0, 12.0, 0.0);
+        a.ent(hero).pos.y = 5.0;
+        a.ent(enemy).pos.y = 5.0;
+        let dash = a.skill(Skill {
+            name: "Dash".into(),
+            cost: 0,
+            range: 15.0,
+            cooldown: 8,
+            cast_time: 0,
+            damage_type: Some(DamageType::Physical),
+            effects: vec![Effect::Dash { max: 20.0 }, Effect::Damage(10.0)],
+        });
+        a.gambit(hero, Node::act(TargetQuery::new(Pool::Enemies), dash));
+
+        let mut combat = a.into_combat();
+        combat.tick(); // commit — still at the start
+        assert_eq!(combat.state.entity(hero).pos.x, 0.0);
+
+        combat.tick(); // one tick of DASH_SPEED: 12-unit gap not yet closed
+        let x = combat.state.entity(hero).pos.x;
+        assert!(x > 0.0 && x < 12.0, "mid-lunge, got x = {x}");
+        assert!(combat.is_dashing(hero));
+        assert_eq!(combat.state.entity(enemy).hp, 100.0, "still nothing landed");
+
+        combat.tick(); // remaining gap closes: contact, damage lands
+        assert!(!combat.is_dashing(hero));
+        assert_eq!(combat.state.entity(enemy).hp, 90.0);
+    }
+
+    /// Ranged damage lands when the projectile does, not when it's fired: the
+    /// shot spends ticks in the air crossing the arena while the target's HP
+    /// holds, then the hit applies on impact.
+    #[test]
+    fn projectile_damage_lands_on_impact_not_at_fire() {
+        let mut a = Arena::new();
+        let archer = a.add_at("archer", Team::Player, 100.0, 1.0, 0.0, 0.0);
+        let mark = a.add_at("mark", Team::Enemy, 100.0, 0.0, 30.0, 0.0);
+        a.ent(archer).pos.y = 5.0;
+        a.ent(mark).pos.y = 5.0;
+        let bow = a.skill(Skill {
+            name: "Longshot".into(),
+            cost: 0,
+            range: 100.0,
+            cooldown: 10, // a single arrow in the air at a time
+            cast_time: 0,
+            damage_type: Some(DamageType::Physical),
+            effects: vec![Effect::Damage(10.0)],
+        });
+        a.gambit(archer, Node::act(TargetQuery::new(Pool::Enemies), bow));
+
+        let mut combat = a.into_combat();
+        let events = combat.tick(); // fires: Acted now, damage later
+        assert!(events.iter().any(|e| matches!(e, Event::Acted { .. })));
+        assert_eq!(combat.flights().len(), 1);
+        assert_eq!(combat.state.entity(mark).hp, 100.0, "arrow still in the air");
+
+        combat.tick(); // 12 of 30 units covered
+        combat.tick(); // 24 of 30
+        assert_eq!(combat.state.entity(mark).hp, 100.0, "still in the air");
+        assert_eq!(combat.flights().len(), 1);
+
+        combat.tick(); // within reach — impact
+        assert!(combat.flights().is_empty());
+        assert_eq!(combat.state.entity(mark).hp, 90.0, "landed");
+    }
+
+    /// A point-blank hit (inside MELEE_RANGE) is contact — it lands the moment
+    /// the actor acts, with no flight involved.
+    #[test]
+    fn point_blank_hits_land_immediately() {
+        let mut a = Arena::new();
+        let hero = a.add("hero", Team::Player, 100.0, 1.0);
+        let enemy = a.add("enemy", Team::Enemy, 100.0, 0.0);
+        a.ent(enemy).pos.x = 1.5; // inside MELEE_RANGE
+        let strike = a.skill(damage_skill("Strike", 10.0, None, 0));
+        a.gambit(hero, Node::act(TargetQuery::new(Pool::Enemies), strike));
+
+        let mut combat = a.into_combat();
+        combat.tick();
+        assert!(combat.flights().is_empty());
+        assert_eq!(combat.state.entity(enemy).hp, 90.0);
     }
 
     /// A stunned unit can neither act nor move, and its action bar is frozen —
