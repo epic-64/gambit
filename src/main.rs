@@ -952,20 +952,30 @@ fn entity_ui_bounds(view: &View, e: &Entity) -> Rect4 {
     (sx - half_w, sy - r - 28.0, half_w * 2.0, (r + 28.0) + (r + 30.0))
 }
 
-/// Draw the units in painter order against the terrain. Entities sort north →
+/// Draw the units in painter order against the terrain. Corpses paint first as
+/// a ground layer — a body on the floor is a decal a living unit walks *over*,
+/// never behind, whatever their rows. Within each layer entities sort north →
 /// south, so one nearer the viewer draws over one behind it; then any tile
-/// that rises above an already-drawn unit's ground and reaches it on screen is
-/// repainted on top, so a unit standing behind a wall or below a hill edge is
-/// genuinely hidden. A unit whose token centre ends up covered that way gets a
-/// see-through silhouette ring so it stays trackable behind cover.
+/// that rises more than a walkable step above an already-drawn unit's ground
+/// and reaches it on screen is repainted on top, so a unit standing behind a
+/// wall or below a hill edge is genuinely hidden. (A within-[`STEP_HEIGHT`]
+/// rise — a stair the unit could walk onto — never repaints: the bilinear
+/// smoothing in [`View::elevation`] already ramps the unit up onto it, so
+/// covering its feet would read as being stuck inside the stair.) A unit whose
+/// token centre ends up covered that way gets a see-through silhouette ring so
+/// it stays trackable behind cover.
 fn draw_units(
     view: &View,
     combat: &Combat,
     flash: &HashMap<EntityId, (f32, Color)>,
     shadows: &HashMap<EntityId, ShadowBars>,
 ) {
-    let mut order: Vec<&Entity> = combat.state.entities.iter().collect();
-    order.sort_by(|a, b| a.pos.y.total_cmp(&b.pos.y).then(a.id.0.cmp(&b.id.0)));
+    let (dead, alive): (Vec<&Entity>, Vec<&Entity>) =
+        combat.state.entities.iter().partition(|e| !e.is_alive());
+    let mut layers = [dead, alive];
+    for layer in &mut layers {
+        layer.sort_by(|a, b| a.pos.y.total_cmp(&b.pos.y).then(a.id.0.cmp(&b.id.0)));
+    }
 
     let draw = |e: &Entity| {
         let fl = flash
@@ -975,44 +985,50 @@ fn draw_units(
     };
 
     let Some(t) = view.terrain else {
-        for e in &order {
-            draw(e);
+        for layer in &layers {
+            for e in layer {
+                draw(e);
+            }
         }
         return;
     };
 
     let row_of = |e: &Entity| t.tile_of(e.pos).1.clamp(0, t.rows - 1);
 
-    // Walk the rows north → south; `order[..i]` are the units already painted.
-    let mut i = 0;
-    for r in 0..t.rows {
-        // Repaint the tiles of this row that loom over an already-drawn unit:
-        // the tile rises above the unit's ground and its footprint reaches
-        // the unit's screen area. (Same-height floor south of a unit never
-        // repaints, so a token overhanging its tile edge isn't clipped.)
-        for c in 0..t.cols {
-            let Some(tile) = t.tile(c, r) else { continue };
-            if tile.elevation <= 0 {
-                continue;
+    for order in &layers {
+        // Walk the rows north → south; `order[..i]` are the units already painted.
+        let mut i = 0;
+        for r in 0..t.rows {
+            // Repaint the tiles of this row that loom over an already-drawn
+            // unit: the tile rises beyond a walkable step above the unit's
+            // ground and its footprint reaches the unit's screen area. (Floor
+            // south of a unit within a step of its height never repaints, so
+            // a token overhanging a tile edge or climbing a stair isn't
+            // clipped.)
+            for c in 0..t.cols {
+                let Some(tile) = t.tile(c, r) else { continue };
+                if tile.elevation <= 0 {
+                    continue;
+                }
+                let Some(rect) = tile_screen_bounds(view, t, c, r) else { continue };
+                let looms = order[..i].iter().any(|e| {
+                    tile.elevation > t.elevation_at(e.pos) + STEP_HEIGHT
+                        && rects_overlap(rect, entity_ui_bounds(view, e))
+                });
+                if looms {
+                    draw_tile(view, t, c, r);
+                }
             }
-            let Some(rect) = tile_screen_bounds(view, t, c, r) else { continue };
-            let looms = order[..i].iter().any(|e| {
-                tile.elevation > t.elevation_at(e.pos)
-                    && rects_overlap(rect, entity_ui_bounds(view, e))
-            });
-            if looms {
-                draw_tile(view, t, c, r);
+            while i < order.len() && row_of(order[i]) == r {
+                draw(order[i]);
+                i += 1;
             }
-        }
-        while i < order.len() && row_of(order[i]) == r {
-            draw(order[i]);
-            i += 1;
         }
     }
 
     // Anything the repaint hid gets a see-through outline on top.
-    for e in &order {
-        if e.is_alive() && occluded(view, t, e) {
+    for e in &layers[1] {
+        if occluded(view, t, e) {
             let (sx, sy) = view.pos(e.pos);
             let r = (ENTITY_RADIUS * view.scale).max(6.0);
             draw_circle_lines(sx, sy, r, 2.0, with_alpha(team_color(e.team), 0.9));
@@ -1021,9 +1037,10 @@ fn draw_units(
 }
 
 /// Is this unit's token centre covered by terrain painted in front of it —
-/// a tile south of the unit's row that rises above its ground and whose drawn
-/// footprint reaches the token? (Centre, not edge: a knee-high step clipping
-/// the unit's feet shouldn't ghost it.)
+/// a tile south of the unit's row that rises more than a walkable step above
+/// its ground and whose drawn footprint reaches the token? (Centre, not edge:
+/// a knee-high step clipping the unit's feet shouldn't ghost it — and a
+/// within-[`STEP_HEIGHT`] rise never repaints over the unit at all.)
 fn occluded(view: &View, t: &Terrain, e: &Entity) -> bool {
     let row = t.tile_of(e.pos).1.clamp(0, t.rows - 1);
     let ground = t.elevation_at(e.pos);
@@ -1031,7 +1048,7 @@ fn occluded(view: &View, t: &Terrain, e: &Entity) -> bool {
     for r in (row + 1)..t.rows {
         for c in 0..t.cols {
             let Some(tile) = t.tile(c, r) else { continue };
-            if tile.elevation > ground
+            if tile.elevation > ground + STEP_HEIGHT
                 && tile_screen_bounds(view, t, c, r).is_some_and(|b| rect_contains(b, sx, sy))
             {
                 return true;

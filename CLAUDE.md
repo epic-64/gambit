@@ -389,9 +389,13 @@ Implementation notes / decisions made while building:
   level, sunlit lip, darkening toward the ground), rim lines on drop-off edges, and contact
   shadows under taller neighbours. Units/bars/vfx project through the same `View` (bilinear
   elevation smoothing, cliff-clamped, so units walk *up* steps instead of popping). Units are
-  depth-sorted into the terrain (`draw_units`): they paint north → south (nearer the viewer =
-  drawn later), and any tile that rises above an already-drawn unit's ground is repainted over
-  it, so a unit behind a wall or below a hill edge is genuinely occluded — one whose token
+  depth-sorted into the terrain (`draw_units`): corpses paint first as a ground layer (a living
+  unit walking over a body always draws on top, whatever their rows), the living paint north →
+  south (nearer the viewer = drawn later), and any tile that rises more than a walkable step
+  (`STEP_HEIGHT`) above an already-drawn unit's ground is repainted over it, so a unit behind a
+  wall or below a hill edge is genuinely occluded — but a stair the unit could walk onto never
+  repaints over it (the elevation smoothing already ramps the unit onto it, so covering its
+  feet would read as being stuck inside the step). A unit whose token
   centre is covered ghosts through as a team-colored silhouette ring, so it stays trackable.
   Vfx and projectiles still draw on top of everything. A full isometric/2.5D (FFT-style)
   projection remains a possible future upgrade if height still reads too weakly.
