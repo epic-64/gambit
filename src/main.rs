@@ -212,6 +212,7 @@ fn status_color(kind: StatusKind) -> Color {
         StatusKind::MortalWound => Color::new(0.85, 0.3, 0.45, 1.0),
         StatusKind::RegenAura => Color::new(0.45, 0.9, 0.6, 1.0),
         StatusKind::MightAura => Color::new(1.0, 0.6, 0.3, 1.0),
+        StatusKind::StormAura => Color::new(0.55, 0.65, 1.0, 1.0),
         StatusKind::Exposed => Color::new(0.95, 0.8, 0.5, 1.0),
         StatusKind::Lifeleech => Color::new(0.9, 0.3, 0.65, 1.0),
     }
@@ -219,22 +220,44 @@ fn status_color(kind: StatusKind) -> Color {
 
 /// Draw the aura fields: a faint filled disc + ring of the aura's true radius
 /// around each living bearer, so "who is covered" is readable at a glance —
-/// the exact circle the sim tests teammates against, gently breathing.
+/// the exact circle the sim tests entities against, gently breathing. The
+/// storm field additionally crackles (flickering lightning ticks inside the
+/// ring), so a *hostile* field never reads as a teammate's buff circle.
 fn draw_auras(view: &View, combat: &Combat) {
-    let breathe = 0.75 + 0.25 * (get_time() as f32 * 2.0).sin();
+    let t = get_time() as f32;
+    let breathe = 0.75 + 0.25 * (t * 2.0).sin();
     for e in &combat.state.entities {
         if !e.is_alive() {
             continue;
         }
-        for kind in [StatusKind::RegenAura, StatusKind::MightAura] {
+        for (kind, radius) in [
+            (StatusKind::RegenAura, combat::AURA_RADIUS),
+            (StatusKind::MightAura, combat::AURA_RADIUS),
+            (StatusKind::StormAura, combat::STORM_RADIUS),
+        ] {
             if e.status(kind).is_none() {
                 continue;
             }
             let (sx, sy) = view.pos(e.pos);
-            let r = combat::AURA_RADIUS * view.scale;
+            let r = radius * view.scale;
             let color = status_color(kind);
             draw_circle(sx, sy, r, with_alpha(color, 0.05));
             draw_circle_lines(sx, sy, r, 1.5, with_alpha(color, 0.30 * breathe));
+            if kind == StatusKind::StormAura {
+                // Jagged radial ticks strobing around the disc, each on its
+                // own fast cadence — the field is *live*, stand elsewhere.
+                let ph = e.id.0 as f32 * 1.73;
+                for k in 0..5 {
+                    let ang = k as f32 / 5.0 * std::f32::consts::TAU + t * 1.7 + ph;
+                    let flick = (t * 9.0 + k as f32 * 2.4 + ph).sin() * 0.5 + 0.5;
+                    let (ax, ay) = (sx + ang.cos() * r * 0.45, sy + ang.sin() * r * 0.45);
+                    let kink = ang + 0.22;
+                    let (mx, my) = (sx + kink.cos() * r * 0.72, sy + kink.sin() * r * 0.72);
+                    let (bx, by) = (sx + ang.cos() * r * 0.98, sy + ang.sin() * r * 0.98);
+                    draw_line(ax, ay, mx, my, 1.5, with_alpha(color, 0.7 * flick));
+                    draw_line(mx, my, bx, by, 1.5, with_alpha(color, 0.7 * flick));
+                }
+            }
         }
     }
 }
@@ -1334,8 +1357,12 @@ fn draw_status_fx(view: &View, e: &Entity) {
                 }
             }
             // Sneak ghosts the token itself (draw_entity); the auras draw
-            // their field circles under everything (draw_auras).
-            StatusKind::Sneak | StatusKind::RegenAura | StatusKind::MightAura => {}
+            // their field circles (the storm's with its crackle) under
+            // everything (draw_auras).
+            StatusKind::Sneak
+            | StatusKind::RegenAura
+            | StatusKind::MightAura
+            | StatusKind::StormAura => {}
         }
     }
 }

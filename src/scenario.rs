@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 
 use crate::battle::*;
-use crate::combat::Combat;
+use crate::combat::{Combat, STORM_RADIUS};
 use crate::gambit::*;
 use crate::terrain::{Terrain, Tile3};
 
@@ -32,7 +32,7 @@ fn push_skill(skills: &mut Vec<Skill>, s: Skill) -> SkillId {
 pub fn scenarios() -> Vec<(&'static str, fn() -> Combat)> {
     vec![
         ("Duel — Hero & Mage vs Goblin & Ogre (hill + wall)", demo as fn() -> Combat),
-        ("Skirmish — 5v5 party battle (plateau + cover)", skirmish as fn() -> Combat),
+        ("Skirmish — 6v5 party battle (plateau + cover)", skirmish as fn() -> Combat),
     ]
 }
 
@@ -235,11 +235,12 @@ fn demo_terrain() -> Terrain {
     t
 }
 
-/// A 5v5 party skirmish. Players field a **tanky brawler**, an **archer**, a
-/// **mage**, a **healer** and a **chanter** (an offensive aura + mana-theft
-/// support); the enemy fields a **heavy tank**, a squishy-diving **assassin**,
-/// an **archer**, a **healer** and its own **chanter** (a defensive regen aura
-/// + a mending touch). There are no classes in the code —
+/// A 6v5 party skirmish. Players field a **tanky brawler**, an **archer**, a
+/// **mage**, a **healer**, a **chanter** (an offensive aura + mana-theft
+/// support) and a **tempest** (a storm-bearer whose crackling field pulses
+/// damage into every foe inside it); the enemy fields a **heavy tank**, a
+/// squishy-diving **assassin**, an **archer**, a **healer** and its own
+/// **chanter** (a defensive regen aura + a mending touch). There are no classes in the code —
 /// each of those labels is just a bundle of stats + a skill kit + gambit rules
 /// (see CLAUDE.md). Everyone knows only their own kit, so feasibility (range /
 /// cost / cooldown / line-of-sight) does all the routing; the gambits only state
@@ -262,7 +263,12 @@ pub fn skirmish() -> Combat {
             effects: vec![Effect::Damage(8.0)],
         },
     );
-    // Melee: brawler / tank swing. Short range, so they must close in.
+    // Melee: brawler / tank swing. Short range, so they must close in. Modest
+    // on purpose: a frontliner's near-perfect uptime (free, instant, no
+    // cooldown, always a foe in reach) multiplies whatever number sits here,
+    // so it stays under the assassin's swings (Backstab 13) — at 16 the tanks
+    // simply topped the damage meter by default. Their bulk is the payoff,
+    // not their basics.
     let bash = push_skill(
         &mut skills,
         Skill {
@@ -272,7 +278,7 @@ pub fn skirmish() -> Combat {
             cooldown: 0,
             cast_time: 0,
             damage_type: Some(DamageType::Physical),
-            effects: vec![Effect::Damage(16.0)],
+            effects: vec![Effect::Damage(10.0)],
         },
     );
     // Ranged physical: archers plink from afar, a short 1-tick cast (a small
@@ -400,20 +406,23 @@ pub fn skirmish() -> Combat {
     );
     // Brawler's charge: rush a foe up to 6m off, hit for moderate damage and stun
     // it for 1s (4 ticks). A gap-closer + hard CC — the tool that punishes kiting
-    // by locking a fleeing target down. Long cooldown (3s / 12 ticks) + a real
-    // MP cost so it's a signature opener, not a spammable stun-lock.
+    // by locking a fleeing target down. Long cooldown (6s / 24 ticks) + a real
+    // MP cost so it's a signature opener, not a spammable stun-lock — at the
+    // old 12 it fired as rotation filler (~23 casts a fight) and its damage
+    // alone kept the brawler atop the meter; the stun is the point, so the
+    // hit rides just above Bash.
     let charge = push_skill(
         &mut skills,
         Skill {
             name: "Charge".into(),
             cost: 15,
             range: 6.0,
-            cooldown: 12,
+            cooldown: 24,
             cast_time: 0,
             damage_type: Some(DamageType::Physical),
             effects: vec![
                 Effect::Dash { max: 6.0 },
-                Effect::Damage(14.0),
+                Effect::Damage(12.0),
                 Effect::Inflict {
                     kind: StatusKind::Stun,
                     stacks: 1,
@@ -630,7 +639,7 @@ pub fn skirmish() -> Combat {
             }],
         },
     );
-    // Red's life chant: a weak continuous HP drip for every covered teammate.
+    // Red's life chant: a weak pulsing HP drip for every covered teammate.
     let life_chant = push_skill(
         &mut skills,
         Skill {
@@ -725,13 +734,16 @@ pub fn skirmish() -> Combat {
     );
     // Ogre's war cry: self-enrage (+50% outgoing damage for 3s). Fired only
     // once a foe is in reach so the window isn't wasted on the approach march.
+    // The 16s (64-tick) cooldown makes it a rare surge to answer (shield it,
+    // kite it, focus elsewhere) — at the old 24 the buff was up half the fight,
+    // a permanent +25% that quietly made the ogre a top damage dealer.
     let war_cry = push_skill(
         &mut skills,
         Skill {
             name: "War Cry".into(),
             cost: 10,
             range: 100.0,
-            cooldown: 24,
+            cooldown: 64,
             cast_time: 0,
             damage_type: None,
             effects: vec![Effect::Inflict {
@@ -746,7 +758,7 @@ pub fn skirmish() -> Combat {
     // range == the instant-contact band) takes a medium hit at once. The
     // payoff of busting into the middle of the pack, and the punish for
     // crowding the ogre; the 10s (40-tick) cooldown makes it a periodic
-    // detonation, not a rotation filler (Bash still out-damages it on one).
+    // detonation, not a rotation filler.
     let rend = push_skill(
         &mut skills,
         Skill {
@@ -757,6 +769,31 @@ pub fn skirmish() -> Combat {
             cast_time: 0,
             damage_type: Some(DamageType::Physical),
             effects: vec![Effect::Damage(14.0)],
+        },
+    );
+
+    // Tempest's storm: summons a crackling field centred on itself — every foe
+    // inside `STORM_RADIUS` takes a small pulse every other tick while it
+    // lasts (see `combat::pulse_storm_auras`). Area denial, not a nuke: the payoff
+    // scales with how many foes stand in it and how long they stay, so the
+    // tempest's whole game is carrying the field into the scrum and the
+    // counter is simply stepping out. The cooldown (48) is double the field
+    // (24), so the storm is down as long as it's up — a window to punish,
+    // not near-permanent weather (at the old 32 the 8-tick gap barely read).
+    let storm = push_skill(
+        &mut skills,
+        Skill {
+            name: "Storm".into(),
+            cost: 20,
+            range: 100.0,
+            cooldown: 48,
+            cast_time: 1,
+            damage_type: None,
+            effects: vec![Effect::Inflict {
+                kind: StatusKind::StormAura,
+                stacks: 1,
+                duration: 24,
+            }],
         },
     );
 
@@ -805,6 +842,10 @@ pub fn skirmish() -> Combat {
         // support-flavoured touch and a plain strike as the floor.
         mk(8, "Warchanter", Team::Player, 75.0, 0.24, 0.38, 3.5, 4.5, vec![war_chant, sunder, mana_rend, strike], &[]),
         mk(9, "Lifechanter", Team::Enemy, 75.0, 0.24, 0.38, 20.5, 4.5, vec![life_chant, leeching_mark, soothing_touch, strike], &[]),
+        // Blue's sixth: a storm-bearer whose field only pays inside the scrum,
+        // so it's built to wade in — bulkier than the casters, with a plain
+        // strike as its floor between storms.
+        mk(10, "Tempest", Team::Player, 85.0, 0.26, 0.40, 3.5, 9.5, vec![storm, strike], &[]),
     ];
     let terrain = skirmish_terrain();
     let state = BattleState {
@@ -880,7 +921,7 @@ pub fn skirmish() -> Combat {
     );
     // Ogre: roar once a foe is in reach (the enrage window opens exactly when
     // there's something to swing at), then wade in and bash whoever is closest.
-    // War Cry's cooldown (24) outlasts the buff (12), so feasibility alone
+    // War Cry's cooldown (64) far outlasts the buff (12), so feasibility alone
     // paces the re-roar; no "am I already enraged?" plumbing needed.
     gambits.insert(
         EntityId(4),
@@ -894,9 +935,9 @@ pub fn skirmish() -> Combat {
                         4.0,
                     )),
                 )),
-                // Sweep only when the crowd makes it pay: 2+ foes in reach
-                // beats two Bashes' worth of single-target damage. On one foe
-                // Bash hits harder, so the gate also banks the cooldown.
+                // Sweep only when the crowd makes it pay: 2+ foes in reach is
+                // where the 360° hit beats a Bash. The gate also banks the
+                // cooldown instead of blowing it on a lone duel.
                 Node::act(TargetQuery::new(Pool::Enemies).pick(Pick::All), rend).when(
                     Condition::Count {
                         q: TargetQuery::new(Pool::Enemies).filter(Filter::WithinDistance(3.0)),
@@ -1005,8 +1046,8 @@ pub fn skirmish() -> Combat {
                 // While hidden, only a kill justifies breaking stealth: dash
                 // out of the shadows onto a bleeding mark, or finish one in
                 // reach. Commit — with no such mark it *waits*, staying
-                // hidden while the movement gambit slips it out of the press,
-                // instead of falling through to the ordinary rotation.
+                // hidden while the movement gambit walks it onto the enemy's
+                // frailest frame, instead of falling through to the rotation.
                 Node::context(
                     Condition::Exists(
                         TargetQuery::new(Pool::Myself).filter(Filter::HasStatus(StatusKind::Sneak)),
@@ -1204,6 +1245,24 @@ pub fn skirmish() -> Combat {
             ],
         ),
     );
+    // Tempest: summon the storm the moment a foe stands where the field will
+    // bite (inside its radius) — the War Cry pattern: the gate keeps the
+    // summon from being wasted on the approach march, and the cooldown
+    // outlasting the field paces the re-summon with no "is it up?" plumbing.
+    // Between storms it swings the plain strike so a full bar never idles.
+    gambits.insert(
+        EntityId(10),
+        Node::context(
+            Condition::Always,
+            GroupMode::Fallthrough,
+            vec![
+                Node::act(TargetQuery::new(Pool::Myself), storm).when(Condition::Exists(
+                    TargetQuery::new(Pool::Enemies).filter(Filter::WithinDistance(STORM_RADIUS)),
+                )),
+                Node::act(nearest_enemy(), strike),
+            ],
+        ),
+    );
 
     // --- movement gambits (run every tick, independent of the action bar) ---
     // Ranged units hold a standoff band: `Near(ideal 6.5)` pushes in when out
@@ -1262,21 +1321,27 @@ pub fn skirmish() -> Combat {
     move_gambits.insert(
         EntityId(5),
         MoveGambit::new(vec![
-            // While sneaking, slip out of the press: the reference query only
+            // While sneaking, stalk straight to the frailest frame (lowest
+            // max HP — the mage-shaped mark, not whoever happens to be
+            // dinged): nobody can target a hidden unit, so the walk through
+            // the press is free, and the vanish becomes repositioning onto
+            // the backline instead of a retreat. The reference query only
             // matches when the nested self-query does (i.e. the assassin is
-            // actually hidden), so the whole term drops out while visible —
-            // the same query-drops-out gating as the dive pull below.
+            // actually hidden; the 100.0 is "anywhere on the map"), so the
+            // whole term drops out while visible — the same query-drops-out
+            // gating as the dive pull below.
             (
-                Term::AwayFrom(
+                Term::Near(
                     TargetQuery::new(Pool::Enemies)
                         .filter(Filter::WithinDistanceOf(
                             Box::new(
                                 TargetQuery::new(Pool::Myself)
                                     .filter(Filter::HasStatus(StatusKind::Sneak)),
                             ),
-                            6.0,
+                            100.0,
                         ))
-                        .sort(SortKey::Distance, Order::Asc),
+                        .sort(SortKey::MaxHp, Order::Asc),
+                    0.0,
                 ),
                 2.5,
             ),
@@ -1350,6 +1415,17 @@ pub fn skirmish() -> Combat {
             ),
             (Term::Near(embattled_ally(), 1.5), 1.2),
             (Term::Near(nearest_other_ally(), 1.5), 0.8),
+        ]),
+    );
+    // Tempest: carry the field into the thick — the ogre's crowd pattern,
+    // with the kernel sized to the storm's own radius so the stand point it
+    // picks is exactly where the field covers the most foes; the nearest-foe
+    // pull supplies the gradient (and a duel partner) when they're scattered.
+    move_gambits.insert(
+        EntityId(10),
+        MoveGambit::new(vec![
+            (Term::Crowd(TargetQuery::new(Pool::Enemies).pick(Pick::All), STORM_RADIUS), 2.0),
+            (Term::Near(nearest_enemy(), 0.0), 1.0),
         ]),
     );
 
@@ -1446,11 +1522,11 @@ mod tests {
         assert!(peeled, "the brawler should attack the diving assassin at least once");
     }
 
-    /// The 5v5 skirmish resolves and units leave their start positions.
+    /// The 6v5 skirmish resolves and units leave their start positions.
     #[test]
     fn skirmish_runs_to_completion_with_movement() {
         let mut combat = skirmish();
-        assert_eq!(combat.state.entities.len(), 10, "skirmish is a 5v5");
+        assert_eq!(combat.state.entities.len(), 11, "skirmish is a 6v5");
         let start: Vec<Pos> = combat.state.entities.iter().map(|e| e.pos).collect();
 
         combat.run(4000);
@@ -1520,6 +1596,7 @@ mod tests {
         assert!(used("Soothing Touch"), "the red chanter should mend at arm's reach");
         assert!(used("Sunder"), "the blue chanter should crack a guard open");
         assert!(used("Leeching Mark"), "the red chanter should mark the pack's target");
+        assert!(used("Storm"), "the tempest should summon its field once foes close in");
     }
 
     /// Uselessness regression: the chanters must *work*, not just sing. Their

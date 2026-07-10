@@ -44,7 +44,7 @@ pub const EXPOSED_DAMAGE_BONUS: f32 = 0.1;
 /// [`StatusKind::Lifeleech`] bearer. Foes of the bearer only (the mark is
 /// authored by *their* side), and DoT pulses proc nothing (no attacker at
 /// pulse time).
-pub const LEECH_HEAL_ON_HIT: f32 = 3.0;
+pub const LEECH_HEAL_ON_HIT: f32 = 1.0;
 /// Fraction of incoming healing a [`StatusKind::MortalWound`] on the recipient
 /// cuts away â€” every source (Heal, Regen pulse, aura drip, drain-return) is
 /// reduced alike. Flat regardless of stacks, like `SHIELD_REDUCTION`.
@@ -53,15 +53,30 @@ pub const WOUND_HEAL_REDUCTION: f32 = 0.5;
 /// within this distance of a bearer get the aura's benefit, teammates outside
 /// don't. Uniform for now â€” one knob, like `ENTITY_RADIUS`.
 pub const AURA_RADIUS: f32 = 6.0;
-/// HP a `RegenAura` restores per tick to each covered teammate. Deliberately
-/// weak next to a Heal (38) or Regen stacks (4/stack) â€” steady drip, not triage.
-/// Tune with care: it multiplies across the whole covered team, so it's
-/// effectively another fraction of a healer (1.5 here once let the red team
-/// sweep the skirmish without a single loss). Continuous (integrates over
-/// every step slice, like MP regen), so it never spams per-pulse events.
-const AURA_REGEN_PER_TICK: f32 = 0.75;
+/// Ticks between regen-aura pulses. A global metronome (every field beats on
+/// the same clock), so co-covering bearers can never double a teammate's drip.
+pub const AURA_REGEN_PULSE_PERIOD: u32 = 4;
+/// HP a `RegenAura` restores per pulse to each covered, hurt teammate.
+/// Deliberately weak next to a Heal (38) or Regen stacks (4/stack) — steady
+/// drip, not triage. Tune with care: it multiplies across the whole covered
+/// team, so it's effectively another fraction of a healer (a continuous
+/// 1.5/tick once let the red team sweep the skirmish without a single loss;
+/// the current 2-per-4-ticks is 0.5/tick).
+const AURA_REGEN_PER_PULSE: f32 = 2.0;
 /// Outgoing damage bonus for attackers covered by a teammate's `MightAura`.
 const AURA_MIGHT_BONUS: f32 = 0.05;
+/// World-unit radius of a [`StatusKind::StormAura`] field: foes of the bearer
+/// standing inside it take storm pulses. Barely past melee contact range —
+/// the bearer has to be *in* the scrum, not near it, for the field to bite.
+pub const STORM_RADIUS: f32 = 2.5;
+/// Ticks between storm pulses: the field bites every other boundary, not
+/// every tick (still authored in whole ticks — the cadence is a period, like
+/// a DoT with a slower clock).
+pub const STORM_PULSE_PERIOD: u32 = 2;
+/// Damage a `StormAura` deals per pulse to each foe inside the field. Small
+/// (under a single Poison stack): area denial that adds up across a covered
+/// pack — the *stand somewhere else* pressure — not a nuke.
+pub const STORM_DAMAGE_PER_PULSE: f32 = 2.0;
 /// A hit at or under this distance lands immediately (you're in contact);
 /// anything farther is a projectile that has to *travel* â€” its effects apply
 /// on impact, not at fire. Per shot, not per skill: a long-range skill fired
@@ -386,16 +401,21 @@ impl Combat {
         }
 
         self.tick_mp(dt);
-        self.tick_auras(dt);
     }
 
-    /// Regen-aura upkeep: every living entity covered by a teammate's
-    /// `RegenAura` (see [`covered_by_aura`]) recovers `AURA_REGEN_PER_TICK`,
-    /// scaled by the slice. Continuous like MP regen â€” a steady drip the HP
-    /// bar shows directly, with no per-pulse events to spam the log. Coverage
-    /// is sampled per slice, so drifting out of the radius cuts the drip that
-    /// instant.
-    fn tick_auras(&mut self, dt: f32) {
+    /// Regen-aura pulses: every [`AURA_REGEN_PULSE_PERIOD`]-th boundary, each
+    /// living entity covered by a teammate's `RegenAura` (bearer included)
+    /// recovers [`AURA_REGEN_PER_PULSE`] — discrete like the other status
+    /// pulses (it once was a continuous drip; the pulse cadence is the knob
+    /// that let it be weakened without vanishing into a rounding error).
+    /// Coverage is sampled at the pulse, so drifting out of the radius costs
+    /// exactly the missed beats. Full-HP teammates are skipped entirely (no
+    /// Heal-event spam from a field that mostly covers healthy units); a
+    /// MortalWound cuts the pulse like any other heal, inside [`apply_heal`].
+    fn pulse_regen_auras(&mut self, events: &mut Vec<Event>) {
+        if self.time % AURA_REGEN_PULSE_PERIOD != 0 {
+            return;
+        }
         let bearers: Vec<(EntityId, Team, Pos)> = self
             .state
             .entities
@@ -406,32 +426,27 @@ impl Combat {
         if bearers.is_empty() {
             return;
         }
-        for e in &mut self.state.entities {
-            if !e.is_alive() {
-                continue;
-            }
-            let covering: Vec<EntityId> = bearers
-                .iter()
-                .filter(|&&(_, team, pos)| team == e.team && pos.dist(e.pos) <= AURA_RADIUS)
-                .map(|&(id, _, _)| id)
-                .collect();
-            if !covering.is_empty() {
-                // The aura drip is healing too â€” a MortalWound cuts it alike.
-                let mult = if e.status(StatusKind::MortalWound).is_some() {
-                    1.0 - WOUND_HEAL_REDUCTION
-                } else {
-                    1.0
-                };
-                let gained = (AURA_REGEN_PER_TICK * mult * dt).min(e.max_hp - e.hp);
-                e.hp += gained;
-                // Coverage doesn't stack, so co-covering bearers split the
-                // meter credit for the one drip — only what the bar gained.
-                if gained > 0.0 {
-                    let share = gained / covering.len() as f32;
-                    for id in covering {
-                        self.tallies.entry(id).or_default().healing += share;
-                    }
-                }
+        let covered: Vec<(EntityId, Vec<EntityId>)> = self
+            .state
+            .entities
+            .iter()
+            .filter(|e| e.is_alive() && e.hp < e.max_hp)
+            .filter_map(|e| {
+                let covering: Vec<EntityId> = bearers
+                    .iter()
+                    .filter(|&&(_, team, pos)| team == e.team && pos.dist(e.pos) <= AURA_RADIUS)
+                    .map(|&(id, _, _)| id)
+                    .collect();
+                (!covering.is_empty()).then(|| (e.id, covering))
+            })
+            .collect();
+        for (id, covering) in covered {
+            let gained = self.apply_heal(None, id, AURA_REGEN_PER_PULSE, events);
+            // Coverage doesn't stack, so co-covering bearers split the meter
+            // credit for the one pulse — only what the bar actually gained.
+            let share = gained / covering.len() as f32;
+            for b in covering {
+                self.credit_heal(Some(b), share);
             }
         }
     }
@@ -1269,6 +1284,8 @@ impl Combat {
     // --- per-tick upkeep -------------------------------------------------
 
     fn tick_statuses(&mut self, events: &mut Vec<Event>) {
+        self.pulse_storm_auras(events);
+        self.pulse_regen_auras(events);
         for i in 0..self.state.entities.len() {
             if !self.state.entities[i].is_alive() {
                 continue;
@@ -1313,6 +1330,42 @@ impl Combat {
                 s.duration = s.duration.saturating_sub(1);
             }
             e.statuses.retain(|s| s.duration > 0);
+        }
+    }
+
+    /// Storm-aura pulses: every foe standing inside a living bearer's field
+    /// (radius [`STORM_RADIUS`]) takes [`STORM_DAMAGE_PER_PULSE`], per bearer,
+    /// every [`STORM_PULSE_PERIOD`]-th tick boundary — discrete like
+    /// Poison/Burn (DoT cadence stays authored in whole ticks), unlike the
+    /// regen aura's continuous drip. The cadence is anchored to the field's
+    /// own remaining duration, so it's a property of each summon, not of the
+    /// global clock. Like any DoT pulse there is no attacker at pulse time
+    /// (no enrage/might scaling, no leech payback), but the field's applier —
+    /// the bearer, for a self-cast storm — gets the meter credit.
+    fn pulse_storm_auras(&mut self, events: &mut Vec<Event>) {
+        let bearers: Vec<(EntityId, Option<EntityId>, Team, Pos)> = self
+            .state
+            .entities
+            .iter()
+            .filter(|e| e.is_alive())
+            .filter_map(|e| {
+                e.status(StatusKind::StormAura)
+                    .filter(|s| s.duration % STORM_PULSE_PERIOD == 0)
+                    .map(|s| (e.id, s.source, e.team, e.pos))
+            })
+            .collect();
+        for (bearer, source, team, pos) in bearers {
+            let victims: Vec<EntityId> = self
+                .state
+                .entities
+                .iter()
+                .filter(|e| e.is_alive() && e.team != team && e.pos.dist(pos) <= STORM_RADIUS)
+                .map(|e| e.id)
+                .collect();
+            for v in victims {
+                let dealt = self.apply_damage(None, v, STORM_DAMAGE_PER_PULSE, None, events);
+                self.credit_damage(source.or(Some(bearer)), dealt);
+            }
         }
     }
 
@@ -2814,8 +2867,8 @@ mod tests {
 
         assert_eq!(
             combat.state.entity(hero).hp,
-            63.0,
-            "exactly the one landed hit should leech 3 back"
+            60.0 + LEECH_HEAL_ON_HIT,
+            "exactly the one landed hit should leech LEECH_HEAL_ON_HIT back"
         );
     }
 
@@ -2902,9 +2955,10 @@ mod tests {
         assert_eq!(combat.state.entity(ally2).hp, 70.0);
     }
 
-    /// A regen aura drips HP to teammates inside its radius â€” and only those:
+    /// A regen aura pulses HP to teammates inside its radius — and only those:
     /// an ally beyond `AURA_RADIUS` and an enemy standing right in the field
-    /// both get nothing.
+    /// both get nothing. The pulse fires every `AURA_REGEN_PULSE_PERIOD`-th
+    /// tick, so 2 periods' worth of ticks land exactly 2 pulses.
     #[test]
     fn regen_aura_covers_only_nearby_teammates() {
         let mut a = Arena::new();
@@ -2917,11 +2971,12 @@ mod tests {
             .push(Status { kind: StatusKind::RegenAura, stacks: 1, duration: 100, source: None });
 
         let mut combat = a.into_combat();
-        combat.run(4);
+        combat.run(2 * AURA_REGEN_PULSE_PERIOD);
 
         let hp = |id| combat.state.entity(id).hp;
-        assert_eq!(hp(chanter), 53.0, "the bearer is inside its own aura: +0.75 x 4");
-        assert_eq!(hp(near), 53.0, "a covered ally drips up");
+        let expect = 50.0 + 2.0 * AURA_REGEN_PER_PULSE;
+        assert_eq!(hp(chanter), expect, "the bearer is inside its own aura: two pulses");
+        assert_eq!(hp(near), expect, "a covered ally pulses up");
         assert_eq!(hp(far), 50.0, "outside the radius: no benefit");
         assert_eq!(hp(foe), 50.0, "enemies never benefit");
     }
@@ -2950,6 +3005,40 @@ mod tests {
                 "attacker at x={attacker_x}: expected {expected} damage, dealt {dealt}"
             );
         }
+    }
+
+    /// A storm aura hurts only foes standing inside its field — an ally in
+    /// the field, a foe beyond its edge, and the bearer itself are all
+    /// untouched — and it bites on its period, not every boundary: over 4
+    /// ticks a `STORM_PULSE_PERIOD = 2` field lands exactly 2 pulses of
+    /// `STORM_DAMAGE_PER_PULSE`, credited to the bearer's damage tally.
+    #[test]
+    fn storm_aura_pulses_foes_inside_the_field_on_its_period() {
+        let mut a = Arena::new();
+        let bearer = a.add_at("tempest", Team::Enemy, 100.0, 0.0, 0.0, 0.0);
+        let inside = a.add_at("inside", Team::Player, 100.0, 0.0, STORM_RADIUS - 0.5, 0.0);
+        let outside = a.add_at("outside", Team::Player, 100.0, 0.0, STORM_RADIUS + 1.0, 0.0);
+        let ally = a.add_at("ally", Team::Enemy, 100.0, 0.0, 1.0, 0.0);
+        a.ent(bearer).statuses.push(Status {
+            kind: StatusKind::StormAura,
+            stacks: 1,
+            duration: 10,
+            source: None,
+        });
+
+        let mut combat = a.into_combat();
+        combat.run(4); // pulses at duration 10 and 8; 9 and 7 are off-beats
+
+        let hp = |id| combat.state.entity(id).hp;
+        assert_eq!(hp(inside), 100.0 - 2.0 * STORM_DAMAGE_PER_PULSE, "4 ticks = two pulses");
+        assert_eq!(hp(outside), 100.0, "beyond the edge: untouched");
+        assert_eq!(hp(ally), 100.0, "teammates never take storm pulses");
+        assert_eq!(hp(bearer), 100.0, "the bearer doesn't shock itself");
+        assert_eq!(
+            combat.tallies.get(&bearer).map(|t| t.damage),
+            Some(2.0 * STORM_DAMAGE_PER_PULSE),
+            "the pulses credit the bearer's meter"
+        );
     }
 
     /// An entity holds one aura at a time â€” a new chant replaces the old â€” and
@@ -3118,7 +3207,7 @@ mod tests {
         assert_eq!(combat.tally(hero).damage, 18.0);
     }
 
-    /// The regen-aura drip credits the bearer — but only the HP teammates
+    /// The regen-aura pulse credits the bearer — but only the HP teammates
     /// actually gained; covering a full-HP ally contributes nothing.
     #[test]
     fn meter_credits_aura_drip_to_the_bearer() {
@@ -3135,12 +3224,10 @@ mod tests {
         });
 
         let mut combat = a.into_combat();
-        for _ in 0..4 {
-            combat.tick();
-        }
+        combat.run(AURA_REGEN_PULSE_PERIOD); // exactly one pulse
 
-        // Only the hurt teammate's drip lands: 0.75 x 4 ticks. The bearer and
-        // the full ally are covered too but gain nothing.
-        assert!((combat.tally(chanter).healing - 3.0).abs() < 1e-3);
+        // Only the hurt teammate's pulse lands. The bearer and the full ally
+        // are covered too but gain nothing.
+        assert!((combat.tally(chanter).healing - AURA_REGEN_PER_PULSE).abs() < 1e-3);
     }
 }
