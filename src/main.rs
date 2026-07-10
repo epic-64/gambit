@@ -401,7 +401,15 @@ fn draw_entity(world: World, e: &Entity, casting: bool, prev: Snap, alpha: f32) 
     let py = lerp(prev.pos.y, e.pos.y, alpha);
     let hp = lerp(prev.hp, e.hp, alpha);
     let mp = lerp(prev.mp, e.mp, alpha);
-    let action_bar = lerp(prev.action_bar, e.action_bar, alpha);
+    // The sim fills a bar to full and spends it (back to 0) inside one tick, so
+    // snapshots never hold a full bar — lerping through a reset would drain the
+    // bar backwards without it ever topping out. Animate it filling to full
+    // instead; the snap down to the refill next tick reads as the action firing.
+    let action_bar = if e.action_bar < prev.action_bar {
+        lerp(prev.action_bar, 1.0, alpha)
+    } else {
+        lerp(prev.action_bar, e.action_bar, alpha)
+    };
     let (sx, sy) = world_to_screen(world, px, py);
     let alive = e.is_alive();
     // Draw the token at the shared collision radius, so overlaps (or the lack of
