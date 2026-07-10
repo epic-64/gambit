@@ -163,11 +163,18 @@ pub fn demo() -> Combat {
     // Melee closes on the nearest foe (A* routes it through the gap). The mage
     // seeks the high ground to shoot over the wall, kiting only if it can't climb.
     move_gambits.insert(hero, vec![MoveRule::new(MoveIntent::Toward(nearest_enemy()))]);
+    // Mage: hold the high ground and shoot over the wall while it can see a foe;
+    // only advance (toward the gap) when it has *no* line-of-sight to anyone —
+    // otherwise it stays put and fires instead of wandering off its perch.
+    let sees_a_foe =
+        || Condition::Exists(TargetQuery::new(Pool::Enemies).filter(Filter::HasLineOfSight));
     move_gambits.insert(
         mage,
         vec![
             MoveRule::new(MoveIntent::SeekHighGround(nearest_enemy())),
-            MoveRule::new(MoveIntent::Away(nearest_enemy())),
+            MoveRule::new(MoveIntent::Toward(nearest_enemy())).when(Condition::Not(Box::new(
+                sees_a_foe(),
+            ))),
         ],
     );
     move_gambits.insert(goblin, vec![MoveRule::new(MoveIntent::Toward(nearest_enemy()))]);
@@ -207,6 +214,7 @@ fn demo_terrain() -> Terrain {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::combat::Event;
 
     /// The wired-up demo (movement + cast-time skills together) runs to a
     /// decisive end, and units actually move off their start positions.
@@ -225,5 +233,22 @@ mod tests {
             .zip(&start)
             .any(|(e, s)| e.pos.x != s.x || e.pos.y != s.y);
         assert!(moved, "at least one unit should have drifted from its start");
+    }
+
+    /// Regression: the demo mage must actually *do something* — climb the hill
+    /// and fire — not just shuffle on its perch forever. (It once stranded itself
+    /// in a corner because a fleeing fallback undid every step it gained.)
+    #[test]
+    fn demo_mage_takes_actions() {
+        let mut combat = demo();
+        let mage = EntityId(1);
+        let log = combat.run(2000);
+        let mage_acted = log.iter().any(|e| {
+            matches!(
+                e,
+                Event::StartedCast { actor, .. } | Event::Acted { actor, .. } if *actor == mage
+            )
+        });
+        assert!(mage_acted, "the mage should take at least one action, not idle forever");
     }
 }
