@@ -474,7 +474,10 @@ pub fn skirmish() -> Combat {
     // but it's invisibility, not invulnerability: projectiles already flying,
     // lunges underway, and chain arcs still connect. The panic button for a
     // dive gone wrong; taking any action breaks it, so cashing it in on a kill
-    // is a choice. The 20s (80-tick) cooldown makes it once a fight-phase.
+    // is a choice. The 20s (80-tick) cooldown makes it once a fight-phase —
+    // unless the assassin *kills*: a kill hands Sneak straight back (the
+    // engine's stealth-refresh rule), so a finished mark chains into the next
+    // vanish.
     let sneak = push_skill(
         &mut skills,
         Skill {
@@ -489,6 +492,30 @@ pub fn skirmish() -> Combat {
                 stacks: 1,
                 duration: 20,
             }],
+        },
+    );
+    // Assassin's maim: a moderate strike that leaves a 6s (24-tick) grievous
+    // wound — the mark's incoming healing is halved, every source alike. The
+    // anti-sustain opener: land it on the dive target *before* burning it
+    // down, so the enemy healer's triage buys half as much. 12s (48-tick)
+    // cooldown keeps it one wound per dive, not a rolling debuff.
+    let maim = push_skill(
+        &mut skills,
+        Skill {
+            name: "Maim".into(),
+            cost: 10,
+            range: 2.5,
+            cooldown: 48,
+            cast_time: 0,
+            damage_type: Some(DamageType::Physical),
+            effects: vec![
+                Effect::Damage(12.0),
+                Effect::Inflict {
+                    kind: StatusKind::MortalWound,
+                    stacks: 1,
+                    duration: 24,
+                },
+            ],
         },
     );
     // Assassin's finisher: +1% damage per 1% of the target's missing HP — the
@@ -670,6 +697,24 @@ pub fn skirmish() -> Combat {
         },
     );
 
+    // Ogre's rend: a full-circle sweep — every foe within arm's reach (360°,
+    // range == the instant-contact band) takes a medium hit at once. The
+    // payoff of busting into the middle of the pack, and the punish for
+    // crowding the ogre; the 10s (40-tick) cooldown makes it a periodic
+    // detonation, not a rotation filler (Bash still out-damages it on one).
+    let rend = push_skill(
+        &mut skills,
+        Skill {
+            name: "Rend".into(),
+            cost: 15,
+            range: 3.0,
+            cooldown: 40,
+            cast_time: 0,
+            damage_type: Some(DamageType::Physical),
+            effects: vec![Effect::Damage(14.0)],
+        },
+    );
+
     let mk = |id: usize,
               name: &str,
               team: Team,
@@ -705,8 +750,8 @@ pub fn skirmish() -> Combat {
         mk(1, "Archer", Team::Player, 65.0, 0.30, 0.36, 2.0, 2.5, vec![snipe, shot], &[]),
         mk(2, "Mage", Team::Player, 50.0, 0.22, 0.30, 2.0, 11.0, vec![ice_lance, chain_lightning, fireball, shot], &[]),
         mk(3, "Cleric", Team::Player, 70.0, 0.24, 0.34, 2.0, 7.0, vec![prayer, heal, barrier, purify, shot], &[]),
-        mk(4, "Ogre", Team::Enemy, 160.0, 0.20, 0.30, 20.5, 7.0, vec![war_cry, bash], &[DamageType::Fire]),
-        mk(5, "Assassin", Team::Enemy, 55.0, 0.34, 0.50, 22.0, 2.5, vec![sneak, spell_counter, dash, reap, backstab, strike], &[]),
+        mk(4, "Ogre", Team::Enemy, 160.0, 0.20, 0.30, 20.5, 7.0, vec![war_cry, rend, bash], &[DamageType::Fire]),
+        mk(5, "Assassin", Team::Enemy, 55.0, 0.34, 0.50, 22.0, 2.5, vec![sneak, spell_counter, dash, maim, reap, backstab, strike], &[]),
         mk(6, "Raider", Team::Enemy, 62.0, 0.30, 0.36, 22.0, 11.0, vec![snipe, shot], &[]),
         mk(7, "Shaman", Team::Enemy, 60.0, 0.24, 0.34, 22.0, 7.0, vec![heal, siphon, shot], &[DamageType::Holy]),
         // The chanters: one per side, mirrored roles. Blue sings the offensive
@@ -787,6 +832,16 @@ pub fn skirmish() -> Combat {
                         4.0,
                     )),
                 )),
+                // Sweep only when the crowd makes it pay: 2+ foes in reach
+                // beats two Bashes' worth of single-target damage. On one foe
+                // Bash hits harder, so the gate also banks the cooldown.
+                Node::act(TargetQuery::new(Pool::Enemies).pick(Pick::All), rend).when(
+                    Condition::Count {
+                        q: TargetQuery::new(Pool::Enemies).filter(Filter::WithinDistance(3.0)),
+                        cmp: Cmp::Ge,
+                        n: 2,
+                    },
+                ),
                 Node::act(nearest_enemy(), bash),
             ],
         ),
@@ -908,6 +963,15 @@ pub fn skirmish() -> Combat {
                     cmp: Cmp::Ge,
                     n: 2,
                 }),
+                // Open the wound before working the mark down: an unwounded
+                // foe in reach gets maimed first, so everything after lands
+                // against halved triage.
+                Node::act(
+                    TargetQuery::new(Pool::Enemies)
+                        .filter(Filter::Not(Box::new(Filter::HasStatus(StatusKind::MortalWound))))
+                        .sort(SortKey::Hp, Order::Asc),
+                    maim,
+                ),
                 // 0.7 is Reap's break-even vs Backstab (10 x 1.3 = 13 flat) —
                 // below that, the execute scaling wins.
                 Node::act(
@@ -1070,8 +1134,21 @@ pub fn skirmish() -> Combat {
             (Term::Near(nearest_enemy(), 0.0), 1.0),
         ]),
     );
-    // Melee closes on the nearest foe.
-    move_gambits.insert(EntityId(4), MoveGambit::toward(nearest_enemy()));
+    // The ogre busts into the thick of the pack *and always has someone to
+    // hit*: the `Crowd` kernel makes a stand point touching several foes
+    // outscore a lone duel (so it shoulders past an interceptor into the
+    // scrum, right where Rend pays), but scores nothing at an empty midpoint —
+    // the old all-enemies-centroid pull parked it between spread-out foes
+    // with nobody in Bash reach. The `Near(nearest)` pull supplies the
+    // long-range gradient the bounded kernel lacks and, when the foes are too
+    // scattered for any crowd to exist, commits it to whoever is closest.
+    move_gambits.insert(
+        EntityId(4),
+        MoveGambit::new(vec![
+            (Term::Crowd(TargetQuery::new(Pool::Enemies).pick(Pick::All), 5.0), 2.5),
+            (Term::Near(nearest_enemy(), 0.0), 1.0),
+        ]),
+    );
     // Ranged attackers (archers, mage) and healers alike hold the standoff band.
     move_gambits.insert(EntityId(1), ranged_move());
     move_gambits.insert(EntityId(2), ranged_move());
@@ -1321,6 +1398,7 @@ mod tests {
         };
 
         assert!(used("War Cry"), "the ogre should enrage once a foe closes in");
+        assert!(used("Rend"), "the ogre should sweep once the crowd gathers");
         assert!(used("Siphon"), "the shaman should weave its drain");
         assert!(used("Reap"), "the assassin should execute a hurt target");
         assert!(used("Prayer"), "the cleric should group-heal a bleeding party");
@@ -1329,6 +1407,7 @@ mod tests {
         assert!(used("Chain Lightning"), "the mage should arc a bolt through a clump");
         assert!(used("Spell Counter"), "the assassin should raise its spell ward");
         assert!(used("Sneak"), "the assassin should vanish when swarmed");
+        assert!(used("Maim"), "the assassin should open the wound on its mark");
         assert!(used("War Chant"), "the blue chanter should raise its might aura");
         assert!(used("Life Chant"), "the red chanter should raise its regen aura");
         assert!(used("Mana Rend"), "the blue chanter should tear MP in melee");

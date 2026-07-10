@@ -206,6 +206,7 @@ fn status_color(kind: StatusKind) -> Color {
         StatusKind::Snare => Color::new(0.5, 0.7, 0.95, 1.0),
         StatusKind::SpellWard => Color::new(0.8, 0.55, 1.0, 1.0),
         StatusKind::Sneak => Color::new(0.55, 0.6, 0.7, 1.0),
+        StatusKind::MortalWound => Color::new(0.85, 0.3, 0.45, 1.0),
         StatusKind::RegenAura => Color::new(0.45, 0.9, 0.6, 1.0),
         StatusKind::MightAura => Color::new(1.0, 0.6, 0.3, 1.0),
     }
