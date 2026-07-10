@@ -469,6 +469,12 @@ fn pass_filter(filter: &Filter, id: EntityId, actor: EntityId, state: &BattleSta
             state.elevation_at(e.pos) > state.elevation_at(state.entity(actor).pos)
         }
         Filter::WithinDistance(d) => state.entity(actor).pos.dist(e.pos) <= *d,
+        // Resolve the nested query (actor-relative, no range/LoS gate — it's a
+        // reference lookup, not an attack) and pass if the candidate stands
+        // within `d` of any selected entity other than itself.
+        Filter::WithinDistanceOf(q, d) => select(q, actor, state, &[], None)
+            .iter()
+            .any(|&r| r != id && state.entity(r).pos.dist(e.pos) <= *d),
         Filter::Not(inner) => !pass_filter(inner, id, actor, state),
     }
 }
@@ -952,6 +958,53 @@ mod tests {
             (Term::SightOf(nearest_enemy()), 1.0),
         ]);
         assert_eq!(decide_move(&gambit, hero, &w.state), None);
+    }
+
+    /// The relational filter: "an enemy engaging one of my teammates" picks
+    /// the foe standing on the ally, not the one standing on the actor.
+    #[test]
+    fn within_distance_of_targets_the_allys_attacker() {
+        let mut w = World::new();
+        let hero = w.add("hero", Team::Player, 100.0, 0.0);
+        let _ally = w.add("ally", Team::Player, 100.0, 10.0);
+        let attacker = w.add("attacker", Team::Enemy, 100.0, 11.0); // on the ally
+        let _brute = w.add("brute", Team::Enemy, 100.0, 2.0); // on the hero — not a match
+        let strike = w.add_skill("Strike", 0, 100.0, None);
+
+        let peel = Node::act(
+            TargetQuery::new(Pool::Enemies).filter(Filter::WithinDistanceOf(
+                Box::new(
+                    TargetQuery::new(Pool::Allies)
+                        .filter(Filter::NotSelf)
+                        .pick(Pick::All),
+                ),
+                3.0,
+            )),
+            strike,
+        );
+
+        let action = decide(&peel, hero, &w.state).unwrap();
+        assert_eq!(action.targets, vec![attacker]);
+    }
+
+    /// A candidate never satisfies `WithinDistanceOf` through *itself*: a lone
+    /// enemy is not "near an enemy" just because it is one.
+    #[test]
+    fn within_distance_of_never_matches_via_itself() {
+        let mut w = World::new();
+        let hero = w.add("hero", Team::Player, 100.0, 0.0);
+        let _lone = w.add("lone", Team::Enemy, 100.0, 20.0);
+        let strike = w.add_skill("Strike", 0, 100.0, None);
+
+        let rule = Node::act(
+            TargetQuery::new(Pool::Enemies).filter(Filter::WithinDistanceOf(
+                Box::new(TargetQuery::new(Pool::Enemies).pick(Pick::All)),
+                3.0,
+            )),
+            strike,
+        );
+
+        assert_eq!(decide(&rule, hero, &w.state), None);
     }
 
     /// AoE pick returns every matching target.

@@ -60,6 +60,15 @@ pub enum Filter {
     /// the gap is open (instead of fleeing to a corner). `Not(WithinDistance)`
     /// covers "at least this far away".
     WithinDistance(f32),
+    /// The candidate is within `d` world-units of some *other* entity the
+    /// nested query selects (the query is actor-relative, like every query;
+    /// the candidate itself never counts as its own reference). This is the
+    /// relational filter the actor-relative `WithinDistance` can't express:
+    /// "an enemy engaging one of my teammates" is
+    /// `Pool::Enemies` + `WithinDistanceOf(allies-not-me, melee reach)` — the
+    /// protect/peel trigger. Give the nested query `Pick::All` to mean "near
+    /// *any* of them"; a narrower pick ("near the weakest ally") also works.
+    WithinDistanceOf(Box<TargetQuery>, f32),
     Not(Box<Filter>),
 }
 

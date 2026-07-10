@@ -432,6 +432,22 @@ pub fn skirmish() -> Combat {
     let nearest_enemy = || TargetQuery::new(Pool::Enemies).sort(SortKey::Distance, Order::Asc);
     let weakest_enemy = || TargetQuery::new(Pool::Enemies).sort(SortKey::Hp, Order::Asc);
     let toughest_enemy = || TargetQuery::new(Pool::Enemies).sort(SortKey::Hp, Order::Desc);
+    // A foe engaging a teammate: any enemy standing in melee reach of an ally
+    // other than the actor itself. Sorted by HP ascending so the peel goes for
+    // the squishiest attacker first (the diving assassin, not the ogre) — and,
+    // unlike a distance sort, the reference doesn't flip as the peeler runs.
+    let ally_attacker = || {
+        TargetQuery::new(Pool::Enemies)
+            .filter(Filter::WithinDistanceOf(
+                Box::new(
+                    TargetQuery::new(Pool::Allies)
+                        .filter(Filter::NotSelf)
+                        .pick(Pick::All),
+                ),
+                3.0,
+            ))
+            .sort(SortKey::Hp, Order::Asc)
+    };
     // The most-hurt ally (self included) that is actually below ~70% — the heal's
     // "has a valid target" feasibility check makes the guard implicit.
     let hurt_ally = || {
@@ -452,15 +468,20 @@ pub fn skirmish() -> Combat {
     };
 
     let mut gambits = HashMap::new();
-    // Brawler: charge the nearest foe (closing the gap + stunning it) when the
-    // charge is off cooldown, otherwise just bash whoever is closest. Feasibility
-    // (the charge's 6m range + cooldown) picks between them implicitly.
+    // Brawler: protect first — if a foe is on a teammate, charge it (the stun is
+    // the peel) or bash it; only then fall through to the generic engage rules
+    // (charge/bash the nearest foe). Feasibility (the charge's 6m range + its
+    // cooldown, bash's melee reach) picks between all four implicitly, so while
+    // the brawler is still marching toward the diver it keeps fighting whatever
+    // is at hand instead of idling.
     gambits.insert(
         EntityId(0),
         Node::context(
             Condition::Always,
             GroupMode::Fallthrough,
             vec![
+                Node::act(ally_attacker(), charge),
+                Node::act(ally_attacker(), bash),
                 Node::act(nearest_enemy(), charge),
                 Node::act(nearest_enemy(), bash),
             ],
@@ -519,8 +540,20 @@ pub fn skirmish() -> Combat {
     };
 
     let mut move_gambits = HashMap::new();
+    // Brawler: the bodyguard pull. When a foe is on a teammate the heavier
+    // `Near(attacker)` term dominates the blend and the brawler runs to the
+    // peel (on the line between the two pulls, all of the weight difference
+    // favours the attacker, so the argmax sits *at* the attacker); with nobody
+    // diving, the term's query matches nothing and drops out, leaving plain
+    // nearest-foe pursuit.
+    move_gambits.insert(
+        EntityId(0),
+        MoveGambit::new(vec![
+            (Term::Near(ally_attacker(), 0.0), 1.5),
+            (Term::Near(nearest_enemy(), 0.0), 1.0),
+        ]),
+    );
     // Melee closes on the nearest foe.
-    move_gambits.insert(EntityId(0), MoveGambit::toward(nearest_enemy()));
     move_gambits.insert(EntityId(4), MoveGambit::toward(nearest_enemy()));
     // Ranged attackers (archers, mage) and healers alike hold the standoff band.
     move_gambits.insert(EntityId(1), ranged_move());
@@ -607,6 +640,21 @@ mod tests {
             )
         });
         assert!(mage_acted, "the mage should take at least one action, not idle forever");
+    }
+
+    /// Protect regression: the skirmish brawler peels for dived teammates —
+    /// over a full battle it attacks the enemy assassin (the backline diver)
+    /// at least once instead of tunnelling on the frontline ogre forever.
+    #[test]
+    fn skirmish_brawler_peels_the_diver() {
+        let mut combat = skirmish();
+        let log = combat.run(4000);
+        let (brawler, assassin) = (EntityId(0), EntityId(5));
+        let peeled = log.iter().any(|e| matches!(
+            e,
+            Event::Acted { actor, targets, .. } if *actor == brawler && targets.contains(&assassin)
+        ));
+        assert!(peeled, "the brawler should attack the diving assassin at least once");
     }
 
     /// The 4v4 skirmish resolves and units leave their start positions.
