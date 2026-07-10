@@ -24,13 +24,20 @@ use battle::{Entity, EntityId, SkillId, Team, ENTITY_RADIUS};
 use combat::{Combat, Event};
 use terrain::{Terrain, Tile3};
 
-/// Arena size in world units (entity positions live in this space).
-const WORLD_W: f32 = 20.0;
-const WORLD_H: f32 = 12.0;
 /// Seconds of real time per simulation tick.
 const TICK_INTERVAL: f32 = 0.25;
 /// Width reserved on the right for the event log.
 const LOG_W: f32 = 300.0;
+
+/// Arena size in world units. Taken from the running battle's bounds so
+/// differently-sized scenario maps all render to fit.
+type World = (f32, f32);
+
+/// Which screen the viewer is showing: the scenario picker or a live battle.
+enum Screen {
+    Menu,
+    Playing,
+}
 
 fn window_conf() -> Conf {
     Conf {
@@ -44,55 +51,135 @@ fn window_conf() -> Conf {
 
 #[macroquad::main(window_conf)]
 async fn main() {
-    let mut combat = scenario::demo();
+    let scenarios = scenario::scenarios();
+    let mut screen = Screen::Menu;
+    let mut combat: Option<Combat> = None;
+    let mut current = 0usize;
     let mut log: Vec<String> = Vec::new();
     let mut acc = 0.0f32;
     let mut paused = false;
 
     loop {
-        // --- input ---
-        if is_key_pressed(KeyCode::Space) {
-            paused = !paused;
-        }
-        if is_key_pressed(KeyCode::R) {
-            combat = scenario::demo();
-            log.clear();
-            acc = 0.0;
-            paused = false;
-        }
-
-        // --- update: step the sim on a fixed timer ---
-        if !paused && !combat.is_over() {
-            acc += get_frame_time();
-            let mut steps = 0;
-            while acc >= TICK_INTERVAL && steps < 4 {
-                acc -= TICK_INTERVAL;
-                steps += 1;
-                for ev in combat.tick() {
-                    log.push(format_event(&combat, &ev));
+        match screen {
+            Screen::Menu => {
+                // Number keys pick a scenario and drop into the battle.
+                for i in 0..scenarios.len() {
+                    if digit_key(i).is_some_and(is_key_pressed) {
+                        combat = Some(scenarios[i].1());
+                        current = i;
+                        log.clear();
+                        acc = 0.0;
+                        paused = false;
+                        screen = Screen::Playing;
+                    }
                 }
-            }
-            // Keep the log from growing without bound.
-            const MAX_LOG: usize = 500;
-            if log.len() > MAX_LOG {
-                log.drain(0..log.len() - MAX_LOG);
-            }
-        }
 
-        // --- draw ---
-        clear_background(Color::new(0.10, 0.11, 0.13, 1.0));
-        draw_arena();
-        if let Some(t) = combat.state.terrain.as_ref() {
-            draw_terrain(t);
+                clear_background(Color::new(0.10, 0.11, 0.13, 1.0));
+                draw_menu(&scenarios);
+            }
+            Screen::Playing => {
+                // --- input ---
+                if is_key_pressed(KeyCode::Space) {
+                    paused = !paused;
+                }
+                if is_key_pressed(KeyCode::R) {
+                    combat = Some(scenarios[current].1());
+                    log.clear();
+                    acc = 0.0;
+                    paused = false;
+                }
+                if is_key_pressed(KeyCode::M) || is_key_pressed(KeyCode::Escape) {
+                    screen = Screen::Menu;
+                }
+
+                let Some(combat) = combat.as_mut() else {
+                    continue;
+                };
+
+                // --- update: step the sim on a fixed timer ---
+                if !paused && !combat.is_over() {
+                    acc += get_frame_time();
+                    let mut steps = 0;
+                    while acc >= TICK_INTERVAL && steps < 4 {
+                        acc -= TICK_INTERVAL;
+                        steps += 1;
+                        for ev in combat.tick() {
+                            log.push(format_event(combat, &ev));
+                        }
+                    }
+                    // Keep the log from growing without bound.
+                    const MAX_LOG: usize = 500;
+                    if log.len() > MAX_LOG {
+                        log.drain(0..log.len() - MAX_LOG);
+                    }
+                }
+
+                // --- draw ---
+                let world = combat.state.bounds;
+                clear_background(Color::new(0.10, 0.11, 0.13, 1.0));
+                draw_arena(world);
+                if let Some(t) = combat.state.terrain.as_ref() {
+                    draw_terrain(world, t);
+                }
+                for e in &combat.state.entities {
+                    draw_entity(world, e, combat.is_casting(e.id));
+                }
+                draw_log(&log);
+                draw_hud(combat, paused, scenarios[current].0);
+            }
         }
-        for e in &combat.state.entities {
-            draw_entity(e, combat.is_casting(e.id));
-        }
-        draw_log(&log);
-        draw_hud(&combat, paused);
 
         next_frame().await;
     }
+}
+
+/// Map a scenario index to its selection key (1..=9); `None` past the ninth.
+fn digit_key(i: usize) -> Option<KeyCode> {
+    match i {
+        0 => Some(KeyCode::Key1),
+        1 => Some(KeyCode::Key2),
+        2 => Some(KeyCode::Key3),
+        3 => Some(KeyCode::Key4),
+        4 => Some(KeyCode::Key5),
+        5 => Some(KeyCode::Key6),
+        6 => Some(KeyCode::Key7),
+        7 => Some(KeyCode::Key8),
+        8 => Some(KeyCode::Key9),
+        _ => None,
+    }
+}
+
+fn draw_menu(scenarios: &[(&'static str, fn() -> Combat)]) {
+    draw_text("gambit", 44.0, 92.0, 52.0, WHITE);
+    draw_text(
+        "Select a scenario",
+        46.0,
+        140.0,
+        26.0,
+        Color::new(0.78, 0.80, 0.84, 1.0),
+    );
+
+    let mut y = 196.0;
+    for (i, (name, _)) in scenarios.iter().enumerate() {
+        draw_text(&format!("{}.", i + 1), 60.0, y, 28.0, Color::new(0.95, 0.85, 0.3, 1.0));
+        draw_text(name, 96.0, y, 26.0, WHITE);
+        y += 44.0;
+    }
+
+    draw_text(
+        "Press a number key to begin.",
+        46.0,
+        y + 28.0,
+        20.0,
+        Color::new(0.65, 0.68, 0.72, 1.0),
+    );
+    draw_text(
+        "In battle:  Space pause  ·  R restart  ·  M / Esc menu",
+        46.0,
+        y + 54.0,
+        20.0,
+        Color::new(0.65, 0.68, 0.72, 1.0),
+    );
 }
 
 // --- world <-> screen ------------------------------------------------------
@@ -108,22 +195,22 @@ fn arena_rect() -> (f32, f32, f32, f32) {
 }
 
 /// World-units → screen-pixels factor (uniform, so hitboxes read true).
-fn world_scale() -> f32 {
+fn world_scale(world: World) -> f32 {
     let (_, _, aw, ah) = arena_rect();
-    (aw / WORLD_W).min(ah / WORLD_H)
+    (aw / world.0).min(ah / world.1)
 }
 
-fn world_to_screen(wx: f32, wy: f32) -> (f32, f32) {
+fn world_to_screen(world: World, wx: f32, wy: f32) -> (f32, f32) {
     let (ax, ay, _, _) = arena_rect();
-    let scale = world_scale();
+    let scale = world_scale(world);
     (ax + wx * scale, ay + wy * scale)
 }
 
 // --- drawing ---------------------------------------------------------------
 
-fn draw_arena() {
-    let (sx, sy) = world_to_screen(0.0, 0.0);
-    let (ex, ey) = world_to_screen(WORLD_W, WORLD_H);
+fn draw_arena(world: World) {
+    let (sx, sy) = world_to_screen(world, 0.0, 0.0);
+    let (ex, ey) = world_to_screen(world, world.0, world.1);
     draw_rectangle(sx, sy, ex - sx, ey - sy, Color::new(0.14, 0.16, 0.19, 1.0));
     draw_rectangle_lines(sx, sy, ex - sx, ey - sy, 2.0, Color::new(0.3, 0.34, 0.4, 1.0));
 }
@@ -131,13 +218,13 @@ fn draw_arena() {
 /// Shade each tile by elevation; walls (raised, impassable) read as stone, pits
 /// (low, impassable) as dark holes, walkable ground lightens with height. A faint
 /// elevation label marks anything off the ground plane.
-fn draw_terrain(t: &Terrain) {
+fn draw_terrain(world: World, t: &Terrain) {
     let ts = t.tile_size;
     for r in 0..t.rows {
         for c in 0..t.cols {
             let Some(tile) = t.tile(c, r) else { continue };
-            let (sx, sy) = world_to_screen(c as f32 * ts, r as f32 * ts);
-            let (ex, ey) = world_to_screen((c + 1) as f32 * ts, (r + 1) as f32 * ts);
+            let (sx, sy) = world_to_screen(world, c as f32 * ts, r as f32 * ts);
+            let (ex, ey) = world_to_screen(world, (c + 1) as f32 * ts, (r + 1) as f32 * ts);
             let (w, h) = (ex - sx, ey - sy);
             draw_rectangle(sx, sy, w, h, tile_color(tile));
             draw_rectangle_lines(sx, sy, w, h, 1.0, Color::new(0.0, 0.0, 0.0, 0.18));
@@ -163,12 +250,12 @@ fn tile_color(t: Tile3) -> Color {
     }
 }
 
-fn draw_entity(e: &Entity, casting: bool) {
-    let (sx, sy) = world_to_screen(e.pos.x, e.pos.y);
+fn draw_entity(world: World, e: &Entity, casting: bool) {
+    let (sx, sy) = world_to_screen(world, e.pos.x, e.pos.y);
     let alive = e.is_alive();
     // Draw the token at the shared collision radius, so overlaps (or the lack of
     // them) are visible. A small floor keeps it legible when zoomed out.
-    let r = (ENTITY_RADIUS * world_scale()).max(6.0);
+    let r = (ENTITY_RADIUS * world_scale(world)).max(6.0);
     let base = if e.team == Team::Player {
         Color::new(0.35, 0.55, 0.95, 1.0)
     } else {
@@ -249,7 +336,7 @@ fn draw_log(log: &[String]) {
     }
 }
 
-fn draw_hud(combat: &Combat, paused: bool) {
+fn draw_hud(combat: &Combat, paused: bool, scenario: &str) {
     let state = if combat.is_over() {
         "OVER"
     } else if paused {
@@ -258,7 +345,7 @@ fn draw_hud(combat: &Combat, paused: bool) {
         "RUNNING"
     };
     let hud = format!(
-        "gambit  |  tick {}  [{}]   —   Space: pause · R: restart",
+        "{scenario}  |  tick {}  [{}]   —   Space: pause · R: restart · M: menu",
         combat.time, state
     );
     draw_text(&hud, 20.0, 28.0, 22.0, WHITE);
