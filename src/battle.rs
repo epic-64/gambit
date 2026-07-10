@@ -12,6 +12,12 @@ use crate::terrain::Terrain;
 /// should come from equipment, not a per-entity field (see CLAUDE.md).
 pub const ENTITY_RADIUS: f32 = 0.5;
 
+/// Fractional movement-speed reduction inflicted by a `Snare` status (0.6 == a
+/// 60% slow). A single knob — snare magnitude isn't stored per-status, so all
+/// snares slow by the same amount regardless of stacks (see
+/// [`Entity::effective_move_speed`]).
+pub const SNARE_SLOW: f32 = 0.6;
+
 /// Index of an entity within [`BattleState::entities`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct EntityId(pub usize);
@@ -46,6 +52,13 @@ pub enum StatusKind {
     Shield,
     Enrage,
     Silence,
+    /// Hard crowd-control: the victim can neither act nor move while it lasts
+    /// (its action bar is frozen too). The counter that charges/gap-closers
+    /// buy with a hit.
+    Stun,
+    /// A movement slow: cuts the victim's `move_speed` by [`SNARE_SLOW`] while it
+    /// lasts. It can still act — only its drift is throttled (the anti-kite tool).
+    Snare,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -69,6 +82,12 @@ pub enum Effect {
         stacks: u32,
         duration: u32,
     },
+    /// Charge / gap-closer: the *actor* dashes toward its primary target, closing
+    /// to melee contact but travelling at most `max` world units. Unlike the other
+    /// effects (which act on each target), this repositions the actor and resolves
+    /// once, before the per-target effects land — so the damage/status that share
+    /// the skill are dealt from contact.
+    Dash { max: f32 },
 }
 
 /// A simple 2D position. We avoid `macroquad::Vec2` here so this module has no
@@ -158,6 +177,27 @@ impl Entity {
 
     pub fn cooldown_remaining(&self, skill: SkillId) -> u32 {
         self.cooldowns.get(&skill).copied().unwrap_or(0)
+    }
+
+    /// Whether the entity is stunned (can't act or move; ATB frozen).
+    pub fn is_stunned(&self) -> bool {
+        self.status(StatusKind::Stun).is_some()
+    }
+
+    /// Whether the entity is snared (drift slowed by [`SNARE_SLOW`]).
+    pub fn is_snared(&self) -> bool {
+        self.status(StatusKind::Snare).is_some()
+    }
+
+    /// Move speed after status modifiers — the distance the entity may actually
+    /// drift this tick. A `Snare` cuts it by [`SNARE_SLOW`]; otherwise it's the
+    /// raw `move_speed`.
+    pub fn effective_move_speed(&self) -> f32 {
+        if self.is_snared() {
+            self.move_speed * (1.0 - SNARE_SLOW)
+        } else {
+            self.move_speed
+        }
     }
 }
 
