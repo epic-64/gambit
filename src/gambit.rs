@@ -195,6 +195,63 @@ pub struct Node {
     pub body: Body,
 }
 
+// ---------------------------------------------------------------------------
+// Movement rules: a separate, lightweight gambit that runs every tick,
+// decoupled from the action gambit above. It reuses the same target engine —
+// a movement intent is just "pick something, then move relative to it".
+// ---------------------------------------------------------------------------
+
+/// Where a movement rule wants the actor to go, expressed relative to a target
+/// the same `TargetQuery` machinery selects. "Kite the nearest enemy" is
+/// `MoveAway(nearest enemy)`; "close on the weakest foe" is `MoveToward(...)`.
+#[derive(Debug, Clone)]
+pub enum MoveIntent {
+    /// Drift toward the selected target (stops on arrival — never overshoots).
+    Toward(TargetQuery),
+    /// Drift directly away from the selected target.
+    Away(TargetQuery),
+}
+
+impl MoveIntent {
+    /// The query this intent selects its reference entity from.
+    pub fn query(&self) -> &TargetQuery {
+        match self {
+            MoveIntent::Toward(q) | MoveIntent::Away(q) => q,
+        }
+    }
+
+    /// True for `Toward`, false for `Away`.
+    pub fn is_toward(&self) -> bool {
+        matches!(self, MoveIntent::Toward(_))
+    }
+}
+
+/// One movement rule: a guard plus an intent. A movement gambit is an ordered
+/// list of these; the first rule whose condition holds *and* whose intent
+/// resolves to a reference target decides the drift for that tick. If none do,
+/// the actor holds position.
+#[derive(Debug, Clone)]
+pub struct MoveRule {
+    pub condition: Condition,
+    pub intent: MoveIntent,
+}
+
+impl MoveRule {
+    /// An unconditional movement rule.
+    pub fn new(intent: MoveIntent) -> MoveRule {
+        MoveRule {
+            condition: Condition::Always,
+            intent,
+        }
+    }
+
+    /// Attach a guard condition (builder-style).
+    pub fn when(mut self, condition: Condition) -> MoveRule {
+        self.condition = condition;
+        self
+    }
+}
+
 impl Node {
     /// A leaf action node with no guard of its own.
     pub fn act(target: TargetQuery, skill: SkillId) -> Node {

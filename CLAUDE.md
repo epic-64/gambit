@@ -32,12 +32,14 @@ testable in isolation. When rendering lands, keep engine types at the boundary a
 
 ```
 src/
-  battle.rs   World state: Entity, Skill, Effect, Status, BattleState. No engine/AI deps.
-  gambit.rs   The rule model: Node / Body / Condition / TargetQuery (a behaviour tree).
-  eval.rs     decide(root, actor, state) -> Option<Action>: walk the tree. (unit tests)
-  combat.rs   Combat: the ATB loop + action resolution. (unit tests)
+  battle.rs   World state: Entity, Skill, Effect, Status, BattleState (+ arena bounds). No engine/AI deps.
+  gambit.rs   The rule model: Node / Body / Condition / TargetQuery (a behaviour tree),
+              plus MoveRule / MoveIntent (the movement gambit).
+  eval.rs     decide(root, actor, state) -> Option<Action>: walk the action tree;
+              decide_move(gambit, actor, state) -> Option<Pos>: resolve movement drift. (unit tests)
+  combat.rs   Combat: the ATB loop + movement + cast-time state machine + action resolution. (unit tests)
   scenario.rs Hand-built demo battle (temporary, until real encounters exist).
-  main.rs     Macroquad viewer: steps Combat on a timer, draws HP/action bars + log.
+  main.rs     Macroquad viewer: steps Combat on a timer, draws HP/action bars, movement + casting, log.
 ```
 
 Run `cargo test` for the behaviour specs and `cargo run` for the live viewer
@@ -46,17 +48,24 @@ engine-agnostic and headless-testable.
 
 ## Combat loop (`combat.rs`)
 
-`Combat { state, gambits: HashMap<EntityId, Node>, time }` drives a tick-based ATB battle.
+`Combat { state, gambits, move_gambits, casts, time }` drives a tick-based ATB battle.
 Each `tick()`:
 
 1. **Statuses:** apply DoT/regen (Poison/Burn damage, Regen heal — per stack, per tick), then
    age every status and drop expired ones.
 2. **Cooldowns:** decrement each entity's per-skill cooldowns.
-3. **Fill bars:** `action_bar += speed`, capped at `READY` (1.0).
-4. **Act:** every entity with a full bar acts, fullest-bar-first (ties by id). For each,
-   `decide()` walks its gambit; on an `Action` the bar resets to 0 and the action resolves;
-   on `None` the entity **waits** with its bar still full, so it re-evaluates next tick and
-   acts the instant a cooldown/condition frees up.
+3. **Advance casts:** tick down each in-flight cast; a completed one resolves — re-validating
+   its committed targets against the *current* world (alive + still in range) and **fizzling**
+   if none survive. A caster that died mid-cast simply loses the cast.
+4. **Move:** every alive, non-casting entity drifts one `move_speed` step along its
+   `move_gambit` (`decide_move`) — continuous, concurrent with the ATB, never move-*or*-act.
+5. **Fill bars:** `action_bar += atb_speed`, capped at `READY` (1.0). **Casting entities are
+   frozen** (bar stays put until the cast resolves).
+6. **Act:** every non-casting entity with a full bar acts, fullest-bar-first (ties by id). For
+   each, `decide()` walks its gambit; on an `Action` the bar resets to 0 and MP + cooldown are
+   committed immediately — an **instant** skill (`cast_time == 0`) resolves now, a **cast-time**
+   skill instead roots the actor into the `casts` map to resolve in a later tick (step 3). On
+   `None` the entity **waits** with its bar still full, re-evaluating next tick.
 
 Battle ends when one whole team is dead; `run(max_ticks)` loops until then (the cap guards
 against stalemates). Every tick returns a `Vec<Event>` log (Acted / Waited / Damage / Heal /
@@ -200,10 +209,13 @@ presets ("nearest foe", "weakest foe", "lowest-HP ally") that expand into full
 pool→filter→sort→pick queries, and hide the individual knobs behind an "advanced" mode. Cap
 *displayed* nesting to ~2–3 levels even if the data model allows arbitrary depth.
 
-## Movement & positioning (designed — not yet built)
+## Movement & positioning (BUILT — flat arena; terrain still deferred)
 
-Entities are currently **static**: every entity has a `Pos`, and `range` / `SortKey::Distance`
-*read* it, but nothing ever *writes* it. The settled design:
+**Status:** implemented on a flat, bounded arena (no terrain/pathfinding yet — that's the next
+section). Entities now *move*: `move_speed` + `move_gambit` (`MoveToward`/`MoveAway(TargetQuery)`)
+drive continuous drift each tick, and `cast_time` skills root the caster via a Casting state.
+`Entity.speed` was renamed `atb_speed`; `BattleState.bounds` clamps drift to the arena. See the
+combat-loop steps above and `combat.rs` / `eval.rs::decide_move`. The design that was built:
 
 - **Flowy, continuous movement — decoupled from the action.** Movement is NOT a turn/action
   choice competing with skills (that makes it a dead option). Instead a unit *drifts* toward a
@@ -214,6 +226,17 @@ Entities are currently **static**: every entity has a `Pos`, and `range` / `Sort
 - **Movement reuses the target engine.** A movement rule is `MoveToward(TargetQuery)` /
   `MoveAway(TargetQuery)` — the same pool→filter→sort→pick machinery picks what to move
   relative to. "Kite the nearest enemy" = MoveAway(nearest enemy). Low marginal complexity.
+- **Hitboxes (BUILT).** Every entity is a circle of one shared radius (`battle::ENTITY_RADIUS`,
+  uniform for now — *not* a per-entity field; if size ever varies it should come from equipment,
+  not a spawn literal). Units can't overlap and can't hang over the arena edge. After
+  `decide_move` picks a destination, `combat.rs::resolve_collisions` clamps the *whole circle*
+  inside `bounds` (`clamp_within`) and pushes the mover out of any other unit's circle to
+  just-touching (only the mover is displaced; movers resolve one at a time in id order, so it's
+  deterministic and terminating). This is the "don't obliviously stack up / walk off the map"
+  spatial sanity — the always-on, never hand-authored kind. **True steering / local avoidance**
+  (sliding around obstacles rather than just stopping at contact) is deliberately deferred to the
+  terrain layer, which brings A* + steering; today a blocked mover simply halts at the contact
+  point.
 - **Cast-time / rooting.** Some skills have `cast_time > 0` (ticks). Selecting one puts the
   unit in a **Casting** state: rooted (movement suppressed — "stand still"), ATB not filling,
   not re-deciding, until it resolves. Idle drifts, Casting stands still — one small state
@@ -227,8 +250,8 @@ Entities are currently **static**: every entity has a `Pos`, and `range` / `Sort
   per-archetype smuggles back a class system, violating the equipment+rules identity
   principle. "Never commits to an attack" is an authoring problem (a bad gambit), not a system
   one; solve real kiting with more *tools* (gap-closers, roots), not a systemic throttle.
-- **`speed` naming:** the current `Entity.speed` is the **ATB fill rate**. When movement lands,
-  add a separate `move_speed` and rename this to `atb_speed` to avoid confusion.
+- **`speed` naming:** DONE — `Entity.speed` was renamed `atb_speed` (the ATB fill rate) and a
+  separate `move_speed` (world units drifted per tick) added.
 
 ## Terrain, height & navigation (designed — not yet built)
 
@@ -271,8 +294,9 @@ pulls in pathfinding, line-of-sight, terrain data, and terrain rendering.
 
 - **`Pick::Random` is deterministic** (hashes actor + candidate set) to keep `decide()` pure.
   Swap for a seeded RNG threaded through `BattleState` when real randomness is wanted.
-- **Rendering:** a basic top-down viewer exists (`main.rs`) for the flat, movement-free
-  combat. When terrain lands, the **view projection** is an open choice — top-down with height
+- **Rendering:** a basic top-down viewer exists (`main.rs`) for the flat arena — it draws
+  drifting units and rings casting ones, but has no terrain yet. When terrain lands, the
+  **view projection** is an open choice — top-down with height
   cues (shading/outlines) vs. isometric/2.5D (FFT-style). Isometric reads height best but is
   more art/render work.
 - **Terrain authoring is undecided** — how maps are defined (hand-authored data files, an

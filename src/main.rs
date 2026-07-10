@@ -5,10 +5,10 @@
 
 //! gambit — a 2D semi-turn-based RPG built around a modular gambit system.
 //!
-//! This binary is the Macroquad viewer for the (still flat, movement-free)
+//! This binary is the Macroquad viewer for the (still flat, terrain-free)
 //! combat core: it steps `Combat` on a fixed timer and draws each entity's HP
-//! and action bars plus a live event log. See CLAUDE.md for the design and
-//! `cargo test` for the behaviour specs.
+//! and action bars, their movement, and casting state, plus a live event log.
+//! See CLAUDE.md for the design and `cargo test` for the behaviour specs.
 
 mod battle;
 mod combat;
@@ -18,7 +18,7 @@ mod scenario;
 
 use macroquad::prelude::*;
 
-use battle::{Entity, EntityId, SkillId, Team};
+use battle::{Entity, EntityId, SkillId, Team, ENTITY_RADIUS};
 use combat::{Combat, Event};
 
 /// Arena size in world units (entity positions live in this space).
@@ -80,7 +80,7 @@ async fn main() {
         clear_background(Color::new(0.10, 0.11, 0.13, 1.0));
         draw_arena();
         for e in &combat.state.entities {
-            draw_entity(e);
+            draw_entity(e, combat.is_casting(e.id));
         }
         draw_log(&log);
         draw_hud(&combat, paused);
@@ -101,9 +101,15 @@ fn arena_rect() -> (f32, f32, f32, f32) {
     (x, y, w, h)
 }
 
+/// World-units → screen-pixels factor (uniform, so hitboxes read true).
+fn world_scale() -> f32 {
+    let (_, _, aw, ah) = arena_rect();
+    (aw / WORLD_W).min(ah / WORLD_H)
+}
+
 fn world_to_screen(wx: f32, wy: f32) -> (f32, f32) {
-    let (ax, ay, aw, ah) = arena_rect();
-    let scale = (aw / WORLD_W).min(ah / WORLD_H);
+    let (ax, ay, _, _) = arena_rect();
+    let scale = world_scale();
     (ax + wx * scale, ay + wy * scale)
 }
 
@@ -116,9 +122,12 @@ fn draw_arena() {
     draw_rectangle_lines(sx, sy, ex - sx, ey - sy, 2.0, Color::new(0.3, 0.34, 0.4, 1.0));
 }
 
-fn draw_entity(e: &Entity) {
+fn draw_entity(e: &Entity, casting: bool) {
     let (sx, sy) = world_to_screen(e.pos.x, e.pos.y);
     let alive = e.is_alive();
+    // Draw the token at the shared collision radius, so overlaps (or the lack of
+    // them) are visible. A small floor keeps it legible when zoomed out.
+    let r = (ENTITY_RADIUS * world_scale()).max(6.0);
     let base = if e.team == Team::Player {
         Color::new(0.35, 0.55, 0.95, 1.0)
     } else {
@@ -129,11 +138,17 @@ fn draw_entity(e: &Entity) {
     } else {
         Color::new(0.3, 0.3, 0.32, 1.0)
     };
-    draw_circle(sx, sy, 18.0, col);
-    draw_circle_lines(sx, sy, 18.0, 2.0, Color::new(0.0, 0.0, 0.0, 0.4));
+    draw_circle(sx, sy, r, col);
+    draw_circle_lines(sx, sy, r, 2.0, Color::new(0.0, 0.0, 0.0, 0.4));
 
-    // Name.
-    draw_text(&e.name, sx - 20.0, sy - 28.0, 18.0, WHITE);
+    // A casting unit is rooted mid-spell — ring it and label it.
+    if alive && casting {
+        draw_circle_lines(sx, sy, r + 6.0, 2.5, Color::new(0.95, 0.85, 0.3, 0.9));
+        draw_text("casting", sx - 24.0, sy + r + 22.0, 16.0, Color::new(0.95, 0.85, 0.3, 1.0));
+    }
+
+    // Name (just above the token).
+    draw_text(&e.name, sx - 20.0, sy - r - 12.0, 18.0, WHITE);
 
     if !alive {
         draw_text("x_x", sx - 12.0, sy + 5.0, 18.0, LIGHTGRAY);
@@ -147,14 +162,14 @@ fn draw_entity(e: &Entity) {
     let bh = 6.0;
     let bx = sx - bw / 2.0;
 
-    // HP bar (above).
-    let hy = sy - 24.0;
+    // HP bar (above the token).
+    let hy = sy - r - 8.0;
     draw_rectangle(bx, hy, bw, bh, Color::new(0.25, 0.05, 0.05, 1.0));
     let hp_frac = (e.hp / e.max_hp).clamp(0.0, 1.0);
     draw_rectangle(bx, hy, bw * hp_frac, bh, Color::new(0.35, 0.8, 0.4, 1.0));
 
-    // Action bar (below).
-    let ay = sy + 20.0;
+    // Action bar (below the token).
+    let ay = sy + r + 2.0;
     draw_rectangle(bx, ay, bw, bh, Color::new(0.15, 0.15, 0.17, 1.0));
     let ab = e.action_bar.clamp(0.0, 1.0);
     draw_rectangle(bx, ay, bw * ab, bh, Color::new(0.95, 0.85, 0.3, 1.0));
@@ -226,6 +241,13 @@ fn format_event(c: &Combat, ev: &Event) -> String {
         Event::Heal { target, amount } => format!("   {} +{amount:.0} hp", name(*target)),
         Event::Inflicted { target, kind, stacks } => {
             format!("   {} {kind:?} x{stacks}", name(*target))
+        }
+        Event::StartedCast { actor, skill: s, targets } => {
+            let ts: Vec<String> = targets.iter().map(|&t| name(t)).collect();
+            format!("{} begins {} @ {}", name(*actor), skill(*s), ts.join(", "))
+        }
+        Event::Fizzled { actor, skill: s } => {
+            format!("   {}'s {} fizzles", name(*actor), skill(*s))
         }
         Event::Died(t) => format!("   {} defeated", name(*t)),
         Event::Victory(team) => format!("*** {team:?} wins ***"),
