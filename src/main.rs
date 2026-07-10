@@ -145,6 +145,31 @@ fn status_color(kind: StatusKind) -> Color {
         StatusKind::Silence => Color::new(0.75, 0.6, 0.95, 1.0),
         StatusKind::Stun => Color::new(0.95, 0.85, 0.3, 1.0),
         StatusKind::Snare => Color::new(0.5, 0.7, 0.95, 1.0),
+        StatusKind::RegenAura => Color::new(0.45, 0.9, 0.6, 1.0),
+        StatusKind::MightAura => Color::new(1.0, 0.6, 0.3, 1.0),
+    }
+}
+
+/// Draw the aura fields: a faint filled disc + ring of the aura's true radius
+/// around each living bearer, so "who is covered" is readable at a glance —
+/// the exact circle the sim tests teammates against, gently breathing.
+fn draw_auras(world: World, combat: &Combat) {
+    let scale = world_scale(world);
+    let breathe = 0.75 + 0.25 * (get_time() as f32 * 2.0).sin();
+    for e in &combat.state.entities {
+        if !e.is_alive() {
+            continue;
+        }
+        for kind in [StatusKind::RegenAura, StatusKind::MightAura] {
+            if e.status(kind).is_none() {
+                continue;
+            }
+            let (sx, sy) = world_to_screen(world, e.pos.x, e.pos.y);
+            let r = combat::AURA_RADIUS * scale;
+            let color = status_color(kind);
+            draw_circle(sx, sy, r, with_alpha(color, 0.05));
+            draw_circle_lines(sx, sy, r, 1.5, with_alpha(color, 0.30 * breathe));
+        }
     }
 }
 
@@ -245,6 +270,16 @@ fn spawn_impact_vfx(
         Event::Cleansed { target } => {
             let at = combat.state.entity(*target).pos;
             push_text(vfx, at, "cleansed".into(), 17.0, Color::new(1.0, 0.96, 0.72, 1.0));
+        }
+        Event::MpDrained { target, amount } => {
+            let at = combat.state.entity(*target).pos;
+            push_text(
+                vfx,
+                at,
+                format!("-{amount:.0} mp"),
+                17.0,
+                Color::new(0.4, 0.65, 1.0, 1.0),
+            );
         }
         Event::Fizzled { actor, .. } => {
             let at = combat.state.entity(*actor).pos;
@@ -376,6 +411,9 @@ async fn main() {
                 }
                 // Everything below draws combat.state directly — the sim is the
                 // single source of truth; nothing is interpolated or predicted.
+                // Aura fields go under everything mobile: who is covered is
+                // terrain-like information.
+                draw_auras(world, combat);
                 // Intent lines go under the tokens: where each unit is heading
                 // and what it's positioning relative to (or casting at).
                 if show_intent {
@@ -826,6 +864,9 @@ fn format_event(c: &Combat, ev: &Event) -> String {
             format!("   {} {kind:?} x{stacks}", name(*target))
         }
         Event::Cleansed { target } => format!("   {} cleansed", name(*target)),
+        Event::MpDrained { target, amount } => {
+            format!("   {} -{amount:.0} mp", name(*target))
+        }
         Event::StartedCast { actor, skill: s, targets } => {
             let ts: Vec<String> = targets.iter().map(|&t| name(t)).collect();
             format!("{} begins {} @ {}", name(*actor), skill(*s), ts.join(", "))

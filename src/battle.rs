@@ -59,9 +59,25 @@ pub enum StatusKind {
     /// A movement slow: cuts the victim's `move_speed` by [`SNARE_SLOW`] while it
     /// lasts. It can still act — only its drift is throttled (the anti-kite tool).
     Snare,
+    /// Aura: teammates within [`crate::combat::AURA_RADIUS`] of the bearer
+    /// (bearer included) regenerate HP continuously — weak, steady sustain that
+    /// rewards fighting near the chanter. See the aura rules on [`StatusKind::is_aura`].
+    RegenAura,
+    /// Aura: teammates within [`crate::combat::AURA_RADIUS`] of the bearer
+    /// (bearer included) deal `1 + AURA_MIGHT_BONUS` times damage.
+    MightAura,
 }
 
 impl StatusKind {
+    /// Whether the status is an *aura* — a field projected around its bearer
+    /// that benefits nearby teammates. Auras follow two extra rules, enforced
+    /// in the combat sim: an entity holds at most **one** aura at a time
+    /// (a new chant replaces the old), and re-applying one refreshes its
+    /// duration without stacking.
+    pub fn is_aura(self) -> bool {
+        matches!(self, StatusKind::RegenAura | StatusKind::MightAura)
+    }
+
     /// Whether the status hurts its bearer — the set [`Effect::Cleanse`] strips.
     /// The beneficial ones (Regen, Shield, Enrage) are never cleansed off an ally.
     pub fn is_harmful(self) -> bool {
@@ -104,6 +120,10 @@ pub enum Effect {
     /// target — the counter-tool to poison/snare/stun attrition. Beneficial
     /// statuses (Regen, Shield, Enrage) are untouched.
     Cleanse,
+    /// Steal up to this much MP from the target into the actor's own pool
+    /// (capped at the actor's `max_mp`; nothing happens on a dry target) —
+    /// the anti-caster tool that starves costed skills instead of HP.
+    DrainMp(f32),
     /// Apply (or stack) a status on the target.
     Inflict {
         kind: StatusKind,

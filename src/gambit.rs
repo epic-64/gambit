@@ -77,6 +77,9 @@ pub enum SortKey {
     Hp,
     HpPct,
     MaxHp,
+    /// Current MP. `Order::Desc` finds the fattest caster pool — the target an
+    /// MP-drain actually pays off against.
+    Mp,
     /// Distance from the actor.
     Distance,
     /// Ground elevation the candidate stands on. `Order::Desc` prefers the
