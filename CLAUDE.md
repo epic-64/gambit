@@ -32,14 +32,19 @@ testable in isolation. When rendering lands, keep engine types at the boundary a
 
 ```
 src/
-  battle.rs   World state: Entity, Skill, Effect, Status, BattleState (+ arena bounds). No engine/AI deps.
+  battle.rs   World state: Entity, Skill, Effect, Status, BattleState (+ arena bounds + optional
+              Terrain, with flat-arena fallbacks for elevation/LoS/passability). No engine/AI deps.
   gambit.rs   The rule model: Node / Body / Condition / TargetQuery (a behaviour tree),
               plus MoveRule / MoveIntent (the movement gambit).
-  eval.rs     decide(root, actor, state) -> Option<Action>: walk the action tree;
-              decide_move(gambit, actor, state) -> Option<Pos>: resolve movement drift. (unit tests)
+  terrain.rs  Tile grid: passability, elevation, cliffs (walkability), and line-of-sight. (unit tests)
+  nav.rs      A* pathfinding + a reachability flood over the tile grid. Pure, engine-agnostic. (unit tests)
+  eval.rs     decide(root, actor, state) -> Option<Action>: walk the action tree (LoS is an implicit
+              feasibility check); decide_move(gambit, actor, state) -> Option<Pos>: resolve movement
+              drift, routing around terrain via A*. (unit tests)
   combat.rs   Combat: the ATB loop + movement + cast-time state machine + action resolution. (unit tests)
-  scenario.rs Hand-built demo battle (temporary, until real encounters exist).
-  main.rs     Macroquad viewer: steps Combat on a timer, draws HP/action bars, movement + casting, log.
+  scenario.rs Hand-built demo battle + demo map (temporary, until real encounters exist).
+  main.rs     Macroquad viewer: steps Combat on a timer, draws terrain (elevation/walls/pits),
+              HP/action bars, movement + casting, log.
 ```
 
 Run `cargo test` for the behaviour specs and `cargo run` for the live viewer
@@ -253,11 +258,41 @@ combat-loop steps above and `combat.rs` / `eval.rs::decide_move`. The design tha
 - **`speed` naming:** DONE — `Entity.speed` was renamed `atb_speed` (the ATB fill rate) and a
   separate `move_speed` (world units drifted per tick) added.
 
-## Terrain, height & navigation (designed — not yet built)
+## Terrain, height & navigation (BUILT — grid + A* + LoS; steering-smoothing & authoring deferred)
+
+**Status:** implemented. `terrain.rs` holds the tile grid (passability, elevation, cliffs,
+line-of-sight); `nav.rs` does A\* + a reachability flood; `eval.rs` routes movement through it and
+treats LoS as an implicit feasibility check; the viewer shades terrain by elevation. `BattleState`
+carries an `Option<Terrain>` — `None` is the old flat arena (everything passable, elevation 0,
+unobstructed sight), so the pre-terrain behaviour and tests are unchanged. What's built vs. what was
+deliberately left for later is called out inline below.
 
 This makes the game a **tactics RPG** (Final Fantasy Tactics / Tactics Ogre lineage): fights
 happen on terrain with obstacles and elevation, not a flat plane. It's the largest subsystem —
 pulls in pathfinding, line-of-sight, terrain data, and terrain rendering.
+
+Implementation notes / decisions made while building:
+- **Line-of-sight is elevation-only.** A tile blocks sight iff it rises above the straight line
+  drawn between the two eye heights (each eye sits at its tile's elevation). So passability doesn't
+  affect sight — you shoot *across* pits and *over* lower cover, but a tall wall between two low
+  units blocks. Model a wall as a *tall, impassable* tile and a pit as a *low, impassable* one.
+- **LoS is enforced as feasibility, not a hand-authored filter.** A skill's target set is gated by
+  range **and** LoS together in `eval::candidates` (only when a skill range is supplied — conditions
+  and movement queries are sightless). There is also a `Filter::HasLineOfSight` for use inside
+  *conditions* (e.g. "flee if a foe that can see me exists").
+- **New gambit material shipped:** filters `HasLineOfSight` / `OnHigherGround` (negate for
+  lower-or-equal), sort key `Elevation` (`Desc` = prefer high-ground targets), and two tile-seeking
+  movement intents — `SeekHighGround(q)` (climb to the highest reachable tile that still sees the
+  target) and `BreakLoS(q)` (duck to the nearest reachable tile the threat can't see). Both use the
+  reachability flood and hold (fall through) on a flat arena. `InCover` was **not** built — it was
+  under-specified; revisit with real cover authoring.
+- **Steering is "follow the A\* waypoints" + the existing collision pass.** `MoveToward` A\*-routes
+  and steps toward the next waypoint centre; `MoveAway` slides along walls by rotating its heading
+  when the straight-away step is blocked. A terrain backstop in `combat::resolve_collisions` reverts
+  a mover to its (valid) start if entity separation ever shoves it onto a wall/cliff. **True
+  smooth steering / string-pulling** (cutting corners between waypoints rather than threading tile
+  centres) is still deferred — movement threads centres for now, which is slightly robotic.
+- **Terrain authoring** is still just data literals (`scenario::demo_terrain`); no editor/format yet.
 
 - **Representation — tile grid, continuous units.** Terrain is a grid of tiles; each tile has
   an `elevation` and a `passable` flag (walls/pits impassable). Units keep **continuous** `Pos`
@@ -294,10 +329,10 @@ pulls in pathfinding, line-of-sight, terrain data, and terrain rendering.
 
 - **`Pick::Random` is deterministic** (hashes actor + candidate set) to keep `decide()` pure.
   Swap for a seeded RNG threaded through `BattleState` when real randomness is wanted.
-- **Rendering:** a basic top-down viewer exists (`main.rs`) for the flat arena — it draws
-  drifting units and rings casting ones, but has no terrain yet. When terrain lands, the
-  **view projection** is an open choice — top-down with height
-  cues (shading/outlines) vs. isometric/2.5D (FFT-style). Isometric reads height best but is
-  more art/render work.
+- **Rendering:** the top-down viewer (`main.rs`) now draws terrain — tiles shaded by elevation,
+  walls/pits distinct, drifting units, and rings on casting ones. The **view projection** is still
+  an open choice: the current top-down + flat elevation-shading reads height only weakly; an
+  isometric/2.5D (FFT-style) projection reads height best but is more art/render work. Height cues
+  beyond flat shading (outlines, drop shadows, cliff edges) are unbuilt.
 - **Terrain authoring is undecided** — how maps are defined (hand-authored data files, an
   in-engine editor, procedural). Not needed until we build the terrain layer.

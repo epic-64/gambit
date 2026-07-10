@@ -5,21 +5,24 @@
 
 //! gambit — a 2D semi-turn-based RPG built around a modular gambit system.
 //!
-//! This binary is the Macroquad viewer for the (still flat, terrain-free)
-//! combat core: it steps `Combat` on a fixed timer and draws each entity's HP
-//! and action bars, their movement, and casting state, plus a live event log.
-//! See CLAUDE.md for the design and `cargo test` for the behaviour specs.
+//! This binary is the Macroquad viewer for the combat core: it steps `Combat` on
+//! a fixed timer and draws the terrain (elevation shading, walls, pits) plus each
+//! entity's HP and action bars, movement, and casting state, and a live event
+//! log. See CLAUDE.md for the design and `cargo test` for the behaviour specs.
 
 mod battle;
 mod combat;
 mod eval;
 mod gambit;
+mod nav;
 mod scenario;
+mod terrain;
 
 use macroquad::prelude::*;
 
 use battle::{Entity, EntityId, SkillId, Team, ENTITY_RADIUS};
 use combat::{Combat, Event};
+use terrain::{Terrain, Tile3};
 
 /// Arena size in world units (entity positions live in this space).
 const WORLD_W: f32 = 20.0;
@@ -79,6 +82,9 @@ async fn main() {
         // --- draw ---
         clear_background(Color::new(0.10, 0.11, 0.13, 1.0));
         draw_arena();
+        if let Some(t) = combat.state.terrain.as_ref() {
+            draw_terrain(t);
+        }
         for e in &combat.state.entities {
             draw_entity(e, combat.is_casting(e.id));
         }
@@ -120,6 +126,41 @@ fn draw_arena() {
     let (ex, ey) = world_to_screen(WORLD_W, WORLD_H);
     draw_rectangle(sx, sy, ex - sx, ey - sy, Color::new(0.14, 0.16, 0.19, 1.0));
     draw_rectangle_lines(sx, sy, ex - sx, ey - sy, 2.0, Color::new(0.3, 0.34, 0.4, 1.0));
+}
+
+/// Shade each tile by elevation; walls (raised, impassable) read as stone, pits
+/// (low, impassable) as dark holes, walkable ground lightens with height. A faint
+/// elevation label marks anything off the ground plane.
+fn draw_terrain(t: &Terrain) {
+    let ts = t.tile_size;
+    for r in 0..t.rows {
+        for c in 0..t.cols {
+            let Some(tile) = t.tile(c, r) else { continue };
+            let (sx, sy) = world_to_screen(c as f32 * ts, r as f32 * ts);
+            let (ex, ey) = world_to_screen((c + 1) as f32 * ts, (r + 1) as f32 * ts);
+            let (w, h) = (ex - sx, ey - sy);
+            draw_rectangle(sx, sy, w, h, tile_color(tile));
+            draw_rectangle_lines(sx, sy, w, h, 1.0, Color::new(0.0, 0.0, 0.0, 0.18));
+            if tile.elevation != 0 {
+                let label = format!("{}", tile.elevation);
+                draw_text(&label, sx + 3.0, sy + 13.0, 13.0, Color::new(1.0, 1.0, 1.0, 0.35));
+            }
+        }
+    }
+}
+
+fn tile_color(t: Tile3) -> Color {
+    if !t.passable {
+        if t.elevation >= 1 {
+            Color::new(0.32, 0.30, 0.34, 1.0) // wall / raised block
+        } else {
+            Color::new(0.05, 0.05, 0.07, 1.0) // pit
+        }
+    } else {
+        // Walkable ground: lightens with elevation (slightly green).
+        let l = (0.16 + t.elevation as f32 * 0.07).clamp(0.08, 0.6);
+        Color::new(l * 0.9, l, l * 0.85, 1.0)
+    }
 }
 
 fn draw_entity(e: &Entity, casting: bool) {

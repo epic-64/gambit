@@ -315,6 +315,17 @@ impl Combat {
                 break;
             }
         }
+
+        // Terrain backstop (the implicit "don't walk into a wall" sanity): if
+        // entity separation shoved the mover onto an impassable tile or across a
+        // cliff, hold at the start position instead — `from` was valid. A* and
+        // the flee/steer step already avoid walls; this only catches the rare
+        // push-into-wall case, so a plain hold is enough (no re-search needed).
+        if let Some(t) = self.state.terrain.as_ref()
+            && !t.walkable(t.tile_of(from), t.tile_of(p))
+        {
+            return from;
+        }
         p
     }
 
@@ -558,6 +569,7 @@ mod tests {
                     entities: Vec::new(),
                     skills: Vec::new(),
                     bounds: (100.0, 100.0),
+                    terrain: None,
                 },
                 gambits: HashMap::new(),
                 move_gambits: HashMap::new(),
@@ -919,6 +931,47 @@ mod tests {
             e,
             Event::Damage { target, amount, .. } if *target == victim && *amount == 50.0
         )));
+    }
+
+    /// A mover routes *around* an impassable wall (down through a gap and back
+    /// up) to reach a target it couldn't walk to in a straight line — the payoff
+    /// of A\* over pure steering, which would jam into the wall and stop.
+    #[test]
+    fn pathfinding_routes_around_a_wall() {
+        use crate::terrain::{Terrain, Tile3};
+
+        let mut a = Arena::new();
+        //              name    team          hp    atb  x    move
+        let mover = a.add_at("mover", Team::Player, 100.0, 0.0, 0.5, 0.5);
+        let target = a.add_at("target", Team::Enemy, 100.0, 0.0, 5.5, 0.0);
+        // Put them on row 0 (behind the wall) with the only gap on row 2.
+        a.ent(mover).pos.y = 0.5;
+        a.ent(target).pos.y = 0.5;
+
+        // 6×3 grid; wall at column 3 across rows 0..=1, leaving row 2 open.
+        let mut terrain = Terrain::flat(6, 3, 1.0);
+        for r in 0..=1 {
+            terrain.set(3, r, Tile3 { elevation: 4, passable: false });
+        }
+        a.state.bounds = terrain.world_extent();
+        a.state.terrain = Some(terrain);
+
+        a.move_gambit(
+            mover,
+            vec![MoveRule::new(MoveIntent::Toward(
+                TargetQuery::new(Pool::Enemies).sort(SortKey::Distance, Order::Asc),
+            ))],
+        );
+
+        let mut combat = a.into_combat();
+        combat.run(100); // no attacks: just drives movement to convergence
+
+        let m = combat.state.entity(mover).pos;
+        let tpos = combat.state.entity(target).pos;
+        assert!(m.x > 3.0, "mover should have crossed to the far side, x = {}", m.x);
+        // Arrived at the target's hitbox on the far side, never through the wall.
+        let sep = m.dist(tpos);
+        assert!(sep < 1.3, "mover should have reached the target, separation = {sep}");
     }
 
     #[test]
