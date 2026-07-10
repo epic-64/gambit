@@ -48,6 +48,10 @@ const DEATH_LIFE: f32 = 0.6;
 const FLASH_LIFE: f32 = 0.18;
 /// Pixels a floating combat-text number rises over its life.
 const TEXT_RISE: f32 = 30.0;
+/// Seconds a bar's shadow holds at the pre-hit fill before collapsing.
+const SHADOW_HOLD: f32 = 0.2;
+/// Seconds the shadow's collapse then takes to sweep down to the live fill.
+const SHADOW_DECAY: f32 = 0.2;
 
 // Intent-line palette (toggled with I). Kept faint so the lines read as an
 // overlay under the tokens, and off the team colors so a red line means
@@ -100,6 +104,55 @@ struct Vfx {
     age: f32,
     /// Total lifetime in seconds.
     life: f32,
+}
+
+/// Trailing "shadow" behind a resource bar: on a loss it stays at the old fill
+/// for [`SHADOW_HOLD`], then sweeps down to the live value over
+/// [`SHADOW_DECAY`], so the size of the bite just taken stays readable for a
+/// beat. Gains snap it up instantly — the shadow only ever shows loss.
+struct Shadow {
+    /// Displayed fill fraction (>= the live fraction while trailing).
+    frac: f32,
+    /// Live fraction last frame, to spot fresh drops.
+    last_live: f32,
+    /// Seconds left holding at the old fill before the collapse starts.
+    hold: f32,
+    /// Collapse speed (fraction/sec), fixed when the hold expires so the sweep
+    /// takes [`SHADOW_DECAY`] seconds regardless of how big the bite was.
+    speed: f32,
+}
+
+impl Shadow {
+    fn new(live: f32) -> Self {
+        Shadow { frac: live, last_live: live, hold: 0.0, speed: 0.0 }
+    }
+
+    fn tick(&mut self, live: f32, dt: f32) {
+        if live < self.last_live {
+            // Fresh loss: (re)freeze at the old width.
+            self.hold = SHADOW_HOLD;
+            self.speed = 0.0;
+        }
+        self.last_live = live;
+        if live >= self.frac {
+            self.frac = live;
+            return;
+        }
+        self.hold -= dt;
+        if self.hold > 0.0 {
+            return;
+        }
+        if self.speed == 0.0 {
+            self.speed = (self.frac - live) / SHADOW_DECAY;
+        }
+        self.frac = (self.frac - self.speed * dt).max(live);
+    }
+}
+
+/// Shadow trails for one entity's HP and MP bars.
+struct ShadowBars {
+    hp: Shadow,
+    mp: Shadow,
 }
 
 /// The palette of the elements — shared by every attack visual (beams,
@@ -329,6 +382,8 @@ async fn main() {
     // Per-entity hit-flash: a brief tint on a token the instant it's struck
     // (white-ish for damage, green for heals), decayed in real time.
     let mut flash: HashMap<EntityId, (f32, Color)> = HashMap::new();
+    // Per-entity trailing shadows for the HP/MP bars, animated in real time.
+    let mut shadows: HashMap<EntityId, ShadowBars> = HashMap::new();
 
     loop {
         match screen {
@@ -341,6 +396,7 @@ async fn main() {
                         log.clear();
                         vfx.clear();
                         flash.clear();
+                        shadows.clear();
                         paused = false;
                         screen = Screen::Playing;
                     }
@@ -359,6 +415,7 @@ async fn main() {
                     log.clear();
                     vfx.clear();
                     flash.clear();
+                    shadows.clear();
                     paused = false;
                 }
                 if is_key_pressed(KeyCode::M) || is_key_pressed(KeyCode::Escape) {
@@ -402,6 +459,22 @@ async fn main() {
                     *remaining > 0.0
                 });
 
+                // Trail each bar's shadow toward the unit's live HP/MP.
+                for e in &combat.state.entities {
+                    let hp_live = (e.hp / e.max_hp).clamp(0.0, 1.0);
+                    let mp_live = if e.max_mp > 0.0 {
+                        (e.mp / e.max_mp).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    let sb = shadows.entry(e.id).or_insert_with(|| ShadowBars {
+                        hp: Shadow::new(hp_live),
+                        mp: Shadow::new(mp_live),
+                    });
+                    sb.hp.tick(hp_live, dt);
+                    sb.mp.tick(mp_live, dt);
+                }
+
                 // --- draw ---
                 let world = combat.state.bounds;
                 clear_background(Color::new(0.10, 0.11, 0.13, 1.0));
@@ -427,7 +500,7 @@ async fn main() {
                     let fl = flash
                         .get(&e.id)
                         .map(|&(remaining, c)| (remaining / FLASH_LIFE, c));
-                    draw_entity(world, e, combat.is_casting(e.id), fl);
+                    draw_entity(world, e, combat.is_casting(e.id), fl, shadows.get(&e.id));
                 }
                 // Attack visuals ride on top of the tokens: fading pierce-beams
                 // (event decoration) and live projectiles (sim state).
@@ -561,7 +634,13 @@ fn tile_color(t: Tile3) -> Color {
     }
 }
 
-fn draw_entity(world: World, e: &Entity, casting: bool, flash: Option<(f32, Color)>) {
+fn draw_entity(
+    world: World,
+    e: &Entity,
+    casting: bool,
+    flash: Option<(f32, Color)>,
+    shadow: Option<&ShadowBars>,
+) {
     let (sx, sy) = world_to_screen(world, e.pos.x, e.pos.y);
     let alive = e.is_alive();
     // Draw the token at the shared collision radius, so overlaps (or the lack of
@@ -608,10 +687,15 @@ fn draw_entity(world: World, e: &Entity, casting: bool, flash: Option<(f32, Colo
     let bh = 6.0;
     let bx = sx - bw / 2.0;
 
-    // HP bar (above the token).
+    // HP bar (above the token). The darker shadow layer trails behind the
+    // bright fill on a hit, marking the chunk just lost (see [`Shadow`]).
     let hy = sy - r - 8.0;
     draw_rectangle(bx, hy, bw, bh, Color::new(0.25, 0.05, 0.05, 1.0));
     let hp_frac = (e.hp / e.max_hp).clamp(0.0, 1.0);
+    if let Some(sb) = shadow {
+        let w = bw * sb.hp.frac.max(hp_frac);
+        draw_rectangle(bx, hy, w, bh, Color::new(0.16, 0.40, 0.20, 1.0));
+    }
     draw_rectangle(bx, hy, bw * hp_frac, bh, Color::new(0.35, 0.8, 0.4, 1.0));
 
     // Action bar (below the token).
@@ -628,6 +712,10 @@ fn draw_entity(world: World, e: &Entity, casting: bool, flash: Option<(f32, Colo
         let mh = 4.0;
         draw_rectangle(bx, next_y, bw, mh, Color::new(0.06, 0.08, 0.16, 1.0));
         let mp_frac = (e.mp / e.max_mp).clamp(0.0, 1.0);
+        if let Some(sb) = shadow {
+            let w = bw * sb.mp.frac.max(mp_frac);
+            draw_rectangle(bx, next_y, w, mh, Color::new(0.14, 0.30, 0.52, 1.0));
+        }
         draw_rectangle(bx, next_y, bw * mp_frac, mh, Color::new(0.3, 0.6, 0.95, 1.0));
         next_y += mh + 2.0;
     }
