@@ -30,6 +30,15 @@ const SHIELD_REDUCTION: f32 = 0.5;
 const ENRAGE_BONUS: f32 = 0.5;
 /// Fraction of dealt damage an [`Effect::Drain`] returns to the actor as healing.
 pub const DRAIN_RATIO: f32 = 0.5;
+/// Extra damage a target with [`StatusKind::Exposed`] takes, from every source
+/// (0.1 == +10%; DoT pulses included — the multiplier lives on the target's
+/// side). Flat regardless of stacks, like `SHIELD_REDUCTION`.
+pub const EXPOSED_DAMAGE_BONUS: f32 = 0.1;
+/// HP returned to an attacker each time it lands a damaging hit on a
+/// [`StatusKind::Lifeleech`] bearer. Foes of the bearer only (the mark is
+/// authored by *their* side), and DoT pulses proc nothing (no attacker at
+/// pulse time).
+pub const LEECH_HEAL_ON_HIT: f32 = 3.0;
 /// Fraction of incoming healing a [`StatusKind::MortalWound`] on the recipient
 /// cuts away â€” every source (Heal, Regen pulse, aura drip, drain-return) is
 /// reduced alike. Flat regardless of stacks, like `SHIELD_REDUCTION`.
@@ -993,10 +1002,11 @@ impl Combat {
     }
 
     /// Resolve one landed hit: enrage and a covering `MightAura` scale it up,
-    /// weakness multiplies it, a shield on the target soaks half. `source` is
-    /// the attacking entity (None for DoT pulses, which have no attacker at
-    /// pulse time and thus no attacker-side scaling). Returns the damage
-    /// actually dealt.
+    /// weakness multiplies it, a shield on the target soaks half, an `Exposed`
+    /// target takes [`EXPOSED_DAMAGE_BONUS`] extra. `source` is the attacking
+    /// entity (None for DoT pulses, which have no attacker at pulse time and
+    /// thus no attacker-side scaling — and no `Lifeleech` payback). Returns
+    /// the damage actually dealt.
     fn apply_damage(
         &mut self,
         source: Option<EntityId>,
@@ -1014,11 +1024,15 @@ impl Combat {
         }
         let weak = matches!(dmg_type, Some(dt) if e.weaknesses.contains(&dt));
         let shielded = e.status(StatusKind::Shield).is_some();
+        let exposed = e.status(StatusKind::Exposed).is_some();
+        let leeched = e.status(StatusKind::Lifeleech).is_some();
+        let target_team = e.team;
         let amount = base
             * if enraged { 1.0 + ENRAGE_BONUS } else { 1.0 }
             * if empowered { 1.0 + AURA_MIGHT_BONUS } else { 1.0 }
             * if weak { WEAKNESS_MULT } else { 1.0 }
-            * if shielded { 1.0 - SHIELD_REDUCTION } else { 1.0 };
+            * if shielded { 1.0 - SHIELD_REDUCTION } else { 1.0 }
+            * if exposed { 1.0 + EXPOSED_DAMAGE_BONUS } else { 1.0 };
         e.hp = (e.hp - amount).max(0.0);
         let died = !e.is_alive();
         events.push(Event::Damage {
@@ -1034,6 +1048,16 @@ impl Combat {
             // time (`source` is None), so a poison bleed-out refreshes nothing.
             if let Some(killer) = source {
                 self.reset_stealth_cooldowns(killer);
+            }
+        }
+        // A leech mark pays the attacker back on every landed hit — the
+        // killing blow included, and through the attacker's own MortalWound
+        // like any other heal.
+        if leeched {
+            if let Some(attacker) = source {
+                if self.state.entity(attacker).team != target_team {
+                    self.apply_heal(attacker, LEECH_HEAL_ON_HIT, events);
+                }
             }
         }
         amount
@@ -2565,6 +2589,54 @@ mod tests {
 
         // 10 * 1.5 (enrage) * 1.5 (weakness) = 22.5
         assert_eq!(combat.state.entity(victim).hp, 77.5);
+    }
+
+    /// An `Exposed` target takes `1 + EXPOSED_DAMAGE_BONUS` times damage —
+    /// the multiplier lives on the target's side, so every source pays it.
+    #[test]
+    fn exposed_amplifies_incoming_damage() {
+        let mut a = Arena::new();
+        let hero = a.add("hero", Team::Player, 100.0, 1.0);
+        let victim = a.add("victim", Team::Enemy, 100.0, 0.0);
+        a.ent(victim)
+            .statuses
+            .push(Status { kind: StatusKind::Exposed, stacks: 1, duration: 10 });
+        let hit = a.skill(damage_skill("Hit", 20.0, None, 0));
+        a.gambit(hero, Node::act(TargetQuery::new(Pool::Enemies), hit));
+
+        let mut combat = a.into_combat();
+        combat.tick();
+
+        let hp = combat.state.entity(victim).hp;
+        assert!((hp - 78.0).abs() < 1e-3, "20 amplified to 22 by Exposed, got hp {hp}");
+    }
+
+    /// Every damaging hit an enemy lands on a `Lifeleech` bearer heals the
+    /// attacker for `LEECH_HEAL_ON_HIT`; a DoT pulse on the bearer (no
+    /// attacker at pulse time) procs nothing.
+    #[test]
+    fn lifeleech_heals_attackers_who_hit_the_bearer() {
+        let mut a = Arena::new();
+        let hero = a.add("hero", Team::Player, 60.0, 1.0); // hurt: room to heal into
+        let mark = a.add("mark", Team::Enemy, 100.0, 0.0);
+        a.ent(mark)
+            .statuses
+            .push(Status { kind: StatusKind::Lifeleech, stacks: 1, duration: 10 });
+        // A poison pulse also damages the mark this tick — it must leech nothing.
+        a.ent(mark)
+            .statuses
+            .push(Status { kind: StatusKind::Poison, stacks: 1, duration: 10 });
+        let hit = a.skill(damage_skill("Hit", 10.0, None, 0));
+        a.gambit(hero, Node::act(TargetQuery::new(Pool::Enemies), hit));
+
+        let mut combat = a.into_combat();
+        combat.tick();
+
+        assert_eq!(
+            combat.state.entity(hero).hp,
+            63.0,
+            "exactly the one landed hit should leech 3 back"
+        );
     }
 
     /// Cleanse strips every harmful status but leaves beneficial ones alone.
