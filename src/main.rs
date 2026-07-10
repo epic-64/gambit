@@ -18,9 +18,13 @@ mod nav;
 mod scenario;
 mod terrain;
 
+use std::collections::HashMap;
+
 use macroquad::prelude::*;
 
-use battle::{DamageType, Effect, Entity, EntityId, Pos, Skill, SkillId, Team, ENTITY_RADIUS};
+use battle::{
+    DamageType, Effect, Entity, EntityId, Pos, Skill, SkillId, StatusKind, Team, ENTITY_RADIUS,
+};
 use combat::{Combat, Event};
 use eval::Pull;
 use terrain::{Terrain, Tile3};
@@ -32,6 +36,18 @@ const LOG_W: f32 = 300.0;
 
 /// Lifetime (real seconds) of a melee pierce-beam before it fades out.
 const PIERCE_LIFE: f32 = 0.22;
+/// Lifetime of an impact burst (the ring + flash where a hit lands).
+const BURST_LIFE: f32 = 0.3;
+/// Lifetime of a floating combat-text number before it fades out.
+const TEXT_LIFE: f32 = 0.9;
+/// Lifetime of the soft glow + motes where a heal lands.
+const HEAL_LIFE: f32 = 0.55;
+/// Lifetime of the expanding ring where a unit falls.
+const DEATH_LIFE: f32 = 0.6;
+/// Lifetime of the white hit-flash tint on a struck token.
+const FLASH_LIFE: f32 = 0.18;
+/// Pixels a floating combat-text number rises over its life.
+const TEXT_RISE: f32 = 30.0;
 
 // Intent-line palette (toggled with I). Kept faint so the lines read as an
 // overlay under the tokens, and off the team colors so a red line means
@@ -57,15 +73,28 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
 }
 
-/// A transient melee-hit visual — a pierce-beam that snaps from the attacker
-/// through the target and fades. Animated in real time, dropped once it ages
-/// past `life`. Decorates an *already-resolved* point-blank hit; projectiles
-/// are NOT vfx — they're sim state, drawn live in [`draw_flights`].
+/// A transient combat visual, animated in real time and dropped once it ages
+/// past `life`. All of these *decorate already-resolved sim events* — the
+/// beams/bursts/numbers spawn the instant the sim says a hit landed.
+/// Projectiles are NOT vfx — they're sim state, drawn live in
+/// [`draw_flights`].
+enum VfxKind {
+    /// Melee pierce-beam: snaps from the attacker through the target and fades.
+    Beam { from: Pos, to: Pos },
+    /// Impact burst where a hit landed: an expanding ring with a white flash.
+    /// `big` marks a weakness hit (larger, louder).
+    Burst { at: Pos, big: bool },
+    /// Soft glow + rising motes where a heal landed.
+    HealGlow { at: Pos },
+    /// Floating combat text (damage numbers, heals, statuses), rising and
+    /// fading. `lift` is a fixed pixel offset so stacked numbers don't overlap.
+    Text { at: Pos, text: String, size: f32, lift: f32 },
+    /// Expanding ring where a unit fell.
+    Death { at: Pos },
+}
+
 struct Vfx {
-    /// World position the attack originates from (the actor).
-    from: Pos,
-    /// World position it lands on (a target).
-    to: Pos,
+    kind: VfxKind,
     color: Color,
     /// Seconds elapsed since it spawned.
     age: f32,
@@ -73,17 +102,49 @@ struct Vfx {
     life: f32,
 }
 
+/// The palette of the elements — shared by every attack visual (beams,
+/// projectiles, impact bursts, damage numbers) so an element reads the same
+/// from fire to landing.
+fn element_color(dt: DamageType) -> Color {
+    match dt {
+        DamageType::Physical => Color::new(0.85, 0.86, 0.92, 1.0),
+        DamageType::Fire => Color::new(1.0, 0.55, 0.2, 1.0),
+        DamageType::Ice => Color::new(0.5, 0.85, 1.0, 1.0),
+        DamageType::Lightning => Color::new(0.95, 0.9, 0.35, 1.0),
+        DamageType::Poison => Color::new(0.6, 0.85, 0.35, 1.0),
+        DamageType::Holy => Color::new(1.0, 0.96, 0.72, 1.0),
+    }
+}
+
 /// Tint an attack visual by its element (heals/utility with no damage type get
 /// a restorative green).
 fn skill_color(skill: &Skill) -> Color {
     match skill.damage_type {
-        Some(DamageType::Physical) => Color::new(0.85, 0.86, 0.92, 1.0),
-        Some(DamageType::Fire) => Color::new(1.0, 0.55, 0.2, 1.0),
-        Some(DamageType::Ice) => Color::new(0.5, 0.85, 1.0, 1.0),
-        Some(DamageType::Lightning) => Color::new(0.95, 0.9, 0.35, 1.0),
-        Some(DamageType::Poison) => Color::new(0.6, 0.85, 0.35, 1.0),
-        Some(DamageType::Holy) => Color::new(1.0, 0.96, 0.72, 1.0),
+        Some(dt) => element_color(dt),
         None => Color::new(0.4, 0.9, 0.5, 1.0),
+    }
+}
+
+/// Tint a *landed hit* by its element. Unlike [`skill_color`], typeless damage
+/// (DoT pulses, untyped hits) reads neutral — never heal-green.
+fn damage_color(dt: Option<DamageType>) -> Color {
+    match dt {
+        Some(dt) => element_color(dt),
+        None => Color::new(0.92, 0.9, 0.88, 1.0),
+    }
+}
+
+/// Tint a status popup by what the status does.
+fn status_color(kind: StatusKind) -> Color {
+    match kind {
+        StatusKind::Poison => Color::new(0.6, 0.85, 0.35, 1.0),
+        StatusKind::Burn => Color::new(1.0, 0.55, 0.2, 1.0),
+        StatusKind::Regen => Color::new(0.4, 0.9, 0.5, 1.0),
+        StatusKind::Shield => Color::new(0.65, 0.8, 1.0, 1.0),
+        StatusKind::Enrage => Color::new(1.0, 0.4, 0.4, 1.0),
+        StatusKind::Silence => Color::new(0.75, 0.6, 0.95, 1.0),
+        StatusKind::Stun => Color::new(0.95, 0.85, 0.3, 1.0),
+        StatusKind::Snare => Color::new(0.5, 0.7, 0.95, 1.0),
     }
 }
 
@@ -106,7 +167,95 @@ fn spawn_attack_vfx(combat: &Combat, ev: &Event, vfx: &mut Vec<Vfx>) {
         if from.dist(to) > combat::MELEE_RANGE {
             continue; // in flight — the sim's projectile draws it
         }
-        vfx.push(Vfx { from, to, color, age: 0.0, life: PIERCE_LIFE });
+        vfx.push(Vfx {
+            kind: VfxKind::Beam { from, to },
+            color,
+            age: 0.0,
+            life: PIERCE_LIFE,
+        });
+    }
+}
+
+/// Push a floating combat-text popup, lifted above any younger popups already
+/// hovering near the same spot so simultaneous numbers (hit + status, DoT
+/// pulses on several stacks) stack upward instead of overprinting.
+fn push_text(vfx: &mut Vec<Vfx>, at: Pos, text: String, size: f32, color: Color) {
+    let stacked = vfx
+        .iter()
+        .filter(|v| matches!(&v.kind, VfxKind::Text { at: a, .. } if a.dist(at) < 2.0))
+        .count();
+    vfx.push(Vfx {
+        kind: VfxKind::Text { at, text, size, lift: stacked as f32 * 16.0 },
+        color,
+        age: 0.0,
+        life: TEXT_LIFE,
+    });
+}
+
+/// Spawn landing visuals for the events that mark a resolved outcome: impact
+/// bursts + damage numbers where hits land (`Damage` fires at the true landing
+/// instant — projectile impact, dash contact, DoT pulse — so these are always
+/// in sync with the sim), heal glows, status popups, death rings, and fizzle
+/// notes. Also primes the struck token's hit-flash.
+fn spawn_impact_vfx(
+    combat: &Combat,
+    ev: &Event,
+    vfx: &mut Vec<Vfx>,
+    flash: &mut HashMap<EntityId, (f32, Color)>,
+) {
+    match ev {
+        Event::Damage { target, amount, weakness, dmg_type } => {
+            let at = combat.state.entity(*target).pos;
+            let color = damage_color(*dmg_type);
+            vfx.push(Vfx {
+                kind: VfxKind::Burst { at, big: *weakness },
+                color,
+                age: 0.0,
+                life: if *weakness { BURST_LIFE * 1.4 } else { BURST_LIFE },
+            });
+            let (text, size) = if *weakness {
+                (format!("-{amount:.0}!"), 26.0)
+            } else {
+                (format!("-{amount:.0}"), 19.0)
+            };
+            push_text(vfx, at, text, size, color);
+            flash.insert(*target, (FLASH_LIFE, mix(WHITE, color, 0.35)));
+        }
+        Event::Heal { target, amount } => {
+            let at = combat.state.entity(*target).pos;
+            let color = Color::new(0.4, 0.9, 0.5, 1.0);
+            vfx.push(Vfx {
+                kind: VfxKind::HealGlow { at },
+                color,
+                age: 0.0,
+                life: HEAL_LIFE,
+            });
+            push_text(vfx, at, format!("+{amount:.0}"), 19.0, color);
+            flash.insert(*target, (FLASH_LIFE, color));
+        }
+        Event::Inflicted { target, kind, stacks } => {
+            let at = combat.state.entity(*target).pos;
+            let text = if *stacks > 1 {
+                format!("{kind:?} x{stacks}")
+            } else {
+                format!("{kind:?}")
+            };
+            push_text(vfx, at, text, 17.0, status_color(*kind));
+        }
+        Event::Fizzled { actor, .. } => {
+            let at = combat.state.entity(*actor).pos;
+            push_text(vfx, at, "fizzle".into(), 16.0, Color::new(0.6, 0.62, 0.66, 1.0));
+        }
+        Event::Died(target) => {
+            let at = combat.state.entity(*target).pos;
+            vfx.push(Vfx {
+                kind: VfxKind::Death { at },
+                color: Color::new(0.85, 0.85, 0.9, 1.0),
+                age: 0.0,
+                life: DEATH_LIFE,
+            });
+        }
+        _ => {}
     }
 }
 
@@ -135,8 +284,12 @@ async fn main() {
     let mut log: Vec<String> = Vec::new();
     let mut paused = false;
     let mut show_intent = true;
-    // In-flight attack visuals (projectiles / pierce-beams), aged in real time.
+    // In-flight attack visuals (pierce-beams, impact bursts, combat text),
+    // aged in real time.
     let mut vfx: Vec<Vfx> = Vec::new();
+    // Per-entity hit-flash: a brief tint on a token the instant it's struck
+    // (white-ish for damage, green for heals), decayed in real time.
+    let mut flash: HashMap<EntityId, (f32, Color)> = HashMap::new();
 
     loop {
         match screen {
@@ -148,6 +301,7 @@ async fn main() {
                         current = i;
                         log.clear();
                         vfx.clear();
+                        flash.clear();
                         paused = false;
                         screen = Screen::Playing;
                     }
@@ -165,6 +319,7 @@ async fn main() {
                     combat = Some(scenarios[current].1());
                     log.clear();
                     vfx.clear();
+                    flash.clear();
                     paused = false;
                 }
                 if is_key_pressed(KeyCode::M) || is_key_pressed(KeyCode::Escape) {
@@ -187,6 +342,7 @@ async fn main() {
                     for ev in &events {
                         log.push(format_event(combat, ev));
                         spawn_attack_vfx(combat, ev, &mut vfx);
+                        spawn_impact_vfx(combat, ev, &mut vfx, &mut flash);
                     }
                     // Keep the log from growing without bound.
                     const MAX_LOG: usize = 500;
@@ -202,6 +358,10 @@ async fn main() {
                     v.age += dt;
                 }
                 vfx.retain(|v| v.age < v.life);
+                flash.retain(|_, (remaining, _)| {
+                    *remaining -= dt;
+                    *remaining > 0.0
+                });
 
                 // --- draw ---
                 let world = combat.state.bounds;
@@ -222,7 +382,10 @@ async fn main() {
                     }
                 }
                 for e in &combat.state.entities {
-                    draw_entity(world, e, combat.is_casting(e.id));
+                    let fl = flash
+                        .get(&e.id)
+                        .map(|&(remaining, c)| (remaining / FLASH_LIFE, c));
+                    draw_entity(world, e, combat.is_casting(e.id), fl);
                 }
                 // Attack visuals ride on top of the tokens: fading pierce-beams
                 // (event decoration) and live projectiles (sim state).
@@ -356,7 +519,7 @@ fn tile_color(t: Tile3) -> Color {
     }
 }
 
-fn draw_entity(world: World, e: &Entity, casting: bool) {
+fn draw_entity(world: World, e: &Entity, casting: bool, flash: Option<(f32, Color)>) {
     let (sx, sy) = world_to_screen(world, e.pos.x, e.pos.y);
     let alive = e.is_alive();
     // Draw the token at the shared collision radius, so overlaps (or the lack of
@@ -367,11 +530,18 @@ fn draw_entity(world: World, e: &Entity, casting: bool) {
     } else {
         Color::new(0.9, 0.4, 0.35, 1.0)
     };
-    let col = if alive {
+    let mut col = if alive {
         base
     } else {
         Color::new(0.3, 0.3, 0.32, 1.0)
     };
+    // Hit-flash: a just-struck token blazes toward the impact color and decays.
+    if let Some((k, fc)) = flash
+        && alive
+    {
+        col = mix(col, fc, 0.75 * k.clamp(0.0, 1.0));
+        draw_circle_lines(sx, sy, r + 2.5, 2.5, with_alpha(fc, 0.8 * k));
+    }
     draw_circle(sx, sy, r, col);
     draw_circle_lines(sx, sy, r, 2.0, Color::new(0.0, 0.0, 0.0, 0.4));
 
@@ -486,23 +656,84 @@ fn draw_intent(world: World, e: &Entity, combat: &Combat) {
     }
 }
 
-/// Draw one melee pierce-beam: it snaps from the actor through the target and
-/// fades over its life.
+/// Draw one transient combat visual, keyed by kind. Everything eases on the
+/// same normalized age `t` and fades out by end of life.
 fn draw_vfx(world: World, v: &Vfx) {
     let t = (v.age / v.life).clamp(0.0, 1.0);
     let scale = world_scale(world);
     let a = 1.0 - t;
-    let dx = v.to.x - v.from.x;
-    let dy = v.to.y - v.from.y;
-    let len = (dx * dx + dy * dy).sqrt().max(f32::EPSILON);
-    let (nx, ny) = (dx / len, dy / len);
-    // Extend a little past the target so it reads as piercing through it.
-    let ext = 2.0 * ENTITY_RADIUS;
-    let (sx, sy) = world_to_screen(world, v.from.x, v.from.y);
-    let (ex, ey) = world_to_screen(world, v.to.x + nx * ext, v.to.y + ny * ext);
-    let w = (ENTITY_RADIUS * scale * 0.5).max(3.0);
-    draw_line(sx, sy, ex, ey, w * 1.6, with_alpha(v.color, 0.28 * a)); // glow
-    draw_line(sx, sy, ex, ey, w * 0.7, with_alpha(WHITE, a)); // bright core
+    match &v.kind {
+        // Pierce-beam: snaps from the actor through the target and fades.
+        VfxKind::Beam { from, to } => {
+            let dx = to.x - from.x;
+            let dy = to.y - from.y;
+            let len = (dx * dx + dy * dy).sqrt().max(f32::EPSILON);
+            let (nx, ny) = (dx / len, dy / len);
+            // Extend a little past the target so it reads as piercing through it.
+            let ext = 2.0 * ENTITY_RADIUS;
+            let (sx, sy) = world_to_screen(world, from.x, from.y);
+            let (ex, ey) = world_to_screen(world, to.x + nx * ext, to.y + ny * ext);
+            let w = (ENTITY_RADIUS * scale * 0.5).max(3.0);
+            draw_line(sx, sy, ex, ey, w * 1.6, with_alpha(v.color, 0.28 * a)); // glow
+            draw_line(sx, sy, ex, ey, w * 0.7, with_alpha(WHITE, a)); // bright core
+        }
+        // Impact burst: a ring that blows outward fast then fades, with a hot
+        // white flash at the moment of contact.
+        VfxKind::Burst { at, big } => {
+            let (sx, sy) = world_to_screen(world, at.x, at.y);
+            let max_r = (ENTITY_RADIUS * scale).max(6.0) * if *big { 2.8 } else { 1.9 };
+            let r = max_r * (0.35 + 0.65 * t.sqrt()); // fast start, easing out
+            draw_circle(sx, sy, r * 0.8, with_alpha(v.color, 0.22 * a));
+            draw_circle_lines(sx, sy, r, if *big { 3.5 } else { 2.5 }, with_alpha(v.color, 0.9 * a));
+            if t < 0.4 {
+                let f = 1.0 - t / 0.4;
+                draw_circle(sx, sy, r * 0.45, with_alpha(WHITE, 0.8 * f));
+            }
+        }
+        // Heal glow: a soft swelling halo with a few motes drifting upward.
+        VfxKind::HealGlow { at } => {
+            let (sx, sy) = world_to_screen(world, at.x, at.y);
+            let r0 = (ENTITY_RADIUS * scale).max(6.0);
+            let r = r0 * (0.9 + 0.7 * t);
+            draw_circle(sx, sy, r, with_alpha(v.color, 0.18 * a));
+            draw_circle_lines(sx, sy, r, 2.0, with_alpha(v.color, 0.5 * a));
+            for k in 0..3 {
+                let ang = k as f32 * 2.1 + 0.7;
+                let mx = sx + ang.cos() * r0 * 0.7;
+                let my = sy + ang.sin() * r0 * 0.35 - 22.0 * t;
+                draw_circle(mx, my, 2.5, with_alpha(WHITE, 0.8 * a));
+            }
+        }
+        // Floating combat text: rises (easing out), holds, then fades.
+        VfxKind::Text { at, text, size, lift } => {
+            let (sx, sy) = world_to_screen(world, at.x, at.y);
+            let rise = TEXT_RISE * (1.0 - (1.0 - t) * (1.0 - t));
+            let alpha = if t < 0.6 { 1.0 } else { (1.0 - t) / 0.4 };
+            let dims = measure_text(text, None, *size as u16, 1.0);
+            let x = sx - dims.width / 2.0;
+            let y = sy - (ENTITY_RADIUS * scale).max(6.0) - 14.0 - lift - rise;
+            draw_text(text, x + 1.0, y + 1.0, *size, with_alpha(BLACK, 0.7 * alpha));
+            draw_text(text, x, y, *size, with_alpha(v.color, alpha));
+        }
+        // Death ring: one slow shockwave marking where the unit fell.
+        VfxKind::Death { at } => {
+            let (sx, sy) = world_to_screen(world, at.x, at.y);
+            let r0 = (ENTITY_RADIUS * scale).max(6.0);
+            let r = r0 * (1.0 + 2.2 * t);
+            draw_circle(sx, sy, r0 * a, with_alpha(v.color, 0.3 * a));
+            draw_circle_lines(sx, sy, r, 2.5, with_alpha(v.color, 0.7 * a));
+        }
+    }
+}
+
+/// Linear blend of two colors.
+fn mix(a: Color, b: Color, t: f32) -> Color {
+    Color::new(
+        lerp(a.r, b.r, t),
+        lerp(a.g, b.g, t),
+        lerp(a.b, b.b, t),
+        lerp(a.a, b.a, t),
+    )
 }
 
 /// Draw the sim's in-flight projectiles: a glowing head with a short trail
@@ -582,7 +813,7 @@ fn format_event(c: &Combat, ev: &Event) -> String {
             format!("{} -> {} @ {}", name(*actor), skill(*s), ts.join(", "))
         }
         Event::Waited(a) => format!("{} waits", name(*a)),
-        Event::Damage { target, amount, weakness } => {
+        Event::Damage { target, amount, weakness, .. } => {
             let tag = if *weakness { " (weak!)" } else { "" };
             format!("   {} -{amount:.0}{tag}", name(*target))
         }
