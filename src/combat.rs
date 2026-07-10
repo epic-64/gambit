@@ -77,6 +77,24 @@ pub enum Event {
         target: EntityId,
         amount: f32,
     },
+    /// A spell ward on `bearer` ate an incoming damage spell and re-cast it at
+    /// `attacker` — the rebound's own Damage/Inflicted events follow. The ward
+    /// charge is already consumed at this point.
+    Reflected {
+        bearer: EntityId,
+        attacker: EntityId,
+        /// The element the reflected spell carries (for the viewer's beam).
+        dmg_type: Option<DamageType>,
+    },
+    /// A chain-damage arc jumped from one victim to the next; the damage it
+    /// carried follows as its own `Damage` event. Emitted so the viewer can
+    /// draw the arc between the two bodies.
+    Chained {
+        from: EntityId,
+        to: EntityId,
+        /// The element the arc carries (the skill's damage type).
+        dmg_type: Option<DamageType>,
+    },
     Inflicted {
         target: EntityId,
         kind: StatusKind,
@@ -386,6 +404,13 @@ impl Combat {
             match decision {
                 Some(action) => {
                     let skill = self.state.skill(action.skill).clone();
+                    // Acting breaks stealth: committing to any action — an
+                    // instant or a cast start — reveals a sneaking actor.
+                    // (A sneak skill re-applies its status a moment later,
+                    // when its own effects resolve.)
+                    self.state.entities[actor.0]
+                        .statuses
+                        .retain(|s| s.kind != StatusKind::Sneak);
                     // Spend the turn and commit MP + cooldown up front — this is
                     // "commit at cast start" for cast-time skills.
                     self.commit_cost(actor, action.skill, &skill);
@@ -551,14 +576,17 @@ impl Combat {
     }
 
     /// Resolve a completed cast, re-validating its committed targets against the
-    /// *current* world: a target that has died or drifted out of range is
-    /// dropped, and a cast with no valid target left fizzles.
+    /// *current* world: a target that has died, drifted out of range, or
+    /// vanished into sneak is dropped, and a cast with no valid target left
+    /// fizzles.
     fn resolve_cast(&mut self, actor: EntityId, mut action: Action, events: &mut Vec<Event>) {
         let skill = self.state.skill(action.skill).clone();
         let actor_pos = self.state.entity(actor).pos;
         action.targets.retain(|&t| {
             let e = self.state.entity(t);
-            e.is_alive() && actor_pos.dist(e.pos) <= skill.range
+            e.is_alive()
+                && actor_pos.dist(e.pos) <= skill.range
+                && self.state.visible_to(actor, t)
         });
 
         if action.targets.is_empty() {
@@ -698,6 +726,9 @@ impl Combat {
                 let f = &self.flights[i];
                 (f.target, f.pos)
             };
+            // Sneaking does NOT shake a projectile already in the air —
+            // stealth blocks new targeting, not physics (invisibility, not
+            // invulnerability). Only death fizzles a flight.
             if !self.state.entity(target).is_alive() {
                 let f = self.flights.swap_remove(i);
                 events.push(Event::Fizzled { actor: f.actor, skill: f.skill });
@@ -732,10 +763,60 @@ impl Combat {
         skill: &Skill,
         events: &mut Vec<Event>,
     ) {
+        if self.try_reflect(actor, target, skill, events) {
+            return;
+        }
         for effect in &skill.effects {
             match effect {
                 Effect::Damage(base) => {
                     self.apply_damage(Some(actor), target, *base, skill.damage_type, events);
+                }
+                Effect::ChainDamage { base, jumps, falloff, jump_range } => {
+                    // Full damage on the primary target, then arc: each jump
+                    // strikes the nearest not-yet-struck foe within range and
+                    // sight of the *last victim*, at falloff× the previous hit.
+                    // Nearest-first with ties broken by entity order keeps the
+                    // arc path deterministic.
+                    let mut amount = *base;
+                    self.apply_damage(Some(actor), target, amount, skill.damage_type, events);
+                    let actor_team = self.state.entity(actor).team;
+                    let mut struck = vec![target];
+                    let mut from = target;
+                    for _ in 0..*jumps {
+                        let from_pos = self.state.entity(from).pos;
+                        let next = self
+                            .state
+                            .entities
+                            .iter()
+                            .filter(|e| {
+                                e.is_alive()
+                                    && e.team != actor_team
+                                    && !struck.contains(&e.id)
+                                    && from_pos.dist(e.pos) <= *jump_range
+                                    && self.state.line_of_sight(from_pos, e.pos)
+                                // No visibility check: an arc is loose energy,
+                                // not aimed targeting — it finds a sneaking
+                                // foe just fine (invisibility, not
+                                // invulnerability).
+                            })
+                            .min_by(|a, b| {
+                                from_pos
+                                    .dist(a.pos)
+                                    .partial_cmp(&from_pos.dist(b.pos))
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                            })
+                            .map(|e| e.id);
+                        let Some(next) = next else { break };
+                        amount *= falloff;
+                        events.push(Event::Chained {
+                            from,
+                            to: next,
+                            dmg_type: skill.damage_type,
+                        });
+                        self.apply_damage(Some(actor), next, amount, skill.damage_type, events);
+                        struck.push(next);
+                        from = next;
+                    }
                 }
                 Effect::ExecuteDamage(base) => {
                     // 1% more per 1% of the target's missing HP: ×1 at full
@@ -776,6 +857,57 @@ impl Combat {
                 Effect::Dash { .. } => {}
             }
         }
+    }
+
+    /// The `SpellWard` parry: if a hostile damage *spell* (elemental,
+    /// non-physical damage type) lands on a warded target, burn one ward
+    /// charge and re-cast the whole skill from the bearer at the attacker —
+    /// so a reflected chain arcs on through the attacker's side, a reflected
+    /// drain feeds the bearer, and any status riders land on the caster.
+    /// Returns true if the hit was consumed. A warded attacker bounces the
+    /// rebound right back (each pass burns a charge, so it terminates);
+    /// physical hits, heals, and DoT pulses are never reflected.
+    fn try_reflect(
+        &mut self,
+        actor: EntityId,
+        target: EntityId,
+        skill: &Skill,
+        events: &mut Vec<Event>,
+    ) -> bool {
+        let is_spell = matches!(skill.damage_type, Some(dt) if dt != DamageType::Physical);
+        let is_damaging = skill.effects.iter().any(|e| {
+            matches!(
+                e,
+                Effect::Damage(_)
+                    | Effect::ExecuteDamage(_)
+                    | Effect::Drain(_)
+                    | Effect::ChainDamage { .. }
+            )
+        });
+        if !is_spell
+            || !is_damaging
+            || self.state.entity(actor).team == self.state.entity(target).team
+        {
+            return false;
+        }
+        let t = &mut self.state.entities[target.0];
+        if !t.is_alive() || t.status(StatusKind::SpellWard).is_none() {
+            return false;
+        }
+        for s in &mut t.statuses {
+            if s.kind == StatusKind::SpellWard {
+                s.stacks -= 1;
+            }
+        }
+        t.statuses
+            .retain(|s| s.kind != StatusKind::SpellWard || s.stacks > 0);
+        events.push(Event::Reflected {
+            bearer: target,
+            attacker: actor,
+            dmg_type: skill.damage_type,
+        });
+        self.apply_effects_to(target, actor, skill, events);
+        true
     }
 
     /// Resolve one landed hit: enrage and a covering `MightAura` scale it up,
@@ -1103,6 +1235,275 @@ mod tests {
             .expect("a damage event");
         assert!(dmg.1, "should be flagged as a weakness hit");
         assert_eq!(dmg.0, 30.0); // 20 * 1.5
+    }
+
+    /// A sneaking entity doesn't exist to hostile targeting: an enemy with a
+    /// ready attack simply waits (nothing visible to hit), and takes nothing.
+    #[test]
+    fn sneak_hides_from_hostile_targeting() {
+        let mut a = Arena::new();
+        let brute = a.add("brute", Team::Player, 100.0, 1.0);
+        let rogue = a.add("rogue", Team::Enemy, 100.0, 0.0);
+        a.ent(rogue).statuses.push(Status {
+            kind: StatusKind::Sneak,
+            stacks: 1,
+            duration: 10,
+        });
+        let hit = a.skill(damage_skill("Hit", 20.0, None, 0));
+        a.gambit(brute, Node::act(TargetQuery::new(Pool::Enemies), hit));
+        let mut combat = a.into_combat();
+
+        let log = combat.tick();
+
+        assert!(log.contains(&Event::Waited(brute)), "nothing visible to hit");
+        assert_eq!(combat.state.entity(rogue).hp, 100.0);
+    }
+
+    /// Acting breaks stealth: a sneaking attacker can still strike, but the
+    /// hit strips its own Sneak.
+    #[test]
+    fn acting_breaks_sneak() {
+        let mut a = Arena::new();
+        let rogue = a.add("rogue", Team::Player, 100.0, 1.0);
+        let dummy = a.add("dummy", Team::Enemy, 100.0, 0.0);
+        a.ent(rogue).statuses.push(Status {
+            kind: StatusKind::Sneak,
+            stacks: 1,
+            duration: 10,
+        });
+        let hit = a.skill(damage_skill("Hit", 20.0, None, 0));
+        a.gambit(rogue, Node::act(TargetQuery::new(Pool::Enemies), hit));
+        let mut combat = a.into_combat();
+
+        combat.tick();
+
+        assert_eq!(combat.state.entity(dummy).hp, 80.0, "the sneaker can still strike");
+        assert!(
+            combat.state.entity(rogue).status(StatusKind::Sneak).is_none(),
+            "attacking reveals the sneaker"
+        );
+    }
+
+    /// Invisibility, not invulnerability: sneaking does not shake a projectile
+    /// that is already in the air — it still homes in and lands.
+    #[test]
+    fn sneak_does_not_dodge_a_projectile_in_the_air() {
+        let mut a = Arena::new();
+        let archer = a.add("archer", Team::Player, 100.0, 1.0);
+        // Far enough that the shot flies instead of landing instantly.
+        let rogue = a.add_at("rogue", Team::Enemy, 100.0, 0.0, 30.0, 0.0);
+        let shot = a.skill(damage_skill("Shot", 20.0, None, 0));
+        a.gambit(archer, Node::act(TargetQuery::new(Pool::Enemies), shot));
+        let mut combat = a.into_combat();
+
+        combat.tick(); // fires: a projectile is now in the air
+        assert_eq!(combat.flights().len(), 1);
+        combat.state.entities[rogue.0].statuses.push(Status {
+            kind: StatusKind::Sneak,
+            stacks: 1,
+            duration: 20,
+        });
+        combat.run(5); // plenty of time for the shot to arrive
+
+        assert_eq!(
+            combat.state.entity(rogue).hp,
+            80.0,
+            "exactly the one in-flight shot lands; no new shots while hidden"
+        );
+    }
+
+    /// Sneaking mid-cast dodges the committed nuke: the resolving cast finds
+    /// its mark vanished and fizzles — unlike a projectile, nothing has
+    /// launched yet.
+    #[test]
+    fn sneaking_mid_cast_fizzles_the_committed_nuke() {
+        let mut a = Arena::new();
+        let caster = a.add("caster", Team::Player, 100.0, 1.0);
+        let rogue = a.add("rogue", Team::Enemy, 100.0, 0.0);
+        let nuke = a.skill(Skill {
+            name: "Nuke".into(),
+            cost: 0,
+            range: 1000.0,
+            cooldown: 99,
+            cast_time: 2,
+            damage_type: None,
+            effects: vec![Effect::Damage(30.0)],
+        });
+        a.gambit(caster, Node::act(TargetQuery::new(Pool::Enemies), nuke));
+        let mut combat = a.into_combat();
+
+        combat.tick(); // cast begins, committed at the rogue
+        assert!(combat.is_casting(caster));
+        combat.state.entities[rogue.0].statuses.push(Status {
+            kind: StatusKind::Sneak,
+            stacks: 1,
+            duration: 10,
+        });
+        combat.tick();
+        let log = combat.tick(); // cast completes — into thin air
+
+        assert!(
+            log.iter().any(|e| matches!(e, Event::Fizzled { actor, .. } if *actor == caster)),
+            "the cast should fizzle on a vanished mark"
+        );
+        assert_eq!(combat.state.entity(rogue).hp, 100.0);
+    }
+
+    /// A spell ward eats the next hostile damage spell and hurls it back: the
+    /// bearer takes nothing, the caster takes its own hit, the charge is
+    /// consumed — and the next spell lands normally.
+    #[test]
+    fn spell_ward_reflects_one_damage_spell() {
+        let mut a = Arena::new();
+        let caster = a.add("caster", Team::Enemy, 100.0, 1.0); // acts every tick
+        let rogue = a.add("rogue", Team::Player, 100.0, 0.0);
+        a.ent(rogue).statuses.push(Status {
+            kind: StatusKind::SpellWard,
+            stacks: 1,
+            duration: 10,
+        });
+        let bolt = a.skill(damage_skill("Bolt", 20.0, Some(DamageType::Fire), 0));
+        a.gambit(caster, Node::act(TargetQuery::new(Pool::Enemies), bolt));
+        let mut combat = a.into_combat();
+
+        let log = combat.tick();
+
+        assert_eq!(combat.state.entity(rogue).hp, 100.0, "the ward ate the spell");
+        assert_eq!(combat.state.entity(caster).hp, 80.0, "the spell rebounded");
+        assert!(log.iter().any(|e| matches!(e, Event::Reflected { .. })));
+        assert!(
+            combat.state.entity(rogue).status(StatusKind::SpellWard).is_none(),
+            "the charge is consumed"
+        );
+
+        combat.tick(); // second bolt: no ward left
+        assert_eq!(combat.state.entity(rogue).hp, 80.0, "one charge reflects one spell");
+    }
+
+    /// The ward is a *spell* counter: physical hits pass straight through it,
+    /// leaving the charge intact.
+    #[test]
+    fn spell_ward_ignores_physical_hits() {
+        let mut a = Arena::new();
+        let archer = a.add("archer", Team::Enemy, 100.0, 1.0);
+        let rogue = a.add("rogue", Team::Player, 100.0, 0.0);
+        a.ent(rogue).statuses.push(Status {
+            kind: StatusKind::SpellWard,
+            stacks: 1,
+            duration: 10,
+        });
+        let shot = a.skill(damage_skill("Shot", 20.0, Some(DamageType::Physical), 0));
+        a.gambit(archer, Node::act(TargetQuery::new(Pool::Enemies), shot));
+        let mut combat = a.into_combat();
+
+        let log = combat.tick();
+
+        assert_eq!(combat.state.entity(rogue).hp, 80.0, "an arrow is not a spell");
+        assert_eq!(combat.state.entity(archer).hp, 100.0);
+        assert!(log.iter().all(|e| !matches!(e, Event::Reflected { .. })));
+        assert!(
+            combat.state.entity(rogue).status(StatusKind::SpellWard).is_some(),
+            "the charge is still there"
+        );
+    }
+
+    /// Chain damage arcs from the primary target to nearby foes with falloff:
+    /// each jump strikes the nearest unstruck enemy within jump range of the
+    /// last victim, and the arc stops at the jump cap.
+    #[test]
+    fn chain_damage_arcs_with_falloff() {
+        let mut a = Arena::new();
+        let hero = a.add("hero", Team::Player, 100.0, 1.0);
+        let first = a.add_at("first", Team::Enemy, 100.0, 0.0, 2.0, 0.0);
+        let second = a.add_at("second", Team::Enemy, 100.0, 0.0, 4.0, 0.0);
+        let third = a.add_at("third", Team::Enemy, 100.0, 0.0, 6.0, 0.0);
+        let fourth = a.add_at("fourth", Team::Enemy, 100.0, 0.0, 8.0, 0.0);
+        let bolt = a.skill(Skill {
+            name: "Chain Bolt".into(),
+            cost: 0,
+            range: 1000.0,
+            cooldown: 99,
+            cast_time: 0,
+            damage_type: None,
+            effects: vec![Effect::ChainDamage {
+                base: 20.0,
+                jumps: 2,
+                falloff: 0.5,
+                jump_range: 3.0,
+            }],
+        });
+        a.gambit(hero, Node::act(TargetQuery::new(Pool::Enemies), bolt));
+
+        let mut combat = a.into_combat();
+        let log = combat.tick();
+
+        let arcs = log
+            .iter()
+            .filter(|e| matches!(e, Event::Chained { .. }))
+            .count();
+        assert_eq!(arcs, 2, "two jumps after the primary hit");
+        let dmg: Vec<(EntityId, f32)> = log
+            .iter()
+            .filter_map(|e| match e {
+                Event::Damage { target, amount, .. } => Some((*target, *amount)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            dmg,
+            vec![(first, 20.0), (second, 10.0), (third, 5.0)],
+            "full base on the primary, then falloff per arc"
+        );
+        assert_eq!(
+            combat.state.entity(fourth).hp,
+            100.0,
+            "the fourth foe is past the jump cap"
+        );
+    }
+
+    /// A chain arc never leaps farther than its jump range, never strikes the
+    /// actor's own team, and a lone primary target just takes a single hit.
+    #[test]
+    fn chain_damage_respects_jump_range_and_teams() {
+        let mut a = Arena::new();
+        let hero = a.add("hero", Team::Player, 100.0, 1.0);
+        let ally = a.add_at("ally", Team::Player, 100.0, 0.0, 3.0, 0.0);
+        let near = a.add_at("near", Team::Enemy, 100.0, 0.0, 2.0, 0.0);
+        let far = a.add_at("far", Team::Enemy, 100.0, 0.0, 20.0, 0.0);
+        let bolt = a.skill(Skill {
+            name: "Chain Bolt".into(),
+            cost: 0,
+            range: 1000.0,
+            cooldown: 99,
+            cast_time: 0,
+            damage_type: None,
+            effects: vec![Effect::ChainDamage {
+                base: 20.0,
+                jumps: 3,
+                falloff: 0.5,
+                jump_range: 5.0,
+            }],
+        });
+        a.gambit(hero, Node::act(TargetQuery::new(Pool::Enemies), bolt));
+
+        let mut combat = a.into_combat();
+        let log = combat.tick();
+
+        assert_eq!(combat.state.entity(near).hp, 80.0);
+        assert_eq!(
+            combat.state.entity(far).hp,
+            100.0,
+            "an arc can't leap 18 units"
+        );
+        assert_eq!(
+            combat.state.entity(ally).hp,
+            100.0,
+            "an ally inside jump range is never a chain victim"
+        );
+        assert!(
+            log.iter().all(|e| !matches!(e, Event::Chained { .. })),
+            "no valid jump, no arc events"
+        );
     }
 
     #[test]

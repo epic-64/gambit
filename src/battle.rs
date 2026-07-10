@@ -59,6 +59,20 @@ pub enum StatusKind {
     /// A movement slow: cuts the victim's `move_speed` by [`SNARE_SLOW`] while it
     /// lasts. It can still act — only its drift is throttled (the anti-kite tool).
     Snare,
+    /// Spell counter: each stack is a charge that eats the next hostile damage
+    /// *spell* (elemental, non-physical damage) to land on the bearer and
+    /// re-casts it at the attacker instead (see `combat::try_reflect`). The
+    /// anti-mage parry — physical hits and DoT pulses pass straight through.
+    SpellWard,
+    /// Stealth: the bearer is invisible to the other team while it lasts (see
+    /// [`BattleState::visible_to`]) — hostile targeting, conditions, and
+    /// movement references all skip it, and an unresolved *cast* fizzles on a
+    /// vanished mark (nothing has launched yet). It is invisibility, **not**
+    /// invulnerability: attacks already in motion (projectiles in the air,
+    /// lunges underway) still land, and indiscriminate energy (chain arcs)
+    /// still finds it. Teammates still see it. Taking any action breaks it
+    /// (enforced in the combat loop).
+    Sneak,
     /// Aura: teammates within [`crate::combat::AURA_RADIUS`] of the bearer
     /// (bearer included) regenerate HP continuously — weak, steady sustain that
     /// rewards fighting near the chanter. See the aura rules on [`StatusKind::is_aura`].
@@ -124,6 +138,20 @@ pub enum Effect {
     /// (capped at the actor's `max_mp`; nothing happens on a dry target) —
     /// the anti-caster tool that starves costed skills instead of HP.
     DrainMp(f32),
+    /// Chain-lightning damage: the full `base` hits the primary target, then
+    /// the hit arcs up to `jumps` more times — each arc striking the nearest
+    /// not-yet-struck foe within `jump_range` of the last victim (needing line
+    /// of sight *from that victim*, not the actor) for `falloff`× the previous
+    /// hit. The anti-clump tool: spread out and it's just a weak single hit.
+    ChainDamage {
+        base: f32,
+        /// Maximum number of arcs after the primary hit.
+        jumps: u32,
+        /// Damage multiplier per arc (0.7 == each jump lands 70% of the last).
+        falloff: f32,
+        /// Max distance an arc travels from the last victim to the next.
+        jump_range: f32,
+    },
     /// Apply (or stack) a status on the target.
     Inflict {
         kind: StatusKind,
@@ -314,6 +342,16 @@ impl BattleState {
     /// flat).
     pub fn passable_at(&self, p: Pos) -> bool {
         self.terrain.as_ref().is_none_or(|t| t.passable_at(p))
+    }
+
+    /// Whether `viewer` can perceive `target`: a [`StatusKind::Sneak`]ing
+    /// entity is hidden from the other team — it simply doesn't exist to
+    /// hostile queries — while teammates (and itself) always see it. This is
+    /// the implicit-feasibility face of stealth, like range and line-of-sight:
+    /// never something a player hand-authors around.
+    pub fn visible_to(&self, viewer: EntityId, target: EntityId) -> bool {
+        let t = self.entity(target);
+        t.status(StatusKind::Sneak).is_none() || t.team == self.entity(viewer).team
     }
 
     /// All *living* entity ids, in stable order.
