@@ -32,7 +32,7 @@ fn push_skill(skills: &mut Vec<Skill>, s: Skill) -> SkillId {
 pub fn scenarios() -> Vec<(&'static str, fn() -> Combat)> {
     vec![
         ("Duel — Hero & Mage vs Goblin & Ogre (hill + wall)", demo as fn() -> Combat),
-        ("Skirmish — 4v4 party battle (plateau + cover)", skirmish as fn() -> Combat),
+        ("Skirmish — 5v5 party battle (plateau + cover)", skirmish as fn() -> Combat),
     ]
 }
 
@@ -234,9 +234,11 @@ fn demo_terrain() -> Terrain {
     t
 }
 
-/// A 4v4 party skirmish. Players field a **tanky brawler**, an **archer**, a
-/// **mage** and a **healer**; the enemy fields a **heavy tank**, a squishy-diving
-/// **assassin**, an **archer** and a **healer**. There are no classes in the code —
+/// A 5v5 party skirmish. Players field a **tanky brawler**, an **archer**, a
+/// **mage**, a **healer** and a **chanter** (an offensive aura + mana-theft
+/// support); the enemy fields a **heavy tank**, a squishy-diving **assassin**,
+/// an **archer**, a **healer** and its own **chanter** (a defensive regen aura
+/// + a mending touch). There are no classes in the code —
 /// each of those labels is just a bundle of stats + a skill kit + gambit rules
 /// (see CLAUDE.md). Everyone knows only their own kit, so feasibility (range /
 /// cost / cooldown / line-of-sight) does all the routing; the gambits only state
@@ -445,7 +447,12 @@ pub fn skirmish() -> Combat {
         &mut skills,
         Skill {
             name: "Prayer".into(),
-            cost: 40,
+            // Cheaper than a single Heal on purpose: per *target* it's the
+            // weaker mend (24 vs 38), so the price of the group case must not
+            // also be higher — a dearer Prayer was simply never affordable in
+            // a cleric economy that pays 25 per triage Heal (the cooldown and
+            // the rooted cast are what keep it from replacing Heal outright).
+            cost: 20,
             range: 8.0,
             cooldown: 14,
             cast_time: 2,
@@ -502,6 +509,80 @@ pub fn skirmish() -> Combat {
             effects: vec![Effect::Drain(12.0)],
         },
     );
+    // The chanters' auras: a chant projects a field (radius `AURA_RADIUS`)
+    // around the singer that benefits teammates standing inside it — and only
+    // them. One aura per entity at a time (a new chant displaces the old;
+    // enforced by the sim), and each chant outlasts its cooldown, so keeping
+    // the field up costs a periodic action — sustaining the song is the
+    // chanter's job, not a fire-and-forget buff.
+    //
+    // Blue's war chant: +5% damage for every covered teammate.
+    let war_chant = push_skill(
+        &mut skills,
+        Skill {
+            name: "War Chant".into(),
+            cost: 10,
+            range: 100.0,
+            cooldown: 10,
+            cast_time: 1,
+            damage_type: None,
+            effects: vec![Effect::Inflict {
+                kind: StatusKind::MightAura,
+                stacks: 1,
+                duration: 24,
+            }],
+        },
+    );
+    // Red's life chant: a weak continuous HP drip for every covered teammate.
+    let life_chant = push_skill(
+        &mut skills,
+        Skill {
+            name: "Life Chant".into(),
+            cost: 10,
+            range: 100.0,
+            cooldown: 10,
+            cast_time: 1,
+            damage_type: None,
+            effects: vec![Effect::Inflict {
+                kind: StatusKind::RegenAura,
+                stacks: 1,
+                duration: 24,
+            }],
+        },
+    );
+    // Blue chanter's support melee: a touch that tears MP out of the target
+    // into the chanter's own pool — it starves enemy casters (the Shaman's
+    // heals, the Assassin's dives) while funding the chant upkeep.
+    let mana_rend = push_skill(
+        &mut skills,
+        Skill {
+            name: "Mana Rend".into(),
+            cost: 0,
+            range: 2.5,
+            cooldown: 6,
+            cast_time: 0,
+            damage_type: Some(DamageType::Lightning),
+            effects: vec![Effect::Damage(7.0), Effect::DrainMp(15.0)],
+        },
+    );
+    // Red chanter's support melee: a mending touch — heal + cleanse in one,
+    // but only at arm's reach, so the chanter must wade to the ally who needs
+    // it (and its aura comes along).
+    let soothing_touch = push_skill(
+        &mut skills,
+        Skill {
+            name: "Soothing Touch".into(),
+            // Modest numbers on purpose: stacked on top of the regen aura and
+            // the Shaman's heals this is the red team's third sustain source,
+            // and at 16-per-5-ticks it swept the skirmish without a loss.
+            cost: 8,
+            range: 2.5,
+            cooldown: 7,
+            cast_time: 0,
+            damage_type: None,
+            effects: vec![Effect::Heal(12.0), Effect::Cleanse],
+        },
+    );
     // Ogre's war cry: self-enrage (+50% outgoing damage for 3s). Fired only
     // once a foe is in reach so the window isn't wasted on the approach march.
     let war_cry = push_skill(
@@ -555,11 +636,16 @@ pub fn skirmish() -> Combat {
         mk(0, "Brawler", Team::Player, 150.0, 0.26, 0.42, 3.5, 7.0, vec![charge, bash], &[]),
         mk(1, "Archer", Team::Player, 65.0, 0.30, 0.36, 2.0, 2.5, vec![snipe, shot], &[]),
         mk(2, "Mage", Team::Player, 50.0, 0.22, 0.30, 2.0, 11.0, vec![ice_lance, fireball, shot], &[]),
-        mk(3, "Cleric", Team::Player, 60.0, 0.24, 0.34, 2.0, 7.0, vec![prayer, heal, barrier, purify, shot], &[]),
+        mk(3, "Cleric", Team::Player, 70.0, 0.24, 0.34, 2.0, 7.0, vec![prayer, heal, barrier, purify, shot], &[]),
         mk(4, "Ogre", Team::Enemy, 160.0, 0.20, 0.30, 20.5, 7.0, vec![war_cry, bash], &[DamageType::Fire]),
         mk(5, "Assassin", Team::Enemy, 55.0, 0.34, 0.50, 22.0, 2.5, vec![dash, reap, backstab, strike], &[]),
         mk(6, "Raider", Team::Enemy, 62.0, 0.30, 0.36, 22.0, 11.0, vec![snipe, shot], &[]),
         mk(7, "Shaman", Team::Enemy, 60.0, 0.24, 0.34, 22.0, 7.0, vec![heal, siphon, shot], &[DamageType::Holy]),
+        // The chanters: one per side, mirrored roles. Blue sings the offensive
+        // aura, red the defensive one; both fight at arm's reach with a
+        // support-flavoured touch and a plain strike as the floor.
+        mk(8, "Warchanter", Team::Player, 75.0, 0.24, 0.38, 3.5, 4.5, vec![war_chant, mana_rend, strike], &[]),
+        mk(9, "Lifechanter", Team::Enemy, 75.0, 0.24, 0.38, 20.5, 4.5, vec![life_chant, soothing_touch, strike], &[]),
     ];
     let terrain = skirmish_terrain();
     let state = BattleState {
@@ -662,17 +748,20 @@ pub fn skirmish() -> Combat {
     };
     gambits.insert(EntityId(1), archer_gambit());
     gambits.insert(EntityId(6), archer_gambit());
-    // Mage: open the biggest commit on the biggest target — lance the toughest
-    // foe, fall back to fireball (which the fire-weak Ogre dreads) while the
-    // lance recharges, and plink when the MP pool runs dry.
+    // Mage: nuke the backline — the frailest frame (MaxHp, not current HP, so
+    // the pick doesn't chase whoever happens to be dinged) is the assassin,
+    // then the shaman: red's damage carry and its sustain engine. Raw nukes
+    // into a healed 480-HP ogre evaporate, which is what the old
+    // toughest-first rule amounted to. Falls to plinking when the pool dries.
+    let squishiest_enemy = || TargetQuery::new(Pool::Enemies).sort(SortKey::MaxHp, Order::Asc);
     gambits.insert(
         EntityId(2),
         Node::context(
             Condition::Always,
             GroupMode::Fallthrough,
             vec![
-                Node::act(toughest_enemy(), ice_lance),
-                Node::act(toughest_enemy(), fireball),
+                Node::act(squishiest_enemy(), ice_lance),
+                Node::act(squishiest_enemy(), fireball),
                 Node::act(nearest_enemy(), shot),
             ],
         ),
@@ -691,9 +780,11 @@ pub fn skirmish() -> Combat {
             GroupMode::Fallthrough,
             vec![
                 Node::act(weakest_enemy(), dash),
+                // 0.7 is Reap's break-even vs Backstab (10 x 1.3 = 13 flat) —
+                // below that, the execute scaling wins.
                 Node::act(
                     TargetQuery::new(Pool::Enemies)
-                        .filter(Filter::HpPctBelow(0.65))
+                        .filter(Filter::HpPctBelow(0.7))
                         .sort(SortKey::HpPct, Order::Asc),
                     reap,
                 ),
@@ -717,23 +808,40 @@ pub fn skirmish() -> Combat {
             Condition::Always,
             GroupMode::Fallthrough,
             vec![
+                // Group-heal when the *party* is dinged: 2+ allies under 80%.
+                // The loose threshold is load-bearing — red's kill pattern is
+                // to focus the healer itself, so a "2+ badly hurt" window only
+                // ever opened after the cleric was already dead. At 80% the
+                // window opens during the opening trades, while the cleric is
+                // alive and its pool can still fund the cast. Plain
+                // fallthrough, not Commit: a committed prayer-lock would have
+                // the cleric idling through Prayer's cooldown while a teammate
+                // bleeds out next to it.
                 Node::act(
                     TargetQuery::new(Pool::Allies)
-                        .filter(Filter::HpPctBelow(0.7))
+                        .filter(Filter::HpPctBelow(0.8))
                         .pick(Pick::All),
                     prayer,
                 )
                 .when(Condition::Count {
                     q: TargetQuery::new(Pool::Allies)
-                        .filter(Filter::HpPctBelow(0.7))
+                        .filter(Filter::HpPctBelow(0.8))
                         .pick(Pick::All),
                     cmp: Cmp::Ge,
                     n: 2,
                 }),
-                Node::act(hurt_ally(), heal),
+                // Stricter than the shaman's 0.7 triage gate: the cleric also
+                // funds Prayer and Barrier from the same pool, and healing
+                // every scratch kept it too broke for either.
                 Node::act(
                     TargetQuery::new(Pool::Allies)
-                        .filter(Filter::HpPctBelow(0.5))
+                        .filter(Filter::HpPctBelow(0.55))
+                        .sort(SortKey::HpPct, Order::Asc),
+                    heal,
+                ),
+                Node::act(
+                    TargetQuery::new(Pool::Allies)
+                        .filter(Filter::HpPctBelow(0.65))
                         .filter(Filter::Not(Box::new(Filter::HasStatus(StatusKind::Shield))))
                         .sort(SortKey::HpPct, Order::Asc),
                     barrier,
@@ -757,6 +865,52 @@ pub fn skirmish() -> Combat {
                 Node::act(nearest_enemy(), siphon),
                 Node::act(nearest_enemy(), shot),
             ],
+        ),
+    );
+    // Chanters: the song comes first — re-sing whenever the aura has lapsed
+    // (the self-query's "am I missing it?" filter makes that implicit), then
+    // work the support touch, then swing the plain strike so a full bar never
+    // idles. One shared shape, two kits.
+    let chanter_gambit = |chant: SkillId, aura: StatusKind, touch: Node| {
+        Node::context(
+            Condition::Always,
+            GroupMode::Fallthrough,
+            vec![
+                Node::act(
+                    TargetQuery::new(Pool::Myself)
+                        .filter(Filter::Not(Box::new(Filter::HasStatus(aura)))),
+                    chant,
+                ),
+                touch,
+                Node::act(nearest_enemy(), strike),
+            ],
+        )
+    };
+    gambits.insert(
+        EntityId(8),
+        chanter_gambit(
+            war_chant,
+            StatusKind::MightAura,
+            // Rend the fattest MP pool in reach — range already narrows the
+            // candidates to arm's length, so the sort picks the caster in the
+            // scrum, not the dry-tanked ogre the distance sort used to favour.
+            Node::act(
+                TargetQuery::new(Pool::Enemies).sort(SortKey::Mp, Order::Desc),
+                mana_rend,
+            ),
+        ),
+    );
+    gambits.insert(
+        EntityId(9),
+        chanter_gambit(
+            life_chant,
+            StatusKind::RegenAura,
+            Node::act(
+                TargetQuery::new(Pool::Allies)
+                    .filter(Filter::HpPctBelow(0.8))
+                    .sort(SortKey::HpPct, Order::Asc),
+                soothing_touch,
+            ),
         ),
     );
 
@@ -798,6 +952,59 @@ pub fn skirmish() -> Combat {
     move_gambits.insert(EntityId(7), ranged_move());
     // The assassin dives the squishiest target directly.
     move_gambits.insert(EntityId(5), MoveGambit::toward(weakest_enemy()));
+    // Chanters ride with the pack — but "the pack" must mean where their
+    // touch-range kit has work, not merely the nearest teammate (v1 hugged
+    // the backline at a polite 6-unit standoff from the fight, leaving both
+    // 2.5-reach skills permanently infeasible: a chanter that only sang).
+    // Every pull is a query that drops out when it matches nothing, so the
+    // priorities blend cleanly (the brawler's bodyguard pattern).
+    let nearest_other_ally = || {
+        TargetQuery::new(Pool::Allies)
+            .filter(Filter::NotSelf)
+            .sort(SortKey::Distance, Order::Asc)
+    };
+    // A teammate actually trading blows: an ally with a foe in melee reach,
+    // most-hurt first — the one both the regen aura and a mending touch want.
+    let embattled_ally = || {
+        TargetQuery::new(Pool::Allies)
+            .filter(Filter::NotSelf)
+            .filter(Filter::WithinDistanceOf(
+                Box::new(TargetQuery::new(Pool::Enemies).pick(Pick::All)),
+                3.0,
+            ))
+            .sort(SortKey::HpPct, Order::Asc)
+    };
+    // Warchanter: escort the scrum (the might aura pays where allies swing)
+    // and lean toward the fight just enough that Mana Rend finds a target —
+    // the enemy pull stays light so it fights from the scrum's edge rather
+    // than frontlining itself to death.
+    move_gambits.insert(
+        EntityId(8),
+        MoveGambit::new(vec![
+            (Term::Near(embattled_ally(), 1.5), 1.4),
+            (Term::Near(nearest_other_ally(), 1.5), 0.8),
+            (Term::Near(nearest_enemy(), 2.5), 0.35),
+        ]),
+    );
+    // Lifechanter: the wounded outrank everything (deliver the touch), then
+    // escort whoever is being beaten on, then just stay with the pack.
+    move_gambits.insert(
+        EntityId(9),
+        MoveGambit::new(vec![
+            (
+                Term::Near(
+                    TargetQuery::new(Pool::Allies)
+                        .filter(Filter::NotSelf)
+                        .filter(Filter::HpPctBelow(0.8))
+                        .sort(SortKey::HpPct, Order::Asc),
+                    1.0,
+                ),
+                2.0,
+            ),
+            (Term::Near(embattled_ally(), 1.5), 1.2),
+            (Term::Near(nearest_other_ally(), 1.5), 0.8),
+        ]),
+    );
 
     Combat::new(state, gambits).with_movement(move_gambits)
 }
@@ -892,11 +1099,11 @@ mod tests {
         assert!(peeled, "the brawler should attack the diving assassin at least once");
     }
 
-    /// The 4v4 skirmish resolves and units leave their start positions.
+    /// The 5v5 skirmish resolves and units leave their start positions.
     #[test]
     fn skirmish_runs_to_completion_with_movement() {
         let mut combat = skirmish();
-        assert_eq!(combat.state.entities.len(), 8, "skirmish is a 4v4");
+        assert_eq!(combat.state.entities.len(), 10, "skirmish is a 5v5");
         let start: Vec<Pos> = combat.state.entities.iter().map(|e| e.pos).collect();
 
         combat.run(4000);
@@ -955,6 +1162,36 @@ mod tests {
         assert!(used("Prayer"), "the cleric should group-heal a bleeding party");
         assert!(used("Snipe"), "an archer should take the aimed shot while unthreatened");
         assert!(used("Ice Lance"), "the mage should commit to its heavy nuke");
+        assert!(used("War Chant"), "the blue chanter should raise its might aura");
+        assert!(used("Life Chant"), "the red chanter should raise its regen aura");
+        assert!(used("Mana Rend"), "the blue chanter should tear MP in melee");
+        assert!(used("Soothing Touch"), "the red chanter should mend at arm's reach");
+    }
+
+    /// Uselessness regression: the chanters must *work*, not just sing. Their
+    /// kits are touch-range, so this is really a movement spec — each chanter
+    /// has to keep delivering itself to where a 2.5-reach skill has a target
+    /// (v1 hovered at a 6-unit standoff and spent whole fights waiting).
+    #[test]
+    fn chanters_do_more_than_chant() {
+        let mut combat = skirmish();
+        let log = combat.run(4000);
+
+        for (id, who, chant) in [(EntityId(8), "Warchanter", "War Chant"),
+                                 (EntityId(9), "Lifechanter", "Life Chant")] {
+            let worked = log
+                .iter()
+                .filter(|e| matches!(
+                    e,
+                    Event::Acted { actor, skill, .. }
+                        if *actor == id && combat.state.skill(*skill).name != chant
+                ))
+                .count();
+            assert!(
+                worked >= 5,
+                "{who} landed only {worked} non-chant actions over the whole battle"
+            );
+        }
     }
 
     /// Livelock invariant: no unit may sit *ready-but-idle* (`Waited`) for a

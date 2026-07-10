@@ -30,6 +30,19 @@ const SHIELD_REDUCTION: f32 = 0.5;
 const ENRAGE_BONUS: f32 = 0.5;
 /// Fraction of dealt damage an [`Effect::Drain`] returns to the actor as healing.
 pub const DRAIN_RATIO: f32 = 0.5;
+/// World-unit radius of every aura (see [`StatusKind::is_aura`]): teammates
+/// within this distance of a bearer get the aura's benefit, teammates outside
+/// don't. Uniform for now — one knob, like `ENTITY_RADIUS`.
+pub const AURA_RADIUS: f32 = 6.0;
+/// HP a `RegenAura` restores per tick to each covered teammate. Deliberately
+/// weak next to a Heal (38) or Regen stacks (4/stack) — steady drip, not triage.
+/// Tune with care: it multiplies across the whole covered team, so it's
+/// effectively another fraction of a healer (1.5 here once let the red team
+/// sweep the skirmish without a single loss). Continuous (integrates over
+/// every step slice, like MP regen), so it never spams per-pulse events.
+const AURA_REGEN_PER_TICK: f32 = 0.75;
+/// Outgoing damage bonus for attackers covered by a teammate's `MightAura`.
+const AURA_MIGHT_BONUS: f32 = 0.05;
 /// A hit at or under this distance lands immediately (you're in contact);
 /// anything farther is a projectile that has to *travel* — its effects apply
 /// on impact, not at fire. Per shot, not per skill: a long-range skill fired
@@ -73,6 +86,12 @@ pub enum Event {
     /// Only emitted when something was actually removed.
     Cleansed {
         target: EntityId,
+    },
+    /// MP was stolen from the target (already credited to the drainer). Only
+    /// emitted when something was actually taken — a dry pool drains nothing.
+    MpDrained {
+        target: EntityId,
+        amount: f32,
     },
     /// A cast-time skill was begun; the actor is now rooted until it resolves.
     /// MP and cooldown are already committed at this point.
@@ -284,6 +303,37 @@ impl Combat {
         }
 
         self.tick_mp(dt);
+        self.tick_auras(dt);
+    }
+
+    /// Regen-aura upkeep: every living entity covered by a teammate's
+    /// `RegenAura` (see [`covered_by_aura`]) recovers `AURA_REGEN_PER_TICK`,
+    /// scaled by the slice. Continuous like MP regen — a steady drip the HP
+    /// bar shows directly, with no per-pulse events to spam the log. Coverage
+    /// is sampled per slice, so drifting out of the radius cuts the drip that
+    /// instant.
+    fn tick_auras(&mut self, dt: f32) {
+        let bearers: Vec<(Team, Pos)> = self
+            .state
+            .entities
+            .iter()
+            .filter(|e| e.is_alive() && e.status(StatusKind::RegenAura).is_some())
+            .map(|e| (e.team, e.pos))
+            .collect();
+        if bearers.is_empty() {
+            return;
+        }
+        for e in &mut self.state.entities {
+            if !e.is_alive() {
+                continue;
+            }
+            let covered = bearers
+                .iter()
+                .any(|&(team, pos)| team == e.team && pos.dist(e.pos) <= AURA_RADIUS);
+            if covered {
+                e.hp = (e.hp + AURA_REGEN_PER_TICK * dt).min(e.max_hp);
+            }
+        }
     }
 
     /// A whole-tick boundary: apply status pulses, tick down cooldowns,
@@ -711,15 +761,28 @@ impl Combat {
                     duration,
                 } => self.apply_status(target, *kind, *stacks, *duration, events),
                 Effect::Cleanse => self.apply_cleanse(target, events),
+                Effect::DrainMp(amount) => {
+                    let t = &mut self.state.entities[target.0];
+                    if t.is_alive() {
+                        let taken = amount.min(t.mp);
+                        if taken > 0.0 {
+                            t.mp -= taken;
+                            let a = &mut self.state.entities[actor.0];
+                            a.mp = (a.mp + taken).min(a.max_mp);
+                            events.push(Event::MpDrained { target, amount: taken });
+                        }
+                    }
+                }
                 Effect::Dash { .. } => {}
             }
         }
     }
 
-    /// Resolve one landed hit: enrage scales it up, weakness multiplies it,
-    /// a shield on the target soaks half. `source` is the attacking entity
-    /// (None for DoT pulses, which have no attacker at pulse time and thus no
-    /// enrage scaling). Returns the damage actually dealt.
+    /// Resolve one landed hit: enrage and a covering `MightAura` scale it up,
+    /// weakness multiplies it, a shield on the target soaks half. `source` is
+    /// the attacking entity (None for DoT pulses, which have no attacker at
+    /// pulse time and thus no attacker-side scaling). Returns the damage
+    /// actually dealt.
     fn apply_damage(
         &mut self,
         source: Option<EntityId>,
@@ -730,6 +793,7 @@ impl Combat {
     ) -> f32 {
         let enraged = source
             .is_some_and(|s| self.state.entity(s).status(StatusKind::Enrage).is_some());
+        let empowered = source.is_some_and(|s| self.covered_by_aura(s, StatusKind::MightAura));
         let e = &mut self.state.entities[target.0];
         if !e.is_alive() {
             return 0.0;
@@ -738,6 +802,7 @@ impl Combat {
         let shielded = e.status(StatusKind::Shield).is_some();
         let amount = base
             * if enraged { 1.0 + ENRAGE_BONUS } else { 1.0 }
+            * if empowered { 1.0 + AURA_MIGHT_BONUS } else { 1.0 }
             * if weak { WEAKNESS_MULT } else { 1.0 }
             * if shielded { 1.0 - SHIELD_REDUCTION } else { 1.0 };
         e.hp = (e.hp - amount).max(0.0);
@@ -751,6 +816,19 @@ impl Combat {
             events.push(Event::Died(target));
         }
         amount
+    }
+
+    /// Whether `id` sits inside a living teammate's aura of the given kind —
+    /// distance measured at *this* instant (bearer included: its own aura
+    /// always covers it). Multiple bearers don't stack; coverage is coverage.
+    fn covered_by_aura(&self, id: EntityId, kind: StatusKind) -> bool {
+        let me = self.state.entity(id);
+        self.state.entities.iter().any(|a| {
+            a.is_alive()
+                && a.team == me.team
+                && a.status(kind).is_some()
+                && a.pos.dist(me.pos) <= AURA_RADIUS
+        })
     }
 
     /// Strip every harmful status off the target; emits `Cleansed` only if
@@ -788,9 +866,18 @@ impl Combat {
         if !e.is_alive() {
             return;
         }
-        // Stack onto an existing status of the same kind, refreshing duration.
+        // One aura at a time: singing a new chant ends whatever the entity was
+        // already projecting.
+        if kind.is_aura() {
+            e.statuses.retain(|s| s.kind == kind || !s.kind.is_aura());
+        }
+        // Stack onto an existing status of the same kind, refreshing duration —
+        // except auras, which refresh without stacking (re-singing the same
+        // chant sustains the field, it doesn't intensify it).
         if let Some(s) = e.statuses.iter_mut().find(|s| s.kind == kind) {
-            s.stacks += stacks;
+            if !kind.is_aura() {
+                s.stacks += stacks;
+            }
             s.duration = s.duration.max(duration);
         } else {
             e.statuses.push(Status {
@@ -1806,6 +1893,132 @@ mod tests {
 
         assert_eq!(combat.state.entity(ally1).hp, 50.0);
         assert_eq!(combat.state.entity(ally2).hp, 70.0);
+    }
+
+    /// A regen aura drips HP to teammates inside its radius — and only those:
+    /// an ally beyond `AURA_RADIUS` and an enemy standing right in the field
+    /// both get nothing.
+    #[test]
+    fn regen_aura_covers_only_nearby_teammates() {
+        let mut a = Arena::new();
+        let chanter = a.add_at("chanter", Team::Player, 50.0, 0.0, 5.0, 0.0);
+        let near = a.add_at("near", Team::Player, 50.0, 0.0, 8.0, 0.0); // 3 away: covered
+        let far = a.add_at("far", Team::Player, 50.0, 0.0, 20.0, 0.0); // 15 away: outside
+        let foe = a.add_at("foe", Team::Enemy, 50.0, 0.0, 6.0, 0.0); // in the field, wrong team
+        a.ent(chanter)
+            .statuses
+            .push(Status { kind: StatusKind::RegenAura, stacks: 1, duration: 100 });
+
+        let mut combat = a.into_combat();
+        combat.run(4);
+
+        let hp = |id| combat.state.entity(id).hp;
+        assert_eq!(hp(chanter), 53.0, "the bearer is inside its own aura: +0.75 x 4");
+        assert_eq!(hp(near), 53.0, "a covered ally drips up");
+        assert_eq!(hp(far), 50.0, "outside the radius: no benefit");
+        assert_eq!(hp(foe), 50.0, "enemies never benefit");
+    }
+
+    /// A might aura scales an attacker's damage by 5% — but only while the
+    /// attacker stands inside the field.
+    #[test]
+    fn might_aura_boosts_allies_inside_the_radius_only() {
+        for (attacker_x, expected) in [(5.0, 21.0), (20.0, 20.0)] {
+            let mut a = Arena::new();
+            let chanter = a.add_at("chanter", Team::Player, 100.0, 0.0, 5.0, 0.0);
+            let hitter = a.add_at("hitter", Team::Player, 100.0, 1.0, attacker_x, 0.0);
+            let victim = a.add_at("victim", Team::Enemy, 100.0, 0.0, attacker_x + 1.0, 0.0);
+            a.ent(chanter)
+                .statuses
+                .push(Status { kind: StatusKind::MightAura, stacks: 1, duration: 100 });
+            let hit = a.skill(damage_skill("Hit", 20.0, None, 0));
+            a.gambit(hitter, Node::act(TargetQuery::new(Pool::Enemies), hit));
+
+            let mut combat = a.into_combat();
+            combat.tick();
+
+            let dealt = 100.0 - combat.state.entity(victim).hp;
+            assert!(
+                (dealt - expected).abs() < 1e-3,
+                "attacker at x={attacker_x}: expected {expected} damage, dealt {dealt}"
+            );
+        }
+    }
+
+    /// An entity holds one aura at a time — a new chant replaces the old — and
+    /// re-singing the same chant refreshes its duration without stacking.
+    #[test]
+    fn one_aura_at_a_time_and_no_aura_stacking() {
+        let mut a = Arena::new();
+        let chanter = a.add("chanter", Team::Player, 100.0, 1.0);
+        let _foe = a.add("foe", Team::Enemy, 100.0, 0.0);
+        let sing = |name: &str, kind, cooldown| Skill {
+            name: name.into(),
+            cost: 0,
+            range: 1000.0,
+            cooldown,
+            cast_time: 0,
+            damage_type: None,
+            effects: vec![Effect::Inflict { kind, stacks: 1, duration: 10 }],
+        };
+        // The regen chant's long cooldown sequences the ticks deterministically:
+        // it fires once, then every later action falls through to the might chant.
+        let regen_chant = a.skill(sing("Life Chant", StatusKind::RegenAura, 100));
+        let might_chant = a.skill(sing("War Chant", StatusKind::MightAura, 0));
+        a.gambit(
+            chanter,
+            Node::context(
+                Condition::Always,
+                GroupMode::Fallthrough,
+                vec![
+                    Node::act(TargetQuery::new(Pool::Myself), regen_chant),
+                    Node::act(TargetQuery::new(Pool::Myself), might_chant),
+                ],
+            ),
+        );
+
+        let mut combat = a.into_combat();
+        combat.tick(); // sings Life Chant
+        assert!(combat.state.entity(chanter).status(StatusKind::RegenAura).is_some());
+
+        combat.tick(); // sings War Chant — which must displace the regen aura
+        let e = combat.state.entity(chanter);
+        assert!(e.status(StatusKind::RegenAura).is_none(), "one aura at a time");
+        assert!(e.status(StatusKind::MightAura).is_some());
+
+        combat.tick(); // re-sings War Chant: refresh, not stack
+        assert_eq!(combat.state.entity(chanter).status_stacks(StatusKind::MightAura), 1);
+    }
+
+    /// An MP drain steals up to its amount — capped by what the target has —
+    /// and credits it to the actor.
+    #[test]
+    fn drain_mp_steals_capped_by_the_targets_pool() {
+        let mut a = Arena::new();
+        let rend = a.add("rend", Team::Player, 100.0, 1.0);
+        let caster = a.add("caster", Team::Enemy, 100.0, 0.0);
+        a.ent(rend).mp = 10.0;
+        a.ent(caster).mp = 8.0; // less than the drain amount
+        let mana_rend = a.skill(Skill {
+            name: "Mana Rend".into(),
+            cost: 0,
+            range: 1000.0,
+            cooldown: 0,
+            cast_time: 0,
+            damage_type: None,
+            effects: vec![Effect::DrainMp(15.0)],
+        });
+        a.gambit(rend, Node::act(TargetQuery::new(Pool::Enemies), mana_rend));
+
+        let mut combat = a.into_combat();
+        let log = combat.tick();
+
+        assert_eq!(combat.state.entity(caster).mp, 0.0);
+        assert_eq!(combat.state.entity(rend).mp, 18.0, "credited what was actually there");
+        assert!(log.iter().any(|e| matches!(
+            e,
+            Event::MpDrained { target, amount } if *target == caster && *amount == 8.0
+        )));
     }
 
     /// A snare cuts drift by `SNARE_SLOW`: a snared mover covers only the reduced

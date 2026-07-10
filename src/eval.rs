@@ -504,6 +504,7 @@ fn sort_value(key: SortKey, id: EntityId, actor_pos: crate::battle::Pos, state: 
         SortKey::Hp => e.hp,
         SortKey::HpPct => e.hp_pct(),
         SortKey::MaxHp => e.max_hp,
+        SortKey::Mp => e.mp,
         SortKey::Distance => actor_pos.dist(e.pos),
         SortKey::Elevation => state.elevation_at(e.pos) as f32,
         SortKey::StatusStacks(k) => e.status_stacks(k) as f32,
