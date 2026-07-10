@@ -501,12 +501,10 @@ async fn main() {
                         }
                     }
                 }
-                for e in &combat.state.entities {
-                    let fl = flash
-                        .get(&e.id)
-                        .map(|&(remaining, c)| (remaining / FLASH_LIFE, c));
-                    draw_entity(&view, e, combat.is_casting(e.id), fl, shadows.get(&e.id));
-                }
+                // Units paint in depth order against the terrain: south of the
+                // screen draws over north, and terrain rising in front of a
+                // unit repaints over it (the unit then ghosts through).
+                draw_units(&view, combat, &flash, &shadows);
                 // Attack visuals ride on top of the tokens: fading pierce-beams
                 // (event decoration) and live projectiles (sim state).
                 for v in &vfx {
@@ -664,91 +662,99 @@ fn draw_arena(view: &View) {
 /// Draw the terrain with fake depth: every tile's top face is lifted by its
 /// elevation, and wherever a tile stands above whatever is south of it (a
 /// lower step, the rim of a pit, the arena edge) the exposed south face is
-/// drawn beneath it — striated once per level so height stays countable,
-/// sunlit along the lip, darkening toward the ground. Rows paint north to
-/// south so raised terrain correctly overlaps what's behind it, and contact
-/// shadows fall on tiles a taller neighbour looms over. Units, bars and vfx
-/// all draw *after* terrain, so nothing gameplay-relevant is ever hidden.
+/// drawn beneath it. Rows paint north to south so raised terrain correctly
+/// overlaps what's behind it. Units are painted into this depth order by
+/// [`draw_units`]: terrain that rises above a unit's ground gets repainted
+/// over the unit, which then shows through as a ghost outline.
 fn draw_terrain(view: &View, t: &Terrain) {
+    for r in 0..t.rows {
+        for c in 0..t.cols {
+            draw_tile(view, t, c, r);
+        }
+    }
+}
+
+/// Draw one tile completely — lifted top face (checker, rims, the contact
+/// shadows taller neighbours cast onto it) and the exposed south face beneath
+/// it, striated once per level so height stays countable, sunlit along the
+/// lip, darkening toward the ground. Factored out of [`draw_terrain`] so
+/// [`draw_units`] can repaint a single tile over a unit standing behind it.
+fn draw_tile(view: &View, t: &Terrain, c: i32, r: i32) {
+    let Some(tile) = t.tile(c, r) else { return };
     let ts = t.tile_size;
     let tp = ts * view.scale; // tile edge in pixels
     let band = (tp * 0.34).min(11.0); // contact-shadow reach
     // Nested translucent strips fake each contact shadow's soft gradient.
     const AO: [(f32, f32); 3] = [(1.0, 0.08), (0.62, 0.09), (0.30, 0.10)];
-    for r in 0..t.rows {
-        for c in 0..t.cols {
-            let Some(tile) = t.tile(c, r) else { continue };
-            let e = tile.elevation;
-            let (x, gy) = view.flat(c as f32 * ts, r as f32 * ts);
-            let y = gy - e as f32 * view.lift;
+    let e = tile.elevation;
+    let (x, gy) = view.flat(c as f32 * ts, r as f32 * ts);
+    let y = gy - e as f32 * view.lift;
 
-            // Top face, with a faint checker so open ground keeps texture.
-            let mut top = tile_top_color(tile);
-            if (c + r) % 2 == 0 {
-                top = mix(top, WHITE, 0.03);
-            }
-            draw_rectangle(x, y, tp, tp, top);
-            draw_rectangle_lines(x, y, tp, tp, 1.0, Color::new(0.0, 0.0, 0.0, 0.12));
-            if !tile.passable && e >= 1 {
-                // A chiselled inset marks wall/rock caps as solid blocks.
-                draw_rectangle_lines(x + 2.0, y + 2.0, tp - 4.0, tp - 4.0, 1.0, with_alpha(WHITE, 0.10));
-            }
+    // Top face, with a faint checker so open ground keeps texture.
+    let mut top = tile_top_color(tile);
+    if (c + r) % 2 == 0 {
+        top = mix(top, WHITE, 0.03);
+    }
+    draw_rectangle(x, y, tp, tp, top);
+    draw_rectangle_lines(x, y, tp, tp, 1.0, Color::new(0.0, 0.0, 0.0, 0.12));
+    if !tile.passable && e >= 1 {
+        // A chiselled inset marks wall/rock caps as solid blocks.
+        draw_rectangle_lines(x + 2.0, y + 2.0, tp - 4.0, tp - 4.0, 1.0, with_alpha(WHITE, 0.10));
+    }
 
-            // Crisp rim where this tile drops off to lower ground behind or
-            // beside it — without it, a raised edge blurs into what it
-            // overlaps (the south rim gets its face instead).
-            let lower = |dc: i32, dr: i32| t.tile(c + dc, r + dr).is_some_and(|n| n.elevation < e);
-            let rim = with_alpha(BLACK, 0.35);
-            if lower(0, -1) {
-                draw_line(x, y, x + tp, y, 1.5, rim);
-            }
-            if lower(-1, 0) {
-                draw_line(x, y, x, y + tp, 1.5, rim);
-            }
-            if lower(1, 0) {
-                draw_line(x + tp, y, x + tp, y + tp, 1.5, rim);
-            }
+    // Crisp rim where this tile drops off to lower ground behind or beside
+    // it — without it, a raised edge blurs into what it overlaps (the south
+    // rim gets its face instead).
+    let lower = |dc: i32, dr: i32| t.tile(c + dc, r + dr).is_some_and(|n| n.elevation < e);
+    let rim = with_alpha(BLACK, 0.35);
+    if lower(0, -1) {
+        draw_line(x, y, x + tp, y, 1.5, rim);
+    }
+    if lower(-1, 0) {
+        draw_line(x, y, x, y + tp, 1.5, rim);
+    }
+    if lower(1, 0) {
+        draw_line(x + tp, y, x + tp, y + tp, 1.5, rim);
+    }
 
-            // Contact shadows where a higher neighbour looms over this tile.
-            let higher = |dc: i32, dr: i32| t.tile(c + dc, r + dr).is_some_and(|n| n.elevation > e);
-            if higher(0, -1) {
-                for (f, a) in AO {
-                    draw_rectangle(x, y, tp, band * f, with_alpha(BLACK, a));
-                }
-            }
-            if higher(-1, 0) {
-                for (f, a) in AO {
-                    draw_rectangle(x, y, band * f, tp, with_alpha(BLACK, a));
-                }
-            }
-            if higher(1, 0) {
-                for (f, a) in AO {
-                    draw_rectangle(x + tp - band * f, y, band * f, tp, with_alpha(BLACK, a));
-                }
-            }
-
-            // South face: the visible drop from this tile's top down to
-            // whatever is south of it. Off-map counts as ground level, so a
-            // raised rim still shows its face against the backdrop.
-            let es = t.tile(c, r + 1).map_or(e.min(0), |n| n.elevation);
-            if e > es {
-                let fh = (e - es) as f32 * view.lift;
-                let fy = y + tp;
-                draw_rectangle(x, fy, tp, fh, face_color(tile));
-                // Darken toward the ground: a cheap two-step vertical gradient.
-                draw_rectangle(x, fy + fh * 0.55, tp, fh * 0.45, with_alpha(BLACK, 0.10));
-                draw_rectangle(x, fy + fh * 0.80, tp, fh * 0.20, with_alpha(BLACK, 0.12));
-                // One seam per level crossed keeps the drop countable.
-                for k in (es + 1)..e {
-                    let ly = gy + tp - k as f32 * view.lift;
-                    draw_line(x, ly, x + tp, ly, 1.0, with_alpha(BLACK, 0.22));
-                }
-                draw_line(x, fy, x, fy + fh, 1.0, with_alpha(BLACK, 0.18));
-                draw_line(x + tp, fy, x + tp, fy + fh, 1.0, with_alpha(BLACK, 0.18));
-                // Sunlit lip along the top edge of the drop.
-                draw_line(x, fy, x + tp, fy, 2.0, with_alpha(WHITE, 0.40));
-            }
+    // Contact shadows where a higher neighbour looms over this tile.
+    let higher = |dc: i32, dr: i32| t.tile(c + dc, r + dr).is_some_and(|n| n.elevation > e);
+    if higher(0, -1) {
+        for (f, a) in AO {
+            draw_rectangle(x, y, tp, band * f, with_alpha(BLACK, a));
         }
+    }
+    if higher(-1, 0) {
+        for (f, a) in AO {
+            draw_rectangle(x, y, band * f, tp, with_alpha(BLACK, a));
+        }
+    }
+    if higher(1, 0) {
+        for (f, a) in AO {
+            draw_rectangle(x + tp - band * f, y, band * f, tp, with_alpha(BLACK, a));
+        }
+    }
+
+    // South face: the visible drop from this tile's top down to whatever is
+    // south of it. Off-map counts as ground level, so a raised rim still
+    // shows its face against the backdrop.
+    let es = t.tile(c, r + 1).map_or(e.min(0), |n| n.elevation);
+    if e > es {
+        let fh = (e - es) as f32 * view.lift;
+        let fy = y + tp;
+        draw_rectangle(x, fy, tp, fh, face_color(tile));
+        // Darken toward the ground: a cheap two-step vertical gradient.
+        draw_rectangle(x, fy + fh * 0.55, tp, fh * 0.45, with_alpha(BLACK, 0.10));
+        draw_rectangle(x, fy + fh * 0.80, tp, fh * 0.20, with_alpha(BLACK, 0.12));
+        // One seam per level crossed keeps the drop countable.
+        for k in (es + 1)..e {
+            let ly = gy + tp - k as f32 * view.lift;
+            draw_line(x, ly, x + tp, ly, 1.0, with_alpha(BLACK, 0.22));
+        }
+        draw_line(x, fy, x, fy + fh, 1.0, with_alpha(BLACK, 0.18));
+        draw_line(x + tp, fy, x + tp, fy + fh, 1.0, with_alpha(BLACK, 0.18));
+        // Sunlit lip along the top edge of the drop.
+        draw_line(x, fy, x + tp, fy, 2.0, with_alpha(WHITE, 0.40));
     }
 }
 
@@ -777,6 +783,145 @@ fn face_color(t: Tile3) -> Color {
     }
 }
 
+fn team_color(team: Team) -> Color {
+    if team == Team::Player {
+        Color::new(0.35, 0.55, 0.95, 1.0)
+    } else {
+        Color::new(0.9, 0.4, 0.35, 1.0)
+    }
+}
+
+/// Axis-aligned screen rect: (x, y, w, h).
+type Rect4 = (f32, f32, f32, f32);
+
+fn rects_overlap(a: Rect4, b: Rect4) -> bool {
+    a.0 < b.0 + b.2 && b.0 < a.0 + a.2 && a.1 < b.1 + b.3 && b.1 < a.1 + a.3
+}
+
+fn rect_contains(r: Rect4, px: f32, py: f32) -> bool {
+    px >= r.0 && px <= r.0 + r.2 && py >= r.1 && py <= r.1 + r.3
+}
+
+/// Screen-space bounding box of everything a tile paints: its lifted top face
+/// plus the exposed south face hanging beneath it. `None` off-map.
+fn tile_screen_bounds(view: &View, t: &Terrain, c: i32, r: i32) -> Option<Rect4> {
+    let tile = t.tile(c, r)?;
+    let e = tile.elevation;
+    let ts = t.tile_size;
+    let tp = ts * view.scale;
+    let (x, gy) = view.flat(c as f32 * ts, r as f32 * ts);
+    let y = gy - e as f32 * view.lift;
+    let es = t.tile(c, r + 1).map_or(e.min(0), |n| n.elevation);
+    let face = (e - es).max(0) as f32 * view.lift;
+    Some((x, y, tp, tp + face))
+}
+
+/// The unit's token circle on screen (the ghost-outline trigger area).
+fn token_bounds(view: &View, e: &Entity) -> Rect4 {
+    let (sx, sy) = view.pos(e.pos);
+    let r = (ENTITY_RADIUS * view.scale).max(6.0);
+    (sx - r, sy - r, r * 2.0, r * 2.0)
+}
+
+/// Screen box around everything a unit paints — token plus the name above and
+/// the bars/status text below. A repainted tile must be tested against this
+/// full box, or it would hide the token but leave the bars floating on top.
+fn entity_ui_bounds(view: &View, e: &Entity) -> Rect4 {
+    let (sx, sy) = view.pos(e.pos);
+    let r = (ENTITY_RADIUS * view.scale).max(6.0);
+    let half_w = r.max(30.0);
+    (sx - half_w, sy - r - 28.0, half_w * 2.0, (r + 28.0) + (r + 30.0))
+}
+
+/// Draw the units in painter order against the terrain. Entities sort north →
+/// south, so one nearer the viewer draws over one behind it; then any tile
+/// that rises above an already-drawn unit's ground and reaches it on screen is
+/// repainted on top, so a unit standing behind a wall or below a hill edge is
+/// genuinely hidden. A unit whose token centre ends up covered that way gets a
+/// see-through silhouette ring so it stays trackable behind cover.
+fn draw_units(
+    view: &View,
+    combat: &Combat,
+    flash: &HashMap<EntityId, (f32, Color)>,
+    shadows: &HashMap<EntityId, ShadowBars>,
+) {
+    let mut order: Vec<&Entity> = combat.state.entities.iter().collect();
+    order.sort_by(|a, b| a.pos.y.total_cmp(&b.pos.y).then(a.id.0.cmp(&b.id.0)));
+
+    let draw = |e: &Entity| {
+        let fl = flash
+            .get(&e.id)
+            .map(|&(remaining, c)| (remaining / FLASH_LIFE, c));
+        draw_entity(view, e, combat.is_casting(e.id), fl, shadows.get(&e.id));
+    };
+
+    let Some(t) = view.terrain else {
+        for e in &order {
+            draw(e);
+        }
+        return;
+    };
+
+    let row_of = |e: &Entity| t.tile_of(e.pos).1.clamp(0, t.rows - 1);
+
+    // Walk the rows north → south; `order[..i]` are the units already painted.
+    let mut i = 0;
+    for r in 0..t.rows {
+        // Repaint the tiles of this row that loom over an already-drawn unit:
+        // the tile rises above the unit's ground and its footprint reaches
+        // the unit's screen area. (Same-height floor south of a unit never
+        // repaints, so a token overhanging its tile edge isn't clipped.)
+        for c in 0..t.cols {
+            let Some(tile) = t.tile(c, r) else { continue };
+            if tile.elevation <= 0 {
+                continue;
+            }
+            let Some(rect) = tile_screen_bounds(view, t, c, r) else { continue };
+            let looms = order[..i].iter().any(|e| {
+                tile.elevation > t.elevation_at(e.pos)
+                    && rects_overlap(rect, entity_ui_bounds(view, e))
+            });
+            if looms {
+                draw_tile(view, t, c, r);
+            }
+        }
+        while i < order.len() && row_of(order[i]) == r {
+            draw(order[i]);
+            i += 1;
+        }
+    }
+
+    // Anything the repaint hid gets a see-through outline on top.
+    for e in &order {
+        if e.is_alive() && occluded(view, t, e) {
+            let (sx, sy) = view.pos(e.pos);
+            let r = (ENTITY_RADIUS * view.scale).max(6.0);
+            draw_circle_lines(sx, sy, r, 2.0, with_alpha(team_color(e.team), 0.9));
+        }
+    }
+}
+
+/// Is this unit's token centre covered by terrain painted in front of it —
+/// a tile south of the unit's row that rises above its ground and whose drawn
+/// footprint reaches the token? (Centre, not edge: a knee-high step clipping
+/// the unit's feet shouldn't ghost it.)
+fn occluded(view: &View, t: &Terrain, e: &Entity) -> bool {
+    let row = t.tile_of(e.pos).1.clamp(0, t.rows - 1);
+    let ground = t.elevation_at(e.pos);
+    let (sx, sy) = view.pos(e.pos);
+    for r in (row + 1)..t.rows {
+        for c in 0..t.cols {
+            let Some(tile) = t.tile(c, r) else { continue };
+            if tile.elevation > ground
+                && tile_screen_bounds(view, t, c, r).is_some_and(|b| rect_contains(b, sx, sy))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn draw_entity(
     view: &View,
     e: &Entity,
@@ -793,11 +938,7 @@ fn draw_entity(
     if alive {
         draw_ellipse(sx, sy + r * 0.55, r * 0.95, r * 0.42, 0.0, with_alpha(BLACK, 0.28));
     }
-    let base = if e.team == Team::Player {
-        Color::new(0.35, 0.55, 0.95, 1.0)
-    } else {
-        Color::new(0.9, 0.4, 0.35, 1.0)
-    };
+    let base = team_color(e.team);
     let mut col = if alive {
         base
     } else {
