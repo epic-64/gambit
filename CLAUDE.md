@@ -376,10 +376,14 @@ Implementation notes / decisions made while building:
 
 - **`Pick::Random` is deterministic** (hashes actor + candidate set) to keep `decide()` pure.
   Swap for a seeded RNG threaded through `BattleState` when real randomness is wanted.
-- **Rendering:** the top-down viewer (`main.rs`) now draws terrain — tiles shaded by elevation,
-  walls/pits distinct, drifting units, and rings on casting ones. The **view projection** is still
-  an open choice: the current top-down + flat elevation-shading reads height only weakly; an
-  isometric/2.5D (FFT-style) projection reads height best but is more art/render work. Height cues
-  beyond flat shading (outlines, drop shadows, cliff edges) are unbuilt.
+- **Rendering:** the viewer (`main.rs`) draws terrain in a **fake-depth oblique projection**
+  (`View`): the ground plane stays top-down, but elevation lifts everything up-screen by
+  `ELEV_LIFT` tiles per level — tiles show lifted top faces, exposed south faces (striated per
+  level, sunlit lip, darkening toward the ground), rim lines on drop-off edges, and contact
+  shadows under taller neighbours. Units/bars/vfx project through the same `View` (bilinear
+  elevation smoothing, cliff-clamped, so units walk *up* steps instead of popping) and always
+  draw after terrain, so nothing gameplay-relevant hides behind a wall — tall terrain only
+  overlaps dead ground to its north. A full isometric/2.5D (FFT-style) projection remains a
+  possible future upgrade if height still reads too weakly.
 - **Terrain authoring is undecided** — how maps are defined (hand-authored data files, an
   in-engine editor, procedural). Not needed until we build the terrain layer.

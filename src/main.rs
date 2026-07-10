@@ -6,9 +6,10 @@
 //! gambit — a 2D semi-turn-based RPG built around a modular gambit system.
 //!
 //! This binary is the Macroquad viewer for the combat core: it steps `Combat` on
-//! a fixed timer and draws the terrain (elevation shading, walls, pits) plus each
-//! entity's HP and action bars, movement, and casting state, and a live event
-//! log. See CLAUDE.md for the design and `cargo test` for the behaviour specs.
+//! a fixed timer and draws the terrain in a fake-depth oblique projection (see
+//! [`View`]) plus each entity's HP and action bars, movement, and casting state,
+//! and a live event log. See CLAUDE.md for the design and `cargo test` for the
+//! behaviour specs.
 
 mod battle;
 mod combat;
@@ -27,12 +28,17 @@ use battle::{
 };
 use combat::{Combat, Event};
 use eval::Pull;
-use terrain::{Terrain, Tile3};
+use terrain::{Terrain, Tile3, STEP_HEIGHT};
 
 /// Seconds of real time per simulation tick.
 const TICK_INTERVAL: f32 = 0.25;
 /// Width reserved on the right for the event log.
 const LOG_W: f32 = 300.0;
+
+/// Screen lift per elevation level, as a fraction of a tile's on-screen size.
+/// The single knob of the fake-depth projection: bigger reads more dramatic,
+/// but tall terrain overlaps more of the row behind it.
+const ELEV_LIFT: f32 = 0.38;
 
 /// Lifetime (real seconds) of a melee pierce-beam before it fades out.
 const PIERCE_LIFE: f32 = 0.22;
@@ -206,8 +212,7 @@ fn status_color(kind: StatusKind) -> Color {
 /// Draw the aura fields: a faint filled disc + ring of the aura's true radius
 /// around each living bearer, so "who is covered" is readable at a glance —
 /// the exact circle the sim tests teammates against, gently breathing.
-fn draw_auras(world: World, combat: &Combat) {
-    let scale = world_scale(world);
+fn draw_auras(view: &View, combat: &Combat) {
     let breathe = 0.75 + 0.25 * (get_time() as f32 * 2.0).sin();
     for e in &combat.state.entities {
         if !e.is_alive() {
@@ -217,8 +222,8 @@ fn draw_auras(world: World, combat: &Combat) {
             if e.status(kind).is_none() {
                 continue;
             }
-            let (sx, sy) = world_to_screen(world, e.pos.x, e.pos.y);
-            let r = combat::AURA_RADIUS * scale;
+            let (sx, sy) = view.pos(e.pos);
+            let r = combat::AURA_RADIUS * view.scale;
             let color = status_color(kind);
             draw_circle(sx, sy, r, with_alpha(color, 0.05));
             draw_circle_lines(sx, sy, r, 1.5, with_alpha(color, 0.30 * breathe));
@@ -476,23 +481,23 @@ async fn main() {
                 }
 
                 // --- draw ---
-                let world = combat.state.bounds;
-                clear_background(Color::new(0.10, 0.11, 0.13, 1.0));
-                draw_arena(world);
+                let view = View::new(combat.state.bounds, combat.state.terrain.as_ref());
+                clear_background(Color::new(0.09, 0.10, 0.12, 1.0));
+                draw_arena(&view);
                 if let Some(t) = combat.state.terrain.as_ref() {
-                    draw_terrain(world, t);
+                    draw_terrain(&view, t);
                 }
                 // Everything below draws combat.state directly — the sim is the
                 // single source of truth; nothing is interpolated or predicted.
                 // Aura fields go under everything mobile: who is covered is
                 // terrain-like information.
-                draw_auras(world, combat);
+                draw_auras(&view, combat);
                 // Intent lines go under the tokens: where each unit is heading
                 // and what it's positioning relative to (or casting at).
                 if show_intent {
                     for e in &combat.state.entities {
                         if e.is_alive() {
-                            draw_intent(world, e, combat);
+                            draw_intent(&view, e, combat);
                         }
                     }
                 }
@@ -500,14 +505,14 @@ async fn main() {
                     let fl = flash
                         .get(&e.id)
                         .map(|&(remaining, c)| (remaining / FLASH_LIFE, c));
-                    draw_entity(world, e, combat.is_casting(e.id), fl, shadows.get(&e.id));
+                    draw_entity(&view, e, combat.is_casting(e.id), fl, shadows.get(&e.id));
                 }
                 // Attack visuals ride on top of the tokens: fading pierce-beams
                 // (event decoration) and live projectiles (sim state).
                 for v in &vfx {
-                    draw_vfx(world, v);
+                    draw_vfx(&view, v);
                 }
-                draw_flights(world, combat);
+                draw_flights(&view, combat);
                 draw_log(&log);
                 draw_hud(combat, paused, scenarios[current].0);
             }
@@ -578,74 +583,216 @@ fn arena_rect() -> (f32, f32, f32, f32) {
     (x, y, w, h)
 }
 
-/// World-units → screen-pixels factor (uniform, so hitboxes read true).
-fn world_scale(world: World) -> f32 {
-    let (_, _, aw, ah) = arena_rect();
-    (aw / world.0).min(ah / world.1)
+/// The battle camera: world → screen with a fake-depth oblique projection.
+/// The ground plane maps top-down exactly as before; elevation additionally
+/// lifts a point *up the screen* by [`ELEV_LIFT`] tiles per level, so hills
+/// rise, walls stand and pits sink — while every tile keeps (most of) its own
+/// screen footprint. With no terrain the lift is zero and this degrades to the
+/// old flat projection.
+struct View<'a> {
+    /// Arena size in world units.
+    world: World,
+    /// Screen position of the arena's top-left corner.
+    origin: (f32, f32),
+    /// World-units → screen-pixels factor (uniform, so hitboxes read true).
+    scale: f32,
+    /// Screen pixels of lift per elevation level.
+    lift: f32,
+    terrain: Option<&'a Terrain>,
 }
 
-fn world_to_screen(world: World, wx: f32, wy: f32) -> (f32, f32) {
-    let (ax, ay, _, _) = arena_rect();
-    let scale = world_scale(world);
-    (ax + wx * scale, ay + wy * scale)
+impl<'a> View<'a> {
+    fn new(world: World, terrain: Option<&'a Terrain>) -> View<'a> {
+        let (ax, ay, aw, ah) = arena_rect();
+        let scale = (aw / world.0).min(ah / world.1);
+        let lift = terrain.map_or(0.0, |t| t.tile_size * scale * ELEV_LIFT);
+        View { world, origin: (ax, ay), scale, lift, terrain }
+    }
+
+    /// Ground-plane projection — no elevation lift.
+    fn flat(&self, wx: f32, wy: f32) -> (f32, f32) {
+        (self.origin.0 + wx * self.scale, self.origin.1 + wy * self.scale)
+    }
+
+    /// Project a world point standing on the terrain, lifted by the smoothed
+    /// elevation under it.
+    fn pos(&self, p: Pos) -> (f32, f32) {
+        let (x, y) = self.flat(p.x, p.y);
+        (x, y - self.elevation(p) * self.lift)
+    }
+
+    /// Project an airborne point (projectiles): like [`Self::pos`] but never
+    /// below the ground plane, so a shot crossing a pit doesn't dive into it.
+    fn pos_air(&self, p: Pos) -> (f32, f32) {
+        let (x, y) = self.flat(p.x, p.y);
+        (x, y - self.elevation(p).max(0.0) * self.lift)
+    }
+
+    /// Smoothed visual elevation under a world point. Bilinear across the four
+    /// nearest tile centres, so a unit *walks up* a step instead of popping a
+    /// level at the tile boundary — but a neighbour more than [`STEP_HEIGHT`]
+    /// away (a wall, a cliff face, a pit) doesn't pull: you can't walk there,
+    /// so it must not ramp the ground you stand on. This is a pure function of
+    /// position (projection, not interpolation of sim state).
+    fn elevation(&self, p: Pos) -> f32 {
+        let Some(t) = self.terrain else { return 0.0 };
+        let (bc, br) = t.tile_of(p);
+        let base = t.elevation((bc.clamp(0, t.cols - 1), br.clamp(0, t.rows - 1))) as f32;
+        let fx = (p.x / t.tile_size - 0.5).clamp(0.0, (t.cols - 1) as f32);
+        let fy = (p.y / t.tile_size - 0.5).clamp(0.0, (t.rows - 1) as f32);
+        let (c0, r0) = (fx.floor() as i32, fy.floor() as i32);
+        let (tx, ty) = (fx - c0 as f32, fy - r0 as f32);
+        let s = |c: i32, r: i32| {
+            let e = t.elevation((c.min(t.cols - 1), r.min(t.rows - 1))) as f32;
+            if (e - base).abs() <= STEP_HEIGHT as f32 { e } else { base }
+        };
+        let top = s(c0, r0) * (1.0 - tx) + s(c0 + 1, r0) * tx;
+        let bot = s(c0, r0 + 1) * (1.0 - tx) + s(c0 + 1, r0 + 1) * tx;
+        top * (1.0 - ty) + bot * ty
+    }
 }
 
 // --- drawing ---------------------------------------------------------------
 
-fn draw_arena(world: World) {
-    let (sx, sy) = world_to_screen(world, 0.0, 0.0);
-    let (ex, ey) = world_to_screen(world, world.0, world.1);
+fn draw_arena(view: &View) {
+    let (sx, sy) = view.flat(0.0, 0.0);
+    let (ex, ey) = view.flat(view.world.0, view.world.1);
     draw_rectangle(sx, sy, ex - sx, ey - sy, Color::new(0.14, 0.16, 0.19, 1.0));
     draw_rectangle_lines(sx, sy, ex - sx, ey - sy, 2.0, Color::new(0.3, 0.34, 0.4, 1.0));
 }
 
-/// Shade each tile by elevation; walls (raised, impassable) read as stone, pits
-/// (low, impassable) as dark holes, walkable ground lightens with height. A faint
-/// elevation label marks anything off the ground plane.
-fn draw_terrain(world: World, t: &Terrain) {
+/// Draw the terrain with fake depth: every tile's top face is lifted by its
+/// elevation, and wherever a tile stands above whatever is south of it (a
+/// lower step, the rim of a pit, the arena edge) the exposed south face is
+/// drawn beneath it — striated once per level so height stays countable,
+/// sunlit along the lip, darkening toward the ground. Rows paint north to
+/// south so raised terrain correctly overlaps what's behind it, and contact
+/// shadows fall on tiles a taller neighbour looms over. Units, bars and vfx
+/// all draw *after* terrain, so nothing gameplay-relevant is ever hidden.
+fn draw_terrain(view: &View, t: &Terrain) {
     let ts = t.tile_size;
+    let tp = ts * view.scale; // tile edge in pixels
+    let band = (tp * 0.34).min(11.0); // contact-shadow reach
+    // Nested translucent strips fake each contact shadow's soft gradient.
+    const AO: [(f32, f32); 3] = [(1.0, 0.08), (0.62, 0.09), (0.30, 0.10)];
     for r in 0..t.rows {
         for c in 0..t.cols {
             let Some(tile) = t.tile(c, r) else { continue };
-            let (sx, sy) = world_to_screen(world, c as f32 * ts, r as f32 * ts);
-            let (ex, ey) = world_to_screen(world, (c + 1) as f32 * ts, (r + 1) as f32 * ts);
-            let (w, h) = (ex - sx, ey - sy);
-            draw_rectangle(sx, sy, w, h, tile_color(tile));
-            draw_rectangle_lines(sx, sy, w, h, 1.0, Color::new(0.0, 0.0, 0.0, 0.18));
-            if tile.elevation != 0 {
-                let label = format!("{}", tile.elevation);
-                draw_text(&label, sx + 3.0, sy + 13.0, 13.0, Color::new(1.0, 1.0, 1.0, 0.35));
+            let e = tile.elevation;
+            let (x, gy) = view.flat(c as f32 * ts, r as f32 * ts);
+            let y = gy - e as f32 * view.lift;
+
+            // Top face, with a faint checker so open ground keeps texture.
+            let mut top = tile_top_color(tile);
+            if (c + r) % 2 == 0 {
+                top = mix(top, WHITE, 0.03);
+            }
+            draw_rectangle(x, y, tp, tp, top);
+            draw_rectangle_lines(x, y, tp, tp, 1.0, Color::new(0.0, 0.0, 0.0, 0.12));
+            if !tile.passable && e >= 1 {
+                // A chiselled inset marks wall/rock caps as solid blocks.
+                draw_rectangle_lines(x + 2.0, y + 2.0, tp - 4.0, tp - 4.0, 1.0, with_alpha(WHITE, 0.10));
+            }
+
+            // Crisp rim where this tile drops off to lower ground behind or
+            // beside it — without it, a raised edge blurs into what it
+            // overlaps (the south rim gets its face instead).
+            let lower = |dc: i32, dr: i32| t.tile(c + dc, r + dr).is_some_and(|n| n.elevation < e);
+            let rim = with_alpha(BLACK, 0.35);
+            if lower(0, -1) {
+                draw_line(x, y, x + tp, y, 1.5, rim);
+            }
+            if lower(-1, 0) {
+                draw_line(x, y, x, y + tp, 1.5, rim);
+            }
+            if lower(1, 0) {
+                draw_line(x + tp, y, x + tp, y + tp, 1.5, rim);
+            }
+
+            // Contact shadows where a higher neighbour looms over this tile.
+            let higher = |dc: i32, dr: i32| t.tile(c + dc, r + dr).is_some_and(|n| n.elevation > e);
+            if higher(0, -1) {
+                for (f, a) in AO {
+                    draw_rectangle(x, y, tp, band * f, with_alpha(BLACK, a));
+                }
+            }
+            if higher(-1, 0) {
+                for (f, a) in AO {
+                    draw_rectangle(x, y, band * f, tp, with_alpha(BLACK, a));
+                }
+            }
+            if higher(1, 0) {
+                for (f, a) in AO {
+                    draw_rectangle(x + tp - band * f, y, band * f, tp, with_alpha(BLACK, a));
+                }
+            }
+
+            // South face: the visible drop from this tile's top down to
+            // whatever is south of it. Off-map counts as ground level, so a
+            // raised rim still shows its face against the backdrop.
+            let es = t.tile(c, r + 1).map_or(e.min(0), |n| n.elevation);
+            if e > es {
+                let fh = (e - es) as f32 * view.lift;
+                let fy = y + tp;
+                draw_rectangle(x, fy, tp, fh, face_color(tile));
+                // Darken toward the ground: a cheap two-step vertical gradient.
+                draw_rectangle(x, fy + fh * 0.55, tp, fh * 0.45, with_alpha(BLACK, 0.10));
+                draw_rectangle(x, fy + fh * 0.80, tp, fh * 0.20, with_alpha(BLACK, 0.12));
+                // One seam per level crossed keeps the drop countable.
+                for k in (es + 1)..e {
+                    let ly = gy + tp - k as f32 * view.lift;
+                    draw_line(x, ly, x + tp, ly, 1.0, with_alpha(BLACK, 0.22));
+                }
+                draw_line(x, fy, x, fy + fh, 1.0, with_alpha(BLACK, 0.18));
+                draw_line(x + tp, fy, x + tp, fy + fh, 1.0, with_alpha(BLACK, 0.18));
+                // Sunlit lip along the top edge of the drop.
+                draw_line(x, fy, x + tp, fy, 2.0, with_alpha(WHITE, 0.40));
             }
         }
     }
 }
 
-fn tile_color(t: Tile3) -> Color {
+/// Top-face palette: walkable ground warms and lightens as it climbs, wall and
+/// rock caps read as cut stone, pit floors as darkness.
+fn tile_top_color(t: Tile3) -> Color {
     if !t.passable {
         if t.elevation >= 1 {
-            Color::new(0.32, 0.30, 0.34, 1.0) // wall / raised block
+            Color::new(0.50, 0.48, 0.54, 1.0) // wall / rock cap
         } else {
-            Color::new(0.05, 0.05, 0.07, 1.0) // pit
+            Color::new(0.03, 0.03, 0.05, 1.0) // pit floor
         }
     } else {
-        // Walkable ground: lightens with elevation (slightly green).
-        let l = (0.16 + t.elevation as f32 * 0.07).clamp(0.08, 0.6);
-        Color::new(l * 0.9, l, l * 0.85, 1.0)
+        let e = t.elevation as f32;
+        let l = (0.15 + e * 0.09).clamp(0.10, 0.62);
+        Color::new(l * 0.95 + e * 0.02, l + e * 0.012, l * 0.70, 1.0)
+    }
+}
+
+/// South-face palette: hewn stone under walls, earthen cliff under ground.
+fn face_color(t: Tile3) -> Color {
+    if !t.passable && t.elevation >= 1 {
+        Color::new(0.24, 0.22, 0.27, 1.0)
+    } else {
+        mix(tile_top_color(t), Color::new(0.08, 0.06, 0.05, 1.0), 0.62)
     }
 }
 
 fn draw_entity(
-    world: World,
+    view: &View,
     e: &Entity,
     casting: bool,
     flash: Option<(f32, Color)>,
     shadow: Option<&ShadowBars>,
 ) {
-    let (sx, sy) = world_to_screen(world, e.pos.x, e.pos.y);
+    let (sx, sy) = view.pos(e.pos);
     let alive = e.is_alive();
     // Draw the token at the shared collision radius, so overlaps (or the lack of
     // them) are visible. A small floor keeps it legible when zoomed out.
-    let r = (ENTITY_RADIUS * world_scale(world)).max(6.0);
+    let r = (ENTITY_RADIUS * view.scale).max(6.0);
+    // Ground shadow, pinning the token to the terrain it stands on.
+    if alive {
+        draw_ellipse(sx, sy + r * 0.55, r * 0.95, r * 0.42, 0.0, with_alpha(BLACK, 0.28));
+    }
     let base = if e.team == Team::Player {
         Color::new(0.35, 0.55, 0.95, 1.0)
     } else {
@@ -738,13 +885,12 @@ fn draw_entity(
 /// away — drawn from the threat *through* the mover so the flee reads as a
 /// push, not a pursuit). A rooted caster instead gets a gold line to each
 /// committed target. No lines at all = holding position by choice.
-fn draw_intent(world: World, e: &Entity, combat: &Combat) {
-    let (sx, sy) = world_to_screen(world, e.pos.x, e.pos.y);
+fn draw_intent(view: &View, e: &Entity, combat: &Combat) {
+    let (sx, sy) = view.pos(e.pos);
 
     // Mid-lunge: the dash is the intent — mark who it's diving on.
     if let Some(t) = combat.dash_target(e.id) {
-        let tp = combat.state.entity(t).pos;
-        let (tx, ty) = world_to_screen(world, tp.x, tp.y);
+        let (tx, ty) = view.pos(combat.state.entity(t).pos);
         draw_line(sx, sy, tx, ty, 2.0, INTENT_TOWARD);
         return;
     }
@@ -752,8 +898,7 @@ fn draw_intent(world: World, e: &Entity, combat: &Combat) {
     // Casting: movement is suppressed, the committed targets are the intent.
     if let Some(targets) = combat.cast_targets(e.id) {
         for &t in targets {
-            let tp = combat.state.entity(t).pos;
-            let (tx, ty) = world_to_screen(world, tp.x, tp.y);
+            let (tx, ty) = view.pos(combat.state.entity(t).pos);
             draw_line(sx, sy, tx, ty, 1.5, INTENT_CAST);
         }
         return;
@@ -764,22 +909,21 @@ fn draw_intent(world: World, e: &Entity, combat: &Combat) {
     };
     // Where it's heading — always truthful, even for reference-free intents
     // like seeking high ground.
-    let (gx, gy) = world_to_screen(world, intent.goal.x, intent.goal.y);
+    let (gx, gy) = view.pos(intent.goal);
     draw_line(sx, sy, gx, gy, 1.5, INTENT_GOAL);
     draw_circle_lines(gx, gy, 4.0, 1.5, INTENT_GOAL);
     // What it's positioning relative to.
     for &(r, pull) in &intent.refs {
-        let (rx, ry) = world_to_screen(world, r.x, r.y);
+        let (rx, ry) = view.pos(r);
         match pull {
             Pull::Toward => draw_line(sx, sy, rx, ry, 1.5, INTENT_TOWARD),
             Pull::Away => {
                 let (dx, dy) = (e.pos.x - r.x, e.pos.y - r.y);
                 let len = (dx * dx + dy * dy).sqrt().max(f32::EPSILON);
-                let (ex, ey) = world_to_screen(
-                    world,
-                    e.pos.x + dx / len * AWAY_STUB,
-                    e.pos.y + dy / len * AWAY_STUB,
-                );
+                let (ex, ey) = view.pos(Pos {
+                    x: e.pos.x + dx / len * AWAY_STUB,
+                    y: e.pos.y + dy / len * AWAY_STUB,
+                });
                 draw_line(rx, ry, ex, ey, 1.5, INTENT_AWAY);
             }
         }
@@ -788,9 +932,9 @@ fn draw_intent(world: World, e: &Entity, combat: &Combat) {
 
 /// Draw one transient combat visual, keyed by kind. Everything eases on the
 /// same normalized age `t` and fades out by end of life.
-fn draw_vfx(world: World, v: &Vfx) {
+fn draw_vfx(view: &View, v: &Vfx) {
     let t = (v.age / v.life).clamp(0.0, 1.0);
-    let scale = world_scale(world);
+    let scale = view.scale;
     let a = 1.0 - t;
     match &v.kind {
         // Pierce-beam: snaps from the actor through the target and fades.
@@ -801,8 +945,8 @@ fn draw_vfx(world: World, v: &Vfx) {
             let (nx, ny) = (dx / len, dy / len);
             // Extend a little past the target so it reads as piercing through it.
             let ext = 2.0 * ENTITY_RADIUS;
-            let (sx, sy) = world_to_screen(world, from.x, from.y);
-            let (ex, ey) = world_to_screen(world, to.x + nx * ext, to.y + ny * ext);
+            let (sx, sy) = view.pos(*from);
+            let (ex, ey) = view.pos(Pos { x: to.x + nx * ext, y: to.y + ny * ext });
             let w = (ENTITY_RADIUS * scale * 0.5).max(3.0);
             draw_line(sx, sy, ex, ey, w * 1.6, with_alpha(v.color, 0.28 * a)); // glow
             draw_line(sx, sy, ex, ey, w * 0.7, with_alpha(WHITE, a)); // bright core
@@ -810,7 +954,7 @@ fn draw_vfx(world: World, v: &Vfx) {
         // Impact burst: a ring that blows outward fast then fades, with a hot
         // white flash at the moment of contact.
         VfxKind::Burst { at, big } => {
-            let (sx, sy) = world_to_screen(world, at.x, at.y);
+            let (sx, sy) = view.pos(*at);
             let max_r = (ENTITY_RADIUS * scale).max(6.0) * if *big { 2.8 } else { 1.9 };
             let r = max_r * (0.35 + 0.65 * t.sqrt()); // fast start, easing out
             draw_circle(sx, sy, r * 0.8, with_alpha(v.color, 0.22 * a));
@@ -822,7 +966,7 @@ fn draw_vfx(world: World, v: &Vfx) {
         }
         // Heal glow: a soft swelling halo with a few motes drifting upward.
         VfxKind::HealGlow { at } => {
-            let (sx, sy) = world_to_screen(world, at.x, at.y);
+            let (sx, sy) = view.pos(*at);
             let r0 = (ENTITY_RADIUS * scale).max(6.0);
             let r = r0 * (0.9 + 0.7 * t);
             draw_circle(sx, sy, r, with_alpha(v.color, 0.18 * a));
@@ -836,7 +980,7 @@ fn draw_vfx(world: World, v: &Vfx) {
         }
         // Floating combat text: rises (easing out), holds, then fades.
         VfxKind::Text { at, text, size, lift } => {
-            let (sx, sy) = world_to_screen(world, at.x, at.y);
+            let (sx, sy) = view.pos(*at);
             let rise = TEXT_RISE * (1.0 - (1.0 - t) * (1.0 - t));
             let alpha = if t < 0.6 { 1.0 } else { (1.0 - t) / 0.4 };
             let dims = measure_text(text, None, *size as u16, 1.0);
@@ -847,7 +991,7 @@ fn draw_vfx(world: World, v: &Vfx) {
         }
         // Death ring: one slow shockwave marking where the unit fell.
         VfxKind::Death { at } => {
-            let (sx, sy) = world_to_screen(world, at.x, at.y);
+            let (sx, sy) = view.pos(*at);
             let r0 = (ENTITY_RADIUS * scale).max(6.0);
             let r = r0 * (1.0 + 2.2 * t);
             draw_circle(sx, sy, r0 * a, with_alpha(v.color, 0.3 * a));
@@ -869,19 +1013,20 @@ fn mix(a: Color, b: Color, t: f32) -> Color {
 /// Draw the sim's in-flight projectiles: a glowing head with a short trail
 /// back along the inbound path. Their positions ARE sim state — when a shot
 /// lands here, its damage lands in the same instant.
-fn draw_flights(world: World, combat: &Combat) {
-    let scale = world_scale(world);
+fn draw_flights(view: &View, combat: &Combat) {
     for f in combat.flights() {
         let color = skill_color(combat.state.skill(f.skill));
-        let (hx, hy) = world_to_screen(world, f.pos.x, f.pos.y);
+        let (hx, hy) = view.pos_air(f.pos);
         // Trail points back away from the target it's homing on.
         let tp = combat.state.entity(f.target).pos;
         let (dx, dy) = (f.pos.x - tp.x, f.pos.y - tp.y);
         let len = (dx * dx + dy * dy).sqrt().max(f32::EPSILON);
         let tail = 1.2; // world units
-        let (tx, ty) =
-            world_to_screen(world, f.pos.x + dx / len * tail, f.pos.y + dy / len * tail);
-        let r = (ENTITY_RADIUS * scale * 0.5).max(4.0);
+        let (tx, ty) = view.pos_air(Pos {
+            x: f.pos.x + dx / len * tail,
+            y: f.pos.y + dy / len * tail,
+        });
+        let r = (ENTITY_RADIUS * view.scale * 0.5).max(4.0);
         draw_line(tx, ty, hx, hy, r * 0.9, with_alpha(color, 0.35));
         draw_circle(hx, hy, r * 1.8, with_alpha(color, 0.25)); // glow
         draw_circle(hx, hy, r, color);
