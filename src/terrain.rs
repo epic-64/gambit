@@ -21,6 +21,14 @@ use crate::battle::Pos;
 /// still see and shoot across it (that's the point of height).
 pub const STEP_HEIGHT: i32 = 1;
 
+/// Height of a unit's eyes above the ground it stands on. Sight lines run
+/// between *eye* points, not ground points — without this, a unit on a hill
+/// crown is blinded to an adjacent lower unit by the crown's own edge (its
+/// ground-level ray clips its own hill). Side effect, accepted as correct:
+/// elevation-1 bumps no longer block sight between two ground units —
+/// knee-high cover shouldn't blind. Walls (elevation ≥ 3) still block.
+pub const EYE_HEIGHT: f32 = 1.0;
+
 /// Column/row index of a tile. Signed so out-of-range neighbours are expressible
 /// without underflow during navigation.
 pub type Tile = (i32, i32);
@@ -163,16 +171,17 @@ impl Terrain {
 
     /// Line-of-sight between two world points. Blocked when an intervening tile
     /// rises above the straight sight line drawn between the two eye heights
-    /// (each eye sits at its tile's elevation). Occlusion is elevation-only —
-    /// passability is about walking, not seeing — so you shoot across pits and
-    /// over lower cover, but a tall wall between two low units blocks the shot.
+    /// (each eye sits [`EYE_HEIGHT`] above its tile's elevation). Occlusion is
+    /// elevation-only — passability is about walking, not seeing — so you shoot
+    /// across pits and over lower cover, but a tall wall between two low units
+    /// blocks the shot.
     pub fn line_of_sight(&self, a: Pos, b: Pos) -> bool {
         let dist = a.dist(b);
         if dist <= f32::EPSILON {
             return true;
         }
-        let ea = self.elevation_at(a) as f32;
-        let eb = self.elevation_at(b) as f32;
+        let ea = self.elevation_at(a) as f32 + EYE_HEIGHT;
+        let eb = self.elevation_at(b) as f32 + EYE_HEIGHT;
         let a_tile = self.tile_of(a);
         let b_tile = self.tile_of(b);
 
@@ -265,6 +274,21 @@ mod tests {
         let a = Pos { x: 0.5, y: 0.5 };
         let b = Pos { x: 4.5, y: 0.5 };
         assert!(t.line_of_sight(a, b));
+    }
+
+    /// Regression (the Shaman/Brawler livelock): a unit standing on a hill crown
+    /// must see a unit at the hill's base — its *own* high ground must not blind
+    /// it. Eye height lifts the sight line clear of the crown's edge.
+    #[test]
+    fn crown_does_not_blind_you_to_a_unit_at_its_base() {
+        let mut t = Terrain::flat(5, 1, 1.0);
+        // Crown: elevation-2 tiles at cols 0..=1; flat ground beyond.
+        t.set(0, 0, Tile3 { elevation: 2, passable: true });
+        t.set(1, 0, Tile3 { elevation: 2, passable: true });
+        let on_crown = Pos { x: 0.5, y: 0.5 };
+        let at_base = Pos { x: 3.5, y: 0.5 };
+        assert!(t.line_of_sight(on_crown, at_base), "crown unit should see the base");
+        assert!(t.line_of_sight(at_base, on_crown), "and vice versa");
     }
 
     #[test]

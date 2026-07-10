@@ -213,75 +213,65 @@ pub struct Node {
 }
 
 // ---------------------------------------------------------------------------
-// Movement rules: a separate, lightweight gambit that runs every tick,
-// decoupled from the action gambit above. It reuses the same target engine —
-// a movement intent is just "pick something, then move relative to it".
+// Movement: a separate, lightweight gambit that runs every tick, decoupled
+// from the action gambit above. Movement is a *continuous* optimization, so —
+// unlike actions — it is NOT a priority rule list: threshold rules over
+// continuous space flip at the boundary and oscillate (bang-bang control; see
+// PLAN.md). Instead a movement gambit is a **weighted sum of scoring terms**
+// evaluated over candidate stand points; conflicting pulls blend into one
+// best spot instead of alternating rule wins. Terms reuse the same
+// `TargetQuery` engine to pick what to position relative to.
 // ---------------------------------------------------------------------------
 
-/// Where a movement rule wants the actor to go, expressed relative to a target
-/// the same `TargetQuery` machinery selects. "Kite the nearest enemy" is
-/// `MoveAway(nearest enemy)`; "close on the weakest foe" is `MoveToward(...)`.
+/// One positional scoring term: maps a candidate stand point to a score, given
+/// a reference the `TargetQuery` selects. All terms are smooth (or damped by
+/// the evaluator's stickiness), so the argmax moves gradually — no wobble.
 #[derive(Debug, Clone)]
-pub enum MoveIntent {
-    /// Drift toward the selected target (stops on arrival — never overshoots).
-    /// Routes around terrain obstacles via A\*.
-    Toward(TargetQuery),
-    /// Drift directly away from the selected target, sliding along walls rather
-    /// than jamming into them.
-    Away(TargetQuery),
-    /// Seek the highest reachable tile that still has line-of-sight to the
-    /// selected target — "get to the high ground and keep the shot". A terrain
-    /// intent: on a flat arena there is no high ground, so it holds. (See
-    /// CLAUDE.md — the payoff that makes terrain worth its cost.)
-    SeekHighGround(TargetQuery),
-    /// Move to the nearest reachable tile that *breaks* line-of-sight to the
-    /// selected threat — duck behind cover. Holds on a flat arena.
-    BreakLoS(TargetQuery),
+pub enum Term {
+    /// Peak score at exactly `ideal` world-units from the selected target,
+    /// degrading linearly with |distance − ideal|. One term expresses
+    /// approach ("get in range"), standoff ("hold at range") *and* retreat
+    /// ("it dove on me") — `ideal = 0.0` is pure melee pursuit.
+    Near(TargetQuery, f32),
+    /// Farther from the selected target is better, saturating at the
+    /// evaluator's away-range — a *bounded* flee, not a run-to-the-corner.
+    AwayFrom(TargetQuery),
+    /// Higher ground scores better. Flat everywhere on a terrain-free arena.
+    HighGround,
+    /// Stand points with line-of-sight to the selected target score full
+    /// weight; blind ones score zero. A *negative* weight turns this into
+    /// "hide from the target" (break line-of-sight) for free.
+    SightOf(TargetQuery),
 }
 
-impl MoveIntent {
-    /// The query this intent selects its reference entity from.
-    pub fn query(&self) -> &TargetQuery {
+impl Term {
+    /// The query this term selects its reference entity from, if it has one.
+    pub fn query(&self) -> Option<&TargetQuery> {
         match self {
-            MoveIntent::Toward(q)
-            | MoveIntent::Away(q)
-            | MoveIntent::SeekHighGround(q)
-            | MoveIntent::BreakLoS(q) => q,
+            Term::Near(q, _) | Term::AwayFrom(q) | Term::SightOf(q) => Some(q),
+            Term::HighGround => None,
         }
-    }
-
-    /// True for intents that close on their reference (`Toward`), false for the
-    /// ones that retreat from it (`Away`). The tile-seeking intents resolve to a
-    /// tile goal rather than a straight toward/away drift, so they are handled
-    /// explicitly by the movement evaluator and don't use this.
-    pub fn is_toward(&self) -> bool {
-        matches!(self, MoveIntent::Toward(_))
     }
 }
 
-/// One movement rule: a guard plus an intent. A movement gambit is an ordered
-/// list of these; the first rule whose condition holds *and* whose intent
-/// resolves to a reference target decides the drift for that tick. If none do,
-/// the actor holds position.
+/// A movement gambit: weighted scoring terms summed per candidate stand point.
+/// The evaluator (`eval::decide_move`) walks the reachable neighbourhood, adds
+/// a stickiness bonus to the current position (moving must *beat* standing
+/// still), and steers toward the argmax. An empty gambit — or one whose every
+/// query matches nothing — holds position.
 #[derive(Debug, Clone)]
-pub struct MoveRule {
-    pub condition: Condition,
-    pub intent: MoveIntent,
+pub struct MoveGambit {
+    pub terms: Vec<(Term, f32)>,
 }
 
-impl MoveRule {
-    /// An unconditional movement rule.
-    pub fn new(intent: MoveIntent) -> MoveRule {
-        MoveRule {
-            condition: Condition::Always,
-            intent,
-        }
+impl MoveGambit {
+    pub fn new(terms: Vec<(Term, f32)>) -> MoveGambit {
+        MoveGambit { terms }
     }
 
-    /// Attach a guard condition (builder-style).
-    pub fn when(mut self, condition: Condition) -> MoveRule {
-        self.condition = condition;
-        self
+    /// The common case: pure pursuit of the selected target (melee closing).
+    pub fn toward(q: TargetQuery) -> MoveGambit {
+        MoveGambit::new(vec![(Term::Near(q, 0.0), 1.0)])
     }
 }
 

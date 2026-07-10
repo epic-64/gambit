@@ -8,10 +8,10 @@
 
 use std::cmp::Ordering;
 
-use crate::battle::{BattleState, EntityId, Pos, SkillId};
+use crate::battle::{BattleState, EntityId, Pos, SkillId, ENTITY_RADIUS};
 use crate::gambit::{
-    Body, Condition, Filter, GroupMode, MoveIntent, MoveRule, Node, Order, Pick, Pool, SortKey,
-    TargetQuery,
+    Body, Condition, Filter, GroupMode, MoveGambit, Node, Order, Pick, Pool, SortKey,
+    TargetQuery, Term,
 };
 use crate::nav;
 use crate::terrain::Tile;
@@ -46,38 +46,137 @@ pub fn decide(root: &Node, actor: EntityId, state: &BattleState) -> Option<Actio
     }
 }
 
+// --- movement scoring knobs -------------------------------------------------
+
+/// Candidate-search radius (A\* path cost ≈ tiles) around the actor. Bounds the
+/// per-tick neighbourhood a mover considers standing in.
+const SEEK_RADIUS: f32 = 8.0;
+/// World units of |distance − ideal| per point of [`Term::Near`] score. Larger
+/// = gentler distance gradient relative to the other terms.
+const DIST_NORM: f32 = 4.0;
+/// Distance at which [`Term::AwayFrom`] saturates: beyond it, farther isn't
+/// better — the bounded flee that replaces the old run-to-the-corner kite.
+const AWAY_RANGE: f32 = 8.0;
+/// Score per elevation step for [`Term::HighGround`].
+const ELEV_SCORE: f32 = 0.25;
+/// Bonus for the actor's *current* position: a move must beat standing still
+/// by this margin. The damping that kills dithering between near-equal spots —
+/// the stateless replacement for hysteresis.
+const STICKINESS: f32 = 0.25;
+/// Score penalty per world-unit of distance to a candidate: moving isn't free,
+/// so near-equal spots resolve to the *nearest* one. Without it, ties on (say)
+/// an ideal-range ring resolve by scan order and the mover orbits its target
+/// instead of backing straight out. Kept well below the terms' gradients so it
+/// breaks ties rather than fighting real preferences.
+const TRAVEL_COST: f32 = 0.02;
+
 /// Decide where `actor` drifts this tick from its movement gambit, independent
-/// of the action gambit. Walks the rules in order; the first whose guard holds
-/// and whose intent resolves to a reference target yields a destination.
+/// of the action gambit. Scores every reachable candidate stand point as the
+/// gambit's weighted term sum and steers one `move_speed` step toward the
+/// argmax (A\*-routed around terrain).
 ///
-/// Returns the actor's *new* position (already bounds-clamped and limited to
-/// one `move_speed` step), or `None` to hold position. Pure — mutation is the
+/// Returns the actor's *new* position, or `None` to hold — when standing still
+/// (plus [`STICKINESS`]) already beats every alternative, or when no term's
+/// query matched anything to position against. Pure — mutation is the
 /// caller's job.
-pub fn decide_move(gambit: &[MoveRule], actor: EntityId, state: &BattleState) -> Option<Pos> {
-    for rule in gambit {
-        let (passed, matched) = eval_condition(&rule.condition, actor, state);
-        if !passed {
-            continue;
+pub fn decide_move(gambit: &MoveGambit, actor: EntityId, state: &BattleState) -> Option<Pos> {
+    // Resolve each term's reference point once — references are actor-relative
+    // (the query engine), not candidate-relative. Movement stays rangeless &
+    // sightless: the whole point is to *reach* a position, so references are
+    // never pre-filtered by range or LoS. Terms whose query matches nothing
+    // drop out; if everything drops, there is nothing to position against.
+    let active: Vec<(&Term, f32, Option<Pos>)> = gambit
+        .terms
+        .iter()
+        .filter_map(|(term, weight)| match term.query() {
+            Some(q) => {
+                let refs = select(q, actor, state, &[], None);
+                centroid(&refs, state).map(|point| (term, *weight, Some(point)))
+            }
+            None => Some((term, *weight, None)),
+        })
+        .collect();
+    if active.is_empty() {
+        return None;
+    }
+
+    let score = |p: Pos| -> f32 {
+        let mut total = 0.0;
+        for (term, w, reference) in &active {
+            let s = match term {
+                Term::Near(_, ideal) => {
+                    let Some(r) = reference else { continue };
+                    -((p.dist(*r) - ideal).abs() / DIST_NORM)
+                }
+                Term::AwayFrom(_) => {
+                    let Some(r) = reference else { continue };
+                    (p.dist(*r) / AWAY_RANGE).min(1.0)
+                }
+                Term::HighGround => state.elevation_at(p) as f32 * ELEV_SCORE,
+                Term::SightOf(_) => {
+                    let Some(r) = reference else { continue };
+                    if state.line_of_sight(p, *r) { 1.0 } else { 0.0 }
+                }
+            };
+            total += w * s;
         }
-        // Movement is rangeless & sightless: the whole point is to *reach* a
-        // position, so we don't pre-filter the reference set by range or LoS.
-        let refs = select(rule.intent.query(), actor, state, &matched, None);
-        let Some(point) = centroid(&refs, state) else {
-            continue; // nothing to move relative to — try the next rule
-        };
-        let dest = match &rule.intent {
-            MoveIntent::Toward(_) => Some(nav_toward(actor, point, state)),
-            MoveIntent::Away(_) => Some(flee(actor, point, state)),
-            // Tile-seeking intents can decline (no better tile / flat arena);
-            // then we fall through to the next rule rather than forcing a hold.
-            MoveIntent::SeekHighGround(_) => seek_high_ground(actor, point, state),
-            MoveIntent::BreakLoS(_) => break_los(actor, point, state),
-        };
-        if let Some(dest) = dest {
-            return Some(dest);
+        total
+    };
+
+    // Argmax over the candidates, with standing still as the incumbent (its
+    // stickiness bonus means a move must clearly beat holding). Candidates pay
+    // travel cost, so near-equal spots resolve to the nearest; residual ties
+    // keep the earlier candidate — the walk is deterministic.
+    let from = state.entity(actor).pos;
+    let mut best_p = from;
+    let mut best = score(from) + STICKINESS;
+    for p in candidate_points(from, state) {
+        let s = score(p) - from.dist(p) * TRAVEL_COST;
+        if s > best {
+            best = s;
+            best_p = p;
         }
     }
-    None
+    if best_p == from {
+        return None; // standing still is (still) the best option
+    }
+    Some(nav_toward(actor, best_p, state))
+}
+
+/// The stand points a mover considers this tick. With terrain: the reachable
+/// tiles' centres (a Dijkstra flood, so walls/cliffs are respected), sorted —
+/// the flood map's iteration order is arbitrary and the argmax must be
+/// deterministic. On a flat arena: a unit lattice around the actor, clamped so
+/// the body stays in bounds.
+fn candidate_points(from: Pos, state: &BattleState) -> Vec<Pos> {
+    match state.terrain.as_ref() {
+        Some(t) => {
+            let mut tiles: Vec<Tile> = nav::reachable(t, t.tile_of(from), SEEK_RADIUS)
+                .into_keys()
+                .collect();
+            tiles.sort_unstable();
+            tiles.into_iter().map(|tl| t.tile_center(tl)).collect()
+        }
+        None => {
+            let r = SEEK_RADIUS as i32;
+            let mut pts = Vec::with_capacity(((2 * r + 1) * (2 * r + 1)) as usize);
+            for dy in -r..=r {
+                for dx in -r..=r {
+                    if dx == 0 && dy == 0 {
+                        continue;
+                    }
+                    pts.push(state.clamp_within(
+                        Pos {
+                            x: from.x + dx as f32,
+                            y: from.y + dy as f32,
+                        },
+                        ENTITY_RADIUS,
+                    ));
+                }
+            }
+            pts
+        }
+    }
 }
 
 /// The midpoint of a set of entities — the reference point a movement intent
@@ -95,10 +194,6 @@ fn centroid(ids: &[EntityId], state: &BattleState) -> Option<Pos> {
     let n = ids.len() as f32;
     Some(Pos { x: x / n, y: y / n })
 }
-
-/// Reachable-tile search radius (A\* cost units ≈ tiles) for the tile-seeking
-/// movement intents. Bounds the per-tick neighbourhood scan.
-const TILE_SEEK_RADIUS: f32 = 8.0;
 
 /// One `move_speed` step from `from` toward `aim`, never overshooting it, then
 /// bounds-clamped. Entity-vs-entity separation and the terrain backstop are the
@@ -141,109 +236,6 @@ fn nav_toward(actor: EntityId, point: Pos, state: &BattleState) -> Pos {
     step_point(from, point, speed, state)
 }
 
-/// Retreat from `threat`. Prefer a straight-away step; when terrain blocks it
-/// (wall or cliff) rotate the heading progressively to *slide along* the
-/// obstacle instead of stopping dead. On a flat arena the straight-away branch
-/// always wins, reproducing the pre-terrain behaviour exactly.
-fn flee(actor: EntityId, threat: Pos, state: &BattleState) -> Pos {
-    let a = state.entity(actor);
-    let from = a.pos;
-    let speed = a.effective_move_speed();
-
-    // Base "directly away" heading; a deterministic fallback when we're on top
-    // of the threat lets overlapping units still separate.
-    let (ax, ay) = (from.x - threat.x, from.y - threat.y);
-    let mag = (ax * ax + ay * ay).sqrt();
-    let (bx, by) = if mag > f32::EPSILON { (ax / mag, ay / mag) } else { (1.0, 0.0) };
-
-    // Straight away first, then widening rotations to either side (never past
-    // perpendicular, so a rotated step never heads back toward the threat).
-    const HEADINGS: [f32; 9] = [0.0, 30.0, -30.0, 45.0, -45.0, 60.0, -60.0, 90.0, -90.0];
-    for deg in HEADINGS {
-        let (nx, ny) = rotate(bx, by, deg);
-        let dest = state.clamp_pos(Pos { x: from.x + nx * speed, y: from.y + ny * speed });
-        if terrain_step_ok(state, from, dest) {
-            return dest;
-        }
-    }
-    from // hemmed in on every heading — hold
-}
-
-fn rotate(x: f32, y: f32, degrees: f32) -> (f32, f32) {
-    let (s, c) = degrees.to_radians().sin_cos();
-    (x * c - y * s, x * s + y * c)
-}
-
-/// Whether a small step from `from` to `dest` is allowed by the terrain
-/// (passable destination, no cliff between the tiles). Vacuously true when flat.
-/// Assumes a step shorter than a tile — true for `move_speed` drift.
-fn terrain_step_ok(state: &BattleState, from: Pos, dest: Pos) -> bool {
-    match state.terrain.as_ref() {
-        None => true,
-        Some(t) => t.walkable(t.tile_of(from), t.tile_of(dest)),
-    }
-}
-
-/// Move toward the highest reachable tile that still has line-of-sight to
-/// `target` — take the high ground while keeping the shot. Returns `None` (hold,
-/// try the next rule) on a flat arena or when no reachable tile improves on the
-/// current elevation.
-fn seek_high_ground(actor: EntityId, target: Pos, state: &BattleState) -> Option<Pos> {
-    let t = state.terrain.as_ref()?;
-    let from = state.entity(actor).pos;
-    let start = t.tile_of(from);
-    let cur_elev = t.elevation(start);
-    let reach = nav::reachable(t, start, TILE_SEEK_RADIUS);
-
-    // Highest reachable tile that can see the target; ties → the nearer tile.
-    let mut best: Option<(i32, f32, Tile)> = None;
-    for (&tile, &cost) in &reach {
-        let center = t.tile_center(tile);
-        if !t.line_of_sight(center, target) {
-            continue;
-        }
-        let elev = t.elevation(tile);
-        let better = match best {
-            None => true,
-            Some((be, bc, _)) => elev > be || (elev == be && cost < bc),
-        };
-        if better {
-            best = Some((elev, cost, tile));
-        }
-    }
-
-    let (best_elev, _, goal) = best?;
-    if goal == start || best_elev <= cur_elev {
-        return None; // already as high as we can usefully get
-    }
-    Some(nav_toward(actor, t.tile_center(goal), state))
-}
-
-/// Move toward the nearest reachable tile from which `threat` can no longer see
-/// us — duck behind cover. Returns `None` (hold) when flat, already hidden, or no
-/// reachable tile breaks line-of-sight.
-fn break_los(actor: EntityId, threat: Pos, state: &BattleState) -> Option<Pos> {
-    let t = state.terrain.as_ref()?;
-    let from = state.entity(actor).pos;
-    let start = t.tile_of(from);
-    if !t.line_of_sight(t.tile_center(start), threat) {
-        return None; // already out of sight
-    }
-    let reach = nav::reachable(t, start, TILE_SEEK_RADIUS);
-
-    let mut best: Option<(f32, Tile)> = None;
-    for (&tile, &cost) in &reach {
-        if tile == start || t.line_of_sight(t.tile_center(tile), threat) {
-            continue;
-        }
-        if best.is_none_or(|(bc, _)| cost < bc) {
-            best = Some((cost, tile));
-        }
-    }
-    let (_, goal) = best?;
-    Some(nav_toward(actor, t.tile_center(goal), state))
-}
-
 fn eval_node(node: &Node, actor: EntityId, state: &BattleState) -> Outcome {
     let (passed, matched) = eval_condition(&node.condition, actor, state);
     if !passed {
@@ -280,7 +272,7 @@ fn try_act(
     let skill = state.skill(skill_id);
 
     // Feasibility: cooldown and resource cost are independent of the target.
-    if actor_ent.cooldown_remaining(skill_id) > 0 || actor_ent.mp < skill.cost {
+    if actor_ent.cooldown_remaining(skill_id) > 0 || actor_ent.mp < skill.cost as f32 {
         return Outcome::Fall;
     }
 
@@ -524,7 +516,9 @@ mod tests {
                 team,
                 hp,
                 max_hp: 100.0,
-                mp: 100,
+                mp: 100.0,
+                max_mp: 100.0,
+                mp_regen: 0.0,
                 pos: Pos { x, y: 0.0 },
                 statuses: Vec::new(),
                 weaknesses: Vec::new(),
@@ -709,78 +703,103 @@ mod tests {
         TargetQuery::new(Pool::Enemies).sort(SortKey::Distance, Order::Asc)
     }
 
-    /// `MoveToward` steps one `move_speed` along the line to the target and
-    /// never overshoots it.
+    /// `Near(q, 0.0)` is pure pursuit: each step closes the gap by one
+    /// `move_speed`, and stickiness stops the walk once it's effectively there
+    /// (no orbiting / overshooting).
     #[test]
-    fn move_toward_steps_then_stops_on_arrival() {
+    fn near_zero_pursues_then_holds_on_arrival() {
         let mut w = World::new();
-        let hero = w.add("hero", Team::Player, 100.0, 0.0);
-        let _enemy = w.add("enemy", Team::Enemy, 100.0, 10.0);
+        let hero = w.add("hero", Team::Player, 100.0, 50.0);
+        let enemy = w.add("enemy", Team::Enemy, 100.0, 60.0);
+        w.ent(hero).pos.y = 50.0; // interior — away from bounds clamping
+        w.ent(enemy).pos.y = 50.0;
         w.ent(hero).move_speed = 3.0;
 
-        let gambit = vec![MoveRule::new(MoveIntent::Toward(nearest_enemy()))];
-        let dest = decide_move(&gambit, hero, &w.state).unwrap();
-        assert_eq!(dest.x, 3.0); // one 3-unit step from 0 toward 10
+        let gambit = MoveGambit::toward(nearest_enemy());
+        let from = w.state.entity(hero).pos;
+        let target = w.state.entity(enemy).pos;
+        let dest = decide_move(&gambit, hero, &w.state).expect("should pursue");
+        assert!(dest.dist(target) < from.dist(target), "each step closes the gap");
+        assert!(dest.dist(from) <= 3.0 + 1e-3, "never exceeds one move_speed step");
 
-        // Close enough that a full step would overshoot -> land exactly on it.
-        w.ent(hero).pos.x = 8.5;
-        let dest = decide_move(&gambit, hero, &w.state).unwrap();
-        assert_eq!(dest.x, 10.0);
-    }
-
-    /// `MoveAway` steps directly away and is clamped to the arena bounds.
-    #[test]
-    fn move_away_steps_and_clamps_to_bounds() {
-        let mut w = World::new();
-        let hero = w.add("hero", Team::Player, 100.0, 5.0);
-        let _enemy = w.add("enemy", Team::Enemy, 100.0, 10.0);
-        w.ent(hero).move_speed = 2.0;
-
-        let gambit = vec![MoveRule::new(MoveIntent::Away(nearest_enemy()))];
-        let dest = decide_move(&gambit, hero, &w.state).unwrap();
-        assert_eq!(dest.x, 3.0); // fled 2 units away from the enemy at 10
-
-        // Backed against the wall: a step past 0 clamps to the boundary.
-        w.ent(hero).pos.x = 1.0;
-        let dest = decide_move(&gambit, hero, &w.state).unwrap();
-        assert_eq!(dest.x, 0.0);
-    }
-
-    /// A `WithinDistance` filter on a flee query makes the kite *bounded*: the
-    /// actor backs away only while the threat is inside the guard distance, and
-    /// holds once the gap is open (so it doesn't flee to a corner and stalemate).
-    #[test]
-    fn within_distance_bounds_the_kite() {
-        let mut w = World::new();
-        let hero = w.add("hero", Team::Player, 100.0, 5.0);
-        let enemy = w.add("enemy", Team::Enemy, 100.0, 9.0); // 4 units away
-        w.ent(hero).move_speed = 1.0;
-
-        // Kite only a foe that has closed inside 6 units.
-        let gambit = vec![MoveRule::new(MoveIntent::Away(
-            TargetQuery::new(Pool::Enemies)
-                .filter(Filter::WithinDistance(6.0))
-                .sort(SortKey::Distance, Order::Asc),
-        ))];
-
-        // Threat is within 6 -> flee away from it (westward, x decreases).
-        let dest = decide_move(&gambit, hero, &w.state).expect("should kite a close threat");
-        assert_eq!(dest.x, 4.0);
-
-        // Push the threat out past 6 units -> query is empty -> hold, don't flee.
-        w.ent(enemy).pos.x = 15.0; // now 10 units away
+        // Practically arrived (inside melee reach): standing still wins.
+        w.ent(hero).pos = Pos { x: 58.8, y: 50.0 }; // 1.2 from the target
         assert_eq!(decide_move(&gambit, hero, &w.state), None);
     }
 
-    /// A movement rule whose target query is empty holds position (falls to the
-    /// next rule / returns None), rather than moving toward nothing.
+    /// The headline of the scoring model: `Near(q, ideal)` is approach,
+    /// standoff *and* retreat in one term — the old three-rule kite band
+    /// (with its threshold wobble) collapses into a single peak.
+    #[test]
+    fn near_ideal_is_a_standoff_band() {
+        let mut w = World::new();
+        let hero = w.add("hero", Team::Player, 100.0, 50.0);
+        let enemy = w.add("enemy", Team::Enemy, 100.0, 57.0);
+        w.ent(hero).pos.y = 50.0;
+        w.ent(enemy).pos.y = 50.0;
+        w.ent(hero).move_speed = 1.0;
+        let gambit = MoveGambit::new(vec![(Term::Near(nearest_enemy(), 7.0), 1.0)]);
+
+        // At the ideal range: hold (stickiness beats any marginal improvement).
+        assert_eq!(decide_move(&gambit, hero, &w.state), None, "holds at ideal range");
+
+        // Dived on (too close): walk the drift to convergence — it must settle
+        // back near the ideal range and *stop* (a stable standoff, not a
+        // wobble). Individual steps may flank rather than back straight out.
+        w.ent(enemy).pos.x = 53.0; // 3 away
+        let mut steps = 0;
+        while let Some(dest) = decide_move(&gambit, hero, &w.state) {
+            w.ent(hero).pos = dest;
+            steps += 1;
+            assert!(steps < 40, "drift must converge, not oscillate forever");
+        }
+        let settled = w.state.entity(hero).pos.dist(w.state.entity(enemy).pos);
+        assert!(
+            (5.5..=8.5).contains(&settled),
+            "should settle near the ideal range 7, got {settled}"
+        );
+
+        // Too far: advance — the destination closes the gap.
+        w.ent(hero).pos = Pos { x: 50.0, y: 50.0 };
+        w.ent(enemy).pos = Pos { x: 65.0, y: 50.0 }; // 15 away
+        let d0 = w.state.entity(hero).pos.dist(w.state.entity(enemy).pos);
+        let dest = decide_move(&gambit, hero, &w.state).expect("should advance");
+        assert!(
+            dest.dist(w.state.entity(enemy).pos) < d0,
+            "advances when the target is beyond the ideal range"
+        );
+    }
+
+    /// `AwayFrom` is a *bounded* flee: it opens the gap while the threat is
+    /// close, and saturates once the gap is comfortable — no fleeing to a
+    /// corner and stalemating.
+    #[test]
+    fn away_from_flees_close_threats_but_saturates() {
+        let mut w = World::new();
+        let hero = w.add("hero", Team::Player, 100.0, 50.0);
+        let enemy = w.add("enemy", Team::Enemy, 100.0, 53.0); // 3 away
+        w.ent(hero).pos.y = 50.0;
+        w.ent(enemy).pos.y = 50.0;
+        w.ent(hero).move_speed = 1.0;
+        let gambit = MoveGambit::new(vec![(Term::AwayFrom(nearest_enemy()), 1.0)]);
+
+        let dest = decide_move(&gambit, hero, &w.state).expect("should flee a close threat");
+        assert!(dest.dist(w.state.entity(enemy).pos) > 3.0, "opens the gap");
+
+        // Gap already comfortable (>= saturation range): hold, don't corner-camp.
+        w.ent(enemy).pos.x = 59.5; // 9.5 away
+        assert_eq!(decide_move(&gambit, hero, &w.state), None);
+    }
+
+    /// A gambit whose every query matches nothing holds position rather than
+    /// moving relative to nothing.
     #[test]
     fn move_holds_when_no_target() {
         let mut w = World::new();
         let hero = w.add("hero", Team::Player, 100.0, 0.0);
         w.ent(hero).move_speed = 1.0;
         // No enemies exist.
-        let gambit = vec![MoveRule::new(MoveIntent::Toward(nearest_enemy()))];
+        let gambit = MoveGambit::toward(nearest_enemy());
         assert_eq!(decide_move(&gambit, hero, &w.state), None);
     }
 
@@ -810,13 +829,15 @@ mod tests {
         assert!(decide(&rule, hero, &w.state).is_some());
     }
 
-    /// `SeekHighGround` walks the actor toward the highest reachable tile that
-    /// still sees the target, gaining elevation.
+    /// A `HighGround`+`SightOf` blend walks the actor up a hill it can shoot
+    /// from — the old dedicated "seek high ground" intent, recovered from two
+    /// generic terms.
     #[test]
-    fn seek_high_ground_climbs_toward_a_hill() {
+    fn high_ground_terms_climb_toward_a_hill() {
         let mut w = World::new();
         let hero = w.add("hero", Team::Player, 100.0, 0.5);
         let _enemy = w.add("enemy", Team::Enemy, 100.0, 4.5);
+        w.ent(hero).pos.y = 0.5;
         w.ent(hero).move_speed = 1.0;
 
         // A two-step hill just east of the actor; the far side is a cliff, so the
@@ -826,21 +847,27 @@ mod tests {
         terrain.set(2, 0, Tile3 { elevation: 2, passable: true });
         w.state.terrain = Some(terrain);
 
-        let gambit = vec![MoveRule::new(MoveIntent::SeekHighGround(nearest_enemy()))];
+        let gambit = MoveGambit::new(vec![
+            (Term::HighGround, 1.0),
+            (Term::SightOf(nearest_enemy()), 1.0),
+        ]);
         let dest = decide_move(&gambit, hero, &w.state).expect("should head for the hill");
         assert!(dest.x > 0.5, "should move east toward the high ground, got {}", dest.x);
     }
 
-    /// On a flat, terrain-free arena there is no high ground, so `SeekHighGround`
-    /// declines (holds / falls to the next rule).
+    /// On a flat, terrain-free arena the same terms score uniformly, so the
+    /// actor holds instead of shuffling.
     #[test]
-    fn seek_high_ground_holds_when_flat() {
+    fn high_ground_terms_hold_when_flat() {
         let mut w = World::new();
         let hero = w.add("hero", Team::Player, 100.0, 0.5);
         let _enemy = w.add("enemy", Team::Enemy, 100.0, 4.5);
         w.ent(hero).move_speed = 1.0;
 
-        let gambit = vec![MoveRule::new(MoveIntent::SeekHighGround(nearest_enemy()))];
+        let gambit = MoveGambit::new(vec![
+            (Term::HighGround, 1.0),
+            (Term::SightOf(nearest_enemy()), 1.0),
+        ]);
         assert_eq!(decide_move(&gambit, hero, &w.state), None);
     }
 

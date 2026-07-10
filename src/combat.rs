@@ -10,7 +10,7 @@ use crate::battle::{
     ENTITY_RADIUS,
 };
 use crate::eval::{decide, decide_move, Action};
-use crate::gambit::{MoveRule, Node};
+use crate::gambit::{MoveGambit, Node};
 
 /// Action-bar value at which an entity gets to act.
 const READY: f32 = 1.0;
@@ -76,9 +76,10 @@ pub struct Combat {
     pub state: BattleState,
     /// Each entity's action ruleset, keyed by id. An entity with no gambit never acts.
     pub gambits: HashMap<EntityId, Node>,
-    /// Each entity's movement ruleset, keyed by id. An entity with no movement
-    /// gambit holds position (the pre-movement behaviour).
-    pub move_gambits: HashMap<EntityId, Vec<MoveRule>>,
+    /// Each entity's movement gambit (weighted positional-scoring terms), keyed
+    /// by id. An entity with no movement gambit holds position (the
+    /// pre-movement behaviour).
+    pub move_gambits: HashMap<EntityId, MoveGambit>,
     /// Casts currently in flight, keyed by caster. Presence == "is casting".
     casts: HashMap<EntityId, Cast>,
     pub time: u32,
@@ -98,7 +99,7 @@ impl Combat {
     }
 
     /// Attach movement gambits (builder-style).
-    pub fn with_movement(mut self, move_gambits: HashMap<EntityId, Vec<MoveRule>>) -> Self {
+    pub fn with_movement(mut self, move_gambits: HashMap<EntityId, MoveGambit>) -> Self {
         self.move_gambits = move_gambits;
         self
     }
@@ -144,6 +145,7 @@ impl Combat {
             return events;
         }
         self.tick_cooldowns();
+        self.tick_mp();
 
         // Advance in-flight casts; any that complete resolve (or fizzle) now.
         self.advance_casts(&mut events);
@@ -389,7 +391,7 @@ impl Combat {
     /// which for a cast-time skill is *cast start*, not resolution.
     fn commit_cost(&mut self, actor: EntityId, skill_id: SkillId, skill: &Skill) {
         let a = &mut self.state.entities[actor.0];
-        a.mp = a.mp.saturating_sub(skill.cost);
+        a.mp = (a.mp - skill.cost as f32).max(0.0);
         if skill.cooldown > 0 {
             a.cooldowns.insert(skill_id, skill.cooldown);
         }
@@ -560,6 +562,18 @@ impl Combat {
         }
     }
 
+    /// Regenerate MP: every alive entity recovers its `mp_regen` per tick, capped
+    /// at `max_mp`. This is what keeps a costed skill (e.g. a healer's mend) from
+    /// permanently drying up — and the hook future MP-drain / regen-aura effects
+    /// will push against. Casting units regen too (a cast doesn't stop the clock).
+    fn tick_mp(&mut self) {
+        for e in &mut self.state.entities {
+            if e.is_alive() && e.mp_regen != 0.0 {
+                e.mp = (e.mp + e.mp_regen).clamp(0.0, e.max_mp);
+            }
+        }
+    }
+
     /// End the battle once one whole team is down. Returns true if over.
     fn check_over(&mut self, events: &mut Vec<Event>) -> bool {
         if self.over {
@@ -595,7 +609,7 @@ mod tests {
     struct Arena {
         state: BattleState,
         gambits: HashMap<EntityId, Node>,
-        move_gambits: HashMap<EntityId, Vec<MoveRule>>,
+        move_gambits: HashMap<EntityId, MoveGambit>,
     }
 
     impl Arena {
@@ -638,7 +652,9 @@ mod tests {
                 team,
                 hp,
                 max_hp: 100.0,
-                mp: 100,
+                mp: 100.0,
+                max_mp: 100.0,
+                mp_regen: 0.0, // off by default so MP-cost assertions stay exact
                 pos: Pos { x, y: 0.0 },
                 statuses: Vec::new(),
                 weaknesses: Vec::new(),
@@ -659,8 +675,8 @@ mod tests {
             self.gambits.insert(id, tree);
         }
 
-        fn move_gambit(&mut self, id: EntityId, rules: Vec<MoveRule>) {
-            self.move_gambits.insert(id, rules);
+        fn move_gambit(&mut self, id: EntityId, gambit: MoveGambit) {
+            self.move_gambits.insert(id, gambit);
         }
 
         fn into_combat(self) -> Combat {
@@ -809,9 +825,9 @@ mod tests {
         a.gambit(hero, Node::act(TargetQuery::new(Pool::Enemies), jab));
         a.move_gambit(
             hero,
-            vec![MoveRule::new(MoveIntent::Toward(
+            MoveGambit::toward(
                 TargetQuery::new(Pool::Enemies).sort(SortKey::Distance, Order::Asc),
-            ))],
+            ),
         );
 
         let mut combat = a.into_combat();
@@ -843,9 +859,9 @@ mod tests {
         a.ent(blocker).pos.y = 5.0;
         a.move_gambit(
             mover,
-            vec![MoveRule::new(MoveIntent::Toward(
+            MoveGambit::toward(
                 TargetQuery::new(Pool::Enemies).sort(SortKey::Distance, Order::Asc),
-            ))],
+            ),
         );
 
         let mut combat = a.into_combat();
@@ -863,31 +879,40 @@ mod tests {
         assert!(m.x < b.x, "mover should stop before the blocker, not pass it");
     }
 
-    /// A unit fleeing into a wall keeps its whole body in the arena — its centre
-    /// stops a radius short of the edge, not on it.
+    /// A unit fleeing to the arena edge keeps its whole body in — its centre
+    /// stops a radius short of the wall, never past it.
     #[test]
     fn movement_keeps_body_inside_bounds() {
         let mut a = Arena::new();
         a.state.bounds = (10.0, 10.0);
-        let runner = a.add_at("runner", Team::Player, 100.0, 0.0, 1.0, 5.0);
-        let _chaser = a.add_at("chaser", Team::Enemy, 100.0, 0.0, 8.0, 0.0);
+        let runner = a.add_at("runner", Team::Player, 100.0, 0.0, 5.0, 5.0);
+        let chaser = a.add_at("chaser", Team::Enemy, 100.0, 0.0, 9.0, 0.0);
+        a.ent(runner).pos.y = 5.0; // centre of the arena, chaser to the east
+        a.ent(chaser).pos.y = 5.0;
         a.move_gambit(
             runner,
-            vec![MoveRule::new(MoveIntent::Away(
-                TargetQuery::new(Pool::Enemies).sort(SortKey::Distance, Order::Asc),
-            ))],
+            MoveGambit::new(vec![(
+                Term::AwayFrom(TargetQuery::new(Pool::Enemies).sort(SortKey::Distance, Order::Asc)),
+                1.0,
+            )]),
         );
 
         let mut combat = a.into_combat();
         combat.run(20);
 
-        // Fled toward x=0 but the radius keeps the whole body in — centre stops
-        // a radius short of the wall.
-        let x = combat.state.entity(runner).pos.x;
-        assert!(
-            (x - ENTITY_RADIUS).abs() < 1e-3,
-            "expected centre at radius {ENTITY_RADIUS}, got {x}"
-        );
+        // Fled west into the wall region: the radius keeps the whole body in —
+        // both coordinates sit at least a radius from every edge.
+        let p = combat.state.entity(runner).pos;
+        assert!(p.x < 5.0, "runner should have fled away from the chaser, x = {}", p.x);
+        for (c, hi) in [(p.x, 10.0), (p.y, 10.0)] {
+            assert!(
+                (ENTITY_RADIUS - 1e-3..=hi - ENTITY_RADIUS + 1e-3).contains(&c),
+                "body must stay inside bounds, got {p:?}"
+            );
+        }
+        // And the flight actually opened the gap.
+        let gap = p.dist(combat.state.entity(chaser).pos);
+        assert!(gap > 4.0, "flee should open the gap, got {gap}");
     }
 
     /// A cast-time skill roots the caster, freezes its ATB, pays its cost once
@@ -913,7 +938,7 @@ mod tests {
         combat.tick(); // tick 1: cast begins
         assert!(combat.is_casting(hero));
         assert_eq!(combat.state.entity(enemy).hp, 100.0);
-        assert_eq!(combat.state.entity(hero).mp, 90); // paid at cast start
+        assert_eq!(combat.state.entity(hero).mp, 90.0); // paid at cast start
 
         combat.tick(); // tick 2: still casting
         assert!(combat.is_casting(hero));
@@ -922,7 +947,7 @@ mod tests {
         combat.tick(); // tick 3: resolves
         assert!(!combat.is_casting(hero));
         assert_eq!(combat.state.entity(enemy).hp, 70.0);
-        assert_eq!(combat.state.entity(hero).mp, 90); // not charged twice
+        assert_eq!(combat.state.entity(hero).mp, 90.0); // not charged twice
     }
 
     /// If every committed target becomes invalid mid-cast (here: killed by an
@@ -994,9 +1019,9 @@ mod tests {
 
         a.move_gambit(
             mover,
-            vec![MoveRule::new(MoveIntent::Toward(
+            MoveGambit::toward(
                 TargetQuery::new(Pool::Enemies).sort(SortKey::Distance, Order::Asc),
-            ))],
+            ),
         );
 
         let mut combat = a.into_combat();
@@ -1093,9 +1118,9 @@ mod tests {
         a.gambit(hero, Node::act(TargetQuery::new(Pool::Enemies), jab));
         a.move_gambit(
             hero,
-            vec![MoveRule::new(MoveIntent::Toward(
+            MoveGambit::toward(
                 TargetQuery::new(Pool::Enemies).sort(SortKey::Distance, Order::Asc),
-            ))],
+            ),
         );
 
         let mut combat = a.into_combat();
@@ -1114,6 +1139,70 @@ mod tests {
         );
     }
 
+    /// MP regenerates each tick up to `max_mp`, and a costed skill becomes
+    /// feasible again once enough has recovered — so a healer that spent itself
+    /// dry starts healing again instead of falling through to its plink forever.
+    #[test]
+    fn mp_regenerates_and_reenables_a_costed_skill() {
+        let mut a = Arena::new();
+        let hero = a.add("hero", Team::Player, 100.0, 1.0); // ready every tick
+        let ally = a.add("ally", Team::Player, 10.0, 0.0); // stays hurt: heal has a target
+        let _enemy = a.add("enemy", Team::Enemy, 500.0, 0.0); // keeps the battle going
+        a.ent(hero).mp = 5.0; // can't afford the heal yet
+        a.ent(hero).max_mp = 100.0;
+        a.ent(hero).mp_regen = 3.0; // ...but recovers 3/tick
+        let heal = a.skill(Skill {
+            name: "Heal".into(),
+            cost: 10,
+            range: 1000.0,
+            cooldown: 0,
+            cast_time: 0,
+            damage_type: None,
+            effects: vec![Effect::Heal(5.0)],
+        });
+        let plink = a.skill(damage_skill("Plink", 1.0, None, 0));
+        // Prefer to heal the hurt ally; fall back to plinking if it can't afford it.
+        a.gambit(
+            hero,
+            Node::context(
+                Condition::Always,
+                GroupMode::Fallthrough,
+                vec![
+                    Node::act(TargetQuery::new(Pool::Allies).filter(Filter::HpPctBelow(0.7)), heal),
+                    Node::act(TargetQuery::new(Pool::Enemies), plink),
+                ],
+            ),
+        );
+
+        let mut combat = a.into_combat();
+        // Tick 1: only 5 MP (+3 regen = 8) — still under 10, so it plinks.
+        let log = combat.tick();
+        assert!(log.iter().any(|e| matches!(e, Event::Acted { skill, .. } if *skill == plink)));
+        assert!(combat.state.entity(hero).mp < 10.0);
+
+        // A few ticks later the regen has cleared the cost and the heal fires.
+        let log = combat.run(5);
+        assert!(
+            log.iter().any(|e| matches!(e, Event::Heal { target, .. } if *target == ally)),
+            "the healer should heal again once MP regenerates past the cost"
+        );
+    }
+
+    /// MP regen never overfills the pool past `max_mp`.
+    #[test]
+    fn mp_regen_caps_at_max() {
+        let mut a = Arena::new();
+        let hero = a.add("hero", Team::Player, 100.0, 0.0);
+        let _enemy = a.add("enemy", Team::Enemy, 100.0, 0.0);
+        a.ent(hero).mp = 98.0;
+        a.ent(hero).max_mp = 100.0;
+        a.ent(hero).mp_regen = 5.0;
+
+        let mut combat = a.into_combat();
+        combat.run(10);
+        assert_eq!(combat.state.entity(hero).mp, 100.0, "regen shouldn't exceed max_mp");
+    }
+
     /// A snare cuts drift by `SNARE_SLOW`: a snared mover covers only the reduced
     /// fraction of its `move_speed` each tick.
     #[test]
@@ -1128,9 +1217,9 @@ mod tests {
             .push(Status { kind: StatusKind::Snare, stacks: 1, duration: 5 });
         a.move_gambit(
             hero,
-            vec![MoveRule::new(MoveIntent::Toward(
+            MoveGambit::toward(
                 TargetQuery::new(Pool::Enemies).sort(SortKey::Distance, Order::Asc),
-            ))],
+            ),
         );
 
         let mut combat = a.into_combat();

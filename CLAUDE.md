@@ -35,12 +35,14 @@ src/
   battle.rs   World state: Entity, Skill, Effect, Status, BattleState (+ arena bounds + optional
               Terrain, with flat-arena fallbacks for elevation/LoS/passability). No engine/AI deps.
   gambit.rs   The rule model: Node / Body / Condition / TargetQuery (a behaviour tree),
-              plus MoveRule / MoveIntent (the movement gambit).
-  terrain.rs  Tile grid: passability, elevation, cliffs (walkability), and line-of-sight. (unit tests)
+              plus MoveGambit / Term (positional-scoring movement — see "Movement").
+  terrain.rs  Tile grid: passability, elevation, cliffs (walkability), and line-of-sight
+              (eye-height rays). (unit tests)
   nav.rs      A* pathfinding + a reachability flood over the tile grid. Pure, engine-agnostic. (unit tests)
   eval.rs     decide(root, actor, state) -> Option<Action>: walk the action tree (LoS is an implicit
-              feasibility check); decide_move(gambit, actor, state) -> Option<Pos>: resolve movement
-              drift, routing around terrain via A*. (unit tests)
+              feasibility check); decide_move(gambit, actor, state) -> Option<Pos>: score reachable
+              stand points by the movement gambit's weighted terms and step toward the argmax,
+              A*-routed around terrain. (unit tests)
   combat.rs   Combat: the ATB loop + movement + cast-time state machine + action resolution. (unit tests)
   scenario.rs Hand-built demo battle + demo map (temporary, until real encounters exist).
   main.rs     Macroquad viewer: steps Combat on a timer, draws terrain (elevation/walls/pits),
@@ -214,13 +216,13 @@ presets ("nearest foe", "weakest foe", "lowest-HP ally") that expand into full
 pool→filter→sort→pick queries, and hide the individual knobs behind an "advanced" mode. Cap
 *displayed* nesting to ~2–3 levels even if the data model allows arbitrary depth.
 
-## Movement & positioning (BUILT — flat arena; terrain still deferred)
+## Movement & positioning (BUILT; movement gambit REVISED to positional scoring)
 
-**Status:** implemented on a flat, bounded arena (no terrain/pathfinding yet — that's the next
-section). Entities now *move*: `move_speed` + `move_gambit` (`MoveToward`/`MoveAway(TargetQuery)`)
-drive continuous drift each tick, and `cast_time` skills root the caster via a Casting state.
-`Entity.speed` was renamed `atb_speed`; `BattleState.bounds` clamps drift to the arena. See the
-combat-loop steps above and `combat.rs` / `eval.rs::decide_move`. The design that was built:
+**Status:** implemented. Entities *move*: `move_speed` + a per-entity `MoveGambit` (weighted
+positional-scoring terms — see the revised bullet below) drive continuous drift each tick, and
+`cast_time` skills root the caster via a Casting state. `Entity.speed` was renamed `atb_speed`;
+`BattleState.bounds` clamps drift to the arena. See the combat-loop steps above and
+`combat.rs` / `eval.rs::decide_move`. The design that was built:
 
 - **Flowy, continuous movement — decoupled from the action.** Movement is NOT a turn/action
   choice competing with skills (that makes it a dead option). Instead a unit *drifts* toward a
@@ -228,9 +230,23 @@ combat-loop steps above and `combat.rs` / `eval.rs::decide_move`. The design tha
   gambit**, while the ATB bar independently fills and fires skills. Move **and** pick skills,
   never move-*or*-pick. This decoupling is what makes movement worth having — and it's the
   reason we don't need a movement budget (see below).
-- **Movement reuses the target engine.** A movement rule is `MoveToward(TargetQuery)` /
-  `MoveAway(TargetQuery)` — the same pool→filter→sort→pick machinery picks what to move
-  relative to. "Kite the nearest enemy" = MoveAway(nearest enemy). Low marginal complexity.
+- **Movement is positional *scoring*, not directional rules (REVISED).** The first build used
+  a priority list of directional intents (`MoveToward`/`MoveAway` + threshold guards). That's
+  bang-bang control over continuous space: a foe parked on a threshold flips which rule wins
+  every tick and the unit oscillates (this livelocked ranged units mid-fight). Movement is a
+  continuous optimization, so it now uses the matching primitive: a `MoveGambit` is a
+  **weighted sum of scoring terms** (`Near(query, ideal_range)` / `AwayFrom(query)` /
+  `HighGround` / `SightOf(query)`), evaluated over the reachable stand points
+  (`nav::reachable` tiles; a sampled lattice on flat arenas). The evaluator adds a
+  **stickiness** bonus to the current spot (a move must beat standing still — the stateless
+  replacement for hysteresis) and a small **travel cost** (near-equal spots resolve to the
+  nearest, killing orbit artifacts), then steps toward the argmax, A\*-routed. Conflicting
+  pulls *blend into one best spot* instead of alternating rule wins — no wobble by
+  construction. `Near(enemy, 6.5)` alone is approach + standoff + retreat (the whole kite
+  band); a *negative* `SightOf` weight is "hide from the target" for free. Target queries
+  survive unchanged as the reference-picker inside terms — the same pool→filter→sort→pick
+  machinery picks what to position *relative to*. Knobs live in `eval.rs`
+  (`STICKINESS`/`TRAVEL_COST`/`DIST_NORM`/`AWAY_RANGE`/`SEEK_RADIUS`).
 - **Hitboxes (BUILT).** Every entity is a circle of one shared radius (`battle::ENTITY_RADIUS`,
   uniform for now — *not* a per-entity field; if size ever varies it should come from equipment,
   not a spawn literal). Units can't overlap and can't hang over the arena edge. After
@@ -272,26 +288,30 @@ happen on terrain with obstacles and elevation, not a flat plane. It's the large
 pulls in pathfinding, line-of-sight, terrain data, and terrain rendering.
 
 Implementation notes / decisions made while building:
-- **Line-of-sight is elevation-only.** A tile blocks sight iff it rises above the straight line
-  drawn between the two eye heights (each eye sits at its tile's elevation). So passability doesn't
-  affect sight — you shoot *across* pits and *over* lower cover, but a tall wall between two low
-  units blocks. Model a wall as a *tall, impassable* tile and a pit as a *low, impassable* one.
+- **Line-of-sight is elevation-only, with eye height.** A tile blocks sight iff it rises above
+  the straight line drawn between the two eye points — each eye sits `EYE_HEIGHT` (1.0) *above*
+  its tile's elevation. Eye height matters: with ground-level rays, a unit on a hill crown was
+  blinded to an adjacent lower unit by its own crown's edge (this livelocked a ranged unit being
+  meleed at its hill's base). Consequences: walls (elev ≥ 3) still block ground units; elev-1
+  bumps no longer block sight between ground units (knee-high cover shouldn't blind). Passability
+  doesn't affect sight — you shoot *across* pits and *over* lower cover. Model a wall as a
+  *tall, impassable* tile and a pit as a *low, impassable* one.
 - **LoS is enforced as feasibility, not a hand-authored filter.** A skill's target set is gated by
   range **and** LoS together in `eval::candidates` (only when a skill range is supplied — conditions
   and movement queries are sightless). There is also a `Filter::HasLineOfSight` for use inside
   *conditions* (e.g. "flee if a foe that can see me exists").
 - **New gambit material shipped:** filters `HasLineOfSight` / `OnHigherGround` (negate for
-  lower-or-equal), sort key `Elevation` (`Desc` = prefer high-ground targets), and two tile-seeking
-  movement intents — `SeekHighGround(q)` (climb to the highest reachable tile that still sees the
-  target) and `BreakLoS(q)` (duck to the nearest reachable tile the threat can't see). Both use the
-  reachability flood and hold (fall through) on a flat arena. `InCover` was **not** built — it was
+  lower-or-equal) and sort key `Elevation` (`Desc` = prefer high-ground targets). The original
+  tile-seeking movement *intents* (`SeekHighGround`/`BreakLoS`) were superseded by the scoring
+  terms: "seek high ground with a shot" = `HighGround` + `SightOf(q)` weights; "duck behind
+  cover" = a *negative* `SightOf(threat)` weight. `InCover` was **not** built — it was
   under-specified; revisit with real cover authoring.
-- **Steering is "follow the A\* waypoints" + the existing collision pass.** `MoveToward` A\*-routes
-  and steps toward the next waypoint centre; `MoveAway` slides along walls by rotating its heading
-  when the straight-away step is blocked. A terrain backstop in `combat::resolve_collisions` reverts
-  a mover to its (valid) start if entity separation ever shoves it onto a wall/cliff. **True
-  smooth steering / string-pulling** (cutting corners between waypoints rather than threading tile
-  centres) is still deferred — movement threads centres for now, which is slightly robotic.
+- **Steering is "follow the A\* waypoints" + the existing collision pass.** The mover steps toward
+  the next waypoint centre of an A\* route to its chosen stand point. A terrain backstop in
+  `combat::resolve_collisions` reverts a mover to its (valid) start if entity separation ever
+  shoves it onto a wall/cliff. **True smooth steering / string-pulling** (cutting corners between
+  waypoints rather than threading tile centres) is still deferred — movement threads centres for
+  now, which is slightly robotic.
 - **Terrain authoring** is still just data literals (`scenario::demo_terrain`); no editor/format yet.
 
 - **Representation — tile grid, continuous units.** Terrain is a grid of tiles; each tile has
@@ -303,8 +323,8 @@ Implementation notes / decisions made while building:
 - **Navigation — A\* + steering.** Global routing is **A\*** over the tile grid (steering alone
   can't route around concave obstacles). A* yields waypoints; the **steering** layer follows
   them smoothly and does local avoidance (walls, other units). A* = *where* to go, steering =
-  *how* to move there. Movement gambits still express only *intent*
-  (`MoveToward`/`MoveAway(TargetQuery)`, seek high ground, …); navigation resolves it.
+  *how* to move there. Movement gambits still express only *preference* (the weighted scoring
+  terms); the evaluator picks the stand point and navigation resolves the route to it.
 - **Spatial sanity is implicit** — like feasibility. Pathfinding around obstacles, staying in
   bounds, and not overlapping allies are systemic and always-on; the player never hand-authors
   "don't run into walls". Getting cornered is still *possible* (a real tactical outcome when
@@ -321,7 +341,8 @@ Implementation notes / decisions made while building:
 - **Gambit payoff — new spatial material** (the reason terrain is worth the cost):
   - Filters: `HasLineOfSight`, `OnHigherGround`, `InCover`, elevation comparisons.
   - Sort key: `Elevation` (e.g. "prefer the high-ground target", "seek the highest reachable tile").
-  - Movement intents: "seek nearest high tile with LoS to the target", "break LoS from ranged threats".
+  - Movement terms: `HighGround` + `SightOf(target)` ("perch where you can shoot"),
+    negative `SightOf(threat)` ("break LoS from ranged threats").
 - **Not doing (yet):** navmesh / continuous heightmap (the grid is enough); flight/teleport
   traversal; height stat bonuses; interior-cover authoring tools.
 
