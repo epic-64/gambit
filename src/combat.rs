@@ -156,20 +156,21 @@ impl Combat {
         self.tick_movement();
 
         // Fill bars, capped at READY so a waiting entity doesn't accumulate.
-        // Casting units are frozen (bar stays at 0 until the cast resolves).
+        // Casting units are frozen (bar stays at 0 until the cast resolves), and
+        // so are stunned ones (their bar is held until the stun wears off).
         for e in &mut self.state.entities {
-            if e.is_alive() && !self.casts.contains_key(&e.id) {
+            if e.is_alive() && !e.is_stunned() && !self.casts.contains_key(&e.id) {
                 e.action_bar = (e.action_bar + e.atb_speed).min(READY);
             }
         }
 
         // Everyone at/over the threshold acts this tick, fullest bar first
-        // (ties broken by id for determinism).
+        // (ties broken by id for determinism). Stunned units can't act.
         let mut ready: Vec<EntityId> = self
             .state
             .entities
             .iter()
-            .filter(|e| e.is_alive() && e.action_bar >= READY)
+            .filter(|e| e.is_alive() && !e.is_stunned() && e.action_bar >= READY)
             .map(|e| e.id)
             .collect();
         ready.sort_by(|&a, &b| {
@@ -245,6 +246,7 @@ impl Combat {
             .iter()
             .filter(|e| {
                 e.is_alive()
+                    && !e.is_stunned()
                     && !self.casts.contains_key(&e.id)
                     && self.move_gambits.contains_key(&e.id)
             })
@@ -397,11 +399,22 @@ impl Combat {
     /// (see [`commit_cost`]) so this can run at cast completion without paying twice.
     fn apply_effects(
         &mut self,
-        _actor: EntityId,
+        actor: EntityId,
         action: &Action,
         skill: &Skill,
         events: &mut Vec<Event>,
     ) {
+        // Actor-centric effects run first: a Dash repositions the actor onto its
+        // primary target before the per-target damage/statuses land, so a charge
+        // hits from contact rather than from where it started.
+        for effect in &skill.effects {
+            if let Effect::Dash { max } = effect
+                && let Some(&primary) = action.targets.first()
+            {
+                self.apply_dash(actor, primary, *max);
+            }
+        }
+
         for &tgt in &action.targets {
             for effect in &skill.effects {
                 match effect {
@@ -414,9 +427,32 @@ impl Combat {
                         stacks,
                         duration,
                     } => self.apply_status(tgt, *kind, *stacks, *duration, events),
+                    // Actor-centric — already resolved above.
+                    Effect::Dash { .. } => {}
                 }
             }
         }
+    }
+
+    /// Charge `actor` toward `target`, stopping at melee contact and travelling at
+    /// most `max` world units. Reuses [`resolve_collisions`] so the landing spot
+    /// stays in bounds, off other units, and off walls (the terrain backstop
+    /// holds the actor at its start if the straight dash would cross one).
+    fn apply_dash(&mut self, actor: EntityId, target: EntityId, max: f32) {
+        let from = self.state.entity(actor).pos;
+        let tp = self.state.entity(target).pos;
+        let d = from.dist(tp);
+        let contact = 2.0 * ENTITY_RADIUS;
+        let travel = (d - contact).clamp(0.0, max);
+        if travel <= f32::EPSILON {
+            return; // already in contact — nothing to close
+        }
+        let dest = Pos {
+            x: from.x + (tp.x - from.x) / d * travel,
+            y: from.y + (tp.y - from.y) / d * travel,
+        };
+        let resolved = self.resolve_collisions(actor, dest);
+        self.state.entities[actor.0].pos = resolved;
     }
 
     fn apply_damage(
@@ -1002,5 +1038,107 @@ mod tests {
             .iter()
             .any(|e| matches!(e, Event::Heal { target, .. } if *target == hero)));
         assert_eq!(combat.state.entity(hero).hp, 75.0);
+    }
+
+    /// A charge/gap-closer (`Effect::Dash`) rushes the actor to melee contact,
+    /// then the same skill's damage and stun land from there.
+    #[test]
+    fn charge_dashes_to_contact_deals_damage_and_stuns() {
+        let mut a = Arena::new();
+        //             name    team          hp    atb  x    move
+        let hero = a.add_at("hero", Team::Player, 100.0, 1.0, 0.0, 0.0); // ready, no drift
+        let enemy = a.add_at("enemy", Team::Enemy, 100.0, 0.0, 8.0, 0.0);
+        a.ent(hero).pos.y = 5.0; // interior row: pure-x geometry, off the y-edge
+        a.ent(enemy).pos.y = 5.0;
+        let charge = a.skill(Skill {
+            name: "Charge".into(),
+            cost: 0,
+            range: 10.0,
+            cooldown: 0,
+            cast_time: 0,
+            damage_type: Some(DamageType::Physical),
+            effects: vec![
+                Effect::Dash { max: 10.0 },
+                Effect::Damage(15.0),
+                Effect::Inflict { kind: StatusKind::Stun, stacks: 1, duration: 3 },
+            ],
+        });
+        a.gambit(hero, Node::act(TargetQuery::new(Pool::Enemies), charge));
+
+        let mut combat = a.into_combat();
+        combat.tick();
+
+        // Closed the 8-unit gap and stopped a hitbox short of the enemy.
+        let sep = combat.state.entity(hero).pos.dist(combat.state.entity(enemy).pos);
+        let contact = 2.0 * ENTITY_RADIUS;
+        assert!((sep - contact).abs() < 1e-3, "should stop at contact, sep = {sep}");
+        // The hit and the stun both landed.
+        assert_eq!(combat.state.entity(enemy).hp, 85.0);
+        assert!(combat.state.entity(enemy).is_stunned());
+    }
+
+    /// A stunned unit can neither act nor move, and its action bar is frozen —
+    /// until the stun expires, after which it behaves normally again.
+    #[test]
+    fn stun_freezes_action_and_movement() {
+        let mut a = Arena::new();
+        let hero = a.add_at("hero", Team::Player, 100.0, 1.0, 0.0, 2.0); // would act + drift
+        let enemy = a.add_at("enemy", Team::Enemy, 100.0, 0.0, 5.0, 0.0);
+        a.ent(hero).pos.y = 5.0;
+        a.ent(enemy).pos.y = 5.0;
+        a.ent(hero)
+            .statuses
+            .push(Status { kind: StatusKind::Stun, stacks: 1, duration: 3 });
+        let jab = a.skill(damage_skill("Jab", 20.0, None, 0));
+        a.gambit(hero, Node::act(TargetQuery::new(Pool::Enemies), jab));
+        a.move_gambit(
+            hero,
+            vec![MoveRule::new(MoveIntent::Toward(
+                TargetQuery::new(Pool::Enemies).sort(SortKey::Distance, Order::Asc),
+            ))],
+        );
+
+        let mut combat = a.into_combat();
+        let startx = combat.state.entity(hero).pos.x;
+        combat.tick(); // first tick: still stunned
+
+        assert_eq!(combat.state.entity(enemy).hp, 100.0, "stunned unit can't act");
+        assert_eq!(combat.state.entity(hero).pos.x, startx, "stunned unit can't move");
+        assert_eq!(combat.state.entity(hero).action_bar, 0.0, "stunned bar is frozen");
+
+        // The stun (duration 3) wears off, after which the hero closes and hits.
+        combat.run(30);
+        assert!(
+            combat.state.entity(enemy).hp < 100.0,
+            "acts and attacks once the stun wears off"
+        );
+    }
+
+    /// A snare cuts drift by `SNARE_SLOW`: a snared mover covers only the reduced
+    /// fraction of its `move_speed` each tick.
+    #[test]
+    fn snare_slows_drift() {
+        let mut a = Arena::new();
+        let hero = a.add_at("hero", Team::Player, 100.0, 0.0, 0.0, 2.0); // move_speed 2
+        let enemy = a.add_at("enemy", Team::Enemy, 100.0, 0.0, 100.0, 0.0);
+        a.ent(hero).pos.y = 5.0;
+        a.ent(enemy).pos.y = 5.0; // same row -> drift is purely along x
+        a.ent(hero)
+            .statuses
+            .push(Status { kind: StatusKind::Snare, stacks: 1, duration: 5 });
+        a.move_gambit(
+            hero,
+            vec![MoveRule::new(MoveIntent::Toward(
+                TargetQuery::new(Pool::Enemies).sort(SortKey::Distance, Order::Asc),
+            ))],
+        );
+
+        let mut combat = a.into_combat();
+        let x0 = combat.state.entity(hero).pos.x;
+        combat.tick();
+
+        // 2.0 * (1 - 0.6) = 0.8 units this tick, not the full 2.0.
+        let moved = combat.state.entity(hero).pos.x - x0;
+        assert!((moved - 0.8).abs() < 1e-3, "snared drift should be 0.8, got {moved}");
     }
 }

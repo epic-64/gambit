@@ -310,6 +310,54 @@ pub fn skirmish() -> Combat {
             ],
         },
     );
+    // Brawler's charge: rush a foe up to 6m off, hit for moderate damage and stun
+    // it for 1s (4 ticks). A gap-closer + hard CC — the tool that punishes kiting
+    // by locking a fleeing target down. Long cooldown so it's a signature opener,
+    // not a spam.
+    let charge = push_skill(
+        &mut skills,
+        Skill {
+            name: "Charge".into(),
+            cost: 0,
+            range: 6.0,
+            cooldown: 5,
+            cast_time: 0,
+            damage_type: Some(DamageType::Physical),
+            effects: vec![
+                Effect::Dash { max: 6.0 },
+                Effect::Damage(14.0),
+                Effect::Inflict {
+                    kind: StatusKind::Stun,
+                    stacks: 1,
+                    duration: 4,
+                },
+            ],
+        },
+    );
+    // Assassin's dash: a fast 4m gap-closer, moderate damage, and a 2s (8-tick)
+    // snare (-60% move speed) so the squishy it dives can't simply kite back out.
+    // Long cooldown (3s / 12 ticks) so it's a periodic engage — dive, then fight
+    // with backstab — not a spammed re-dash every couple of actions.
+    let dash = push_skill(
+        &mut skills,
+        Skill {
+            name: "Dash".into(),
+            cost: 0,
+            range: 5.0,
+            cooldown: 12,
+            cast_time: 0,
+            damage_type: Some(DamageType::Physical),
+            effects: vec![
+                Effect::Dash { max: 4.0 },
+                Effect::Damage(14.0),
+                Effect::Inflict {
+                    kind: StatusKind::Snare,
+                    stacks: 1,
+                    duration: 8,
+                },
+            ],
+        },
+    );
 
     let mk = |id: usize,
               name: &str,
@@ -340,12 +388,12 @@ pub fn skirmish() -> Combat {
     //          id  name        team          hp     atb   move  x     y     kit                weak
     let entities = vec![
         // Players muster on the west edge; the enemy on the east.
-        mk(0, "Brawler", Team::Player, 150.0, 0.26, 0.42, 3.5, 7.0, vec![bash], &[]),
+        mk(0, "Brawler", Team::Player, 150.0, 0.26, 0.42, 3.5, 7.0, vec![charge, bash], &[]),
         mk(1, "Archer", Team::Player, 65.0, 0.30, 0.36, 2.0, 2.5, vec![shot], &[]),
         mk(2, "Mage", Team::Player, 50.0, 0.22, 0.30, 2.0, 11.0, vec![fireball, shot], &[]),
         mk(3, "Cleric", Team::Player, 60.0, 0.24, 0.34, 2.0, 7.0, vec![heal, shot], &[]),
         mk(4, "Ogre", Team::Enemy, 160.0, 0.20, 0.30, 20.5, 7.0, vec![bash], &[DamageType::Fire]),
-        mk(5, "Assassin", Team::Enemy, 55.0, 0.34, 0.50, 22.0, 2.5, vec![backstab], &[]),
+        mk(5, "Assassin", Team::Enemy, 55.0, 0.34, 0.50, 22.0, 2.5, vec![dash, backstab], &[]),
         mk(6, "Raider", Team::Enemy, 62.0, 0.30, 0.36, 22.0, 11.0, vec![shot], &[]),
         mk(7, "Shaman", Team::Enemy, 60.0, 0.24, 0.34, 22.0, 7.0, vec![heal, shot], &[DamageType::Holy]),
     ];
@@ -381,8 +429,21 @@ pub fn skirmish() -> Combat {
     };
 
     let mut gambits = HashMap::new();
-    // Brawler / Ogre: wade in and bash whoever is closest.
-    gambits.insert(EntityId(0), Node::act(nearest_enemy(), bash));
+    // Brawler: charge the nearest foe (closing the gap + stunning it) when the
+    // charge is off cooldown, otherwise just bash whoever is closest. Feasibility
+    // (the charge's 6m range + cooldown) picks between them implicitly.
+    gambits.insert(
+        EntityId(0),
+        Node::context(
+            Condition::Always,
+            GroupMode::Fallthrough,
+            vec![
+                Node::act(nearest_enemy(), charge),
+                Node::act(nearest_enemy(), bash),
+            ],
+        ),
+    );
+    // Ogre: wade in and bash whoever is closest.
     gambits.insert(EntityId(4), Node::act(nearest_enemy(), bash));
     // Archers focus-fire the weakest foe to secure kills.
     gambits.insert(EntityId(1), Node::act(weakest_enemy(), shot));
@@ -399,8 +460,20 @@ pub fn skirmish() -> Combat {
             ],
         ),
     );
-    // Assassin dives the weakest player and poisons it.
-    gambits.insert(EntityId(5), Node::act(weakest_enemy(), backstab));
+    // Assassin dives the weakest player: dash in (gap-close + snare so it can't
+    // kite away) when off cooldown, otherwise backstab (poison). Same implicit
+    // feasibility split — the dash's 5m range/cooldown vs. the melee backstab.
+    gambits.insert(
+        EntityId(5),
+        Node::context(
+            Condition::Always,
+            GroupMode::Fallthrough,
+            vec![
+                Node::act(weakest_enemy(), dash),
+                Node::act(weakest_enemy(), backstab),
+            ],
+        ),
+    );
     // Both healers mend-first.
     gambits.insert(EntityId(3), healer_gambit(heal, shot));
     gambits.insert(EntityId(7), healer_gambit(heal, shot));
@@ -564,6 +637,29 @@ mod tests {
             .zip(&start)
             .any(|(e, s)| e.pos.x != s.x || e.pos.y != s.y);
         assert!(moved, "at least one unit should have drifted from its start");
+    }
+
+    /// The skirmish's new gap-closers actually get used: over a full battle the
+    /// brawler charges (landing a Stun) and the assassin dashes (landing a Snare).
+    #[test]
+    fn skirmish_uses_charge_and_dash_with_their_cc() {
+        let mut combat = skirmish();
+        let log = combat.run(4000);
+
+        let acted_skill = |name: &str| {
+            log.iter().any(|e| matches!(
+                e, Event::Acted { skill, .. } if combat.state.skill(*skill).name == name
+            ))
+        };
+        let inflicted = |kind: StatusKind| {
+            log.iter()
+                .any(|e| matches!(e, Event::Inflicted { kind: k, .. } if *k == kind))
+        };
+
+        assert!(acted_skill("Charge"), "the brawler should charge at least once");
+        assert!(acted_skill("Dash"), "the assassin should dash at least once");
+        assert!(inflicted(StatusKind::Stun), "a charge should land a stun");
+        assert!(inflicted(StatusKind::Snare), "a dash should land a snare");
     }
 
     /// Every scenario in the registry builds and its every entity has a gambit

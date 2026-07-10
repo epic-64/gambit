@@ -122,7 +122,7 @@ fn step_point(from: Pos, aim: Pos, speed: f32, state: &BattleState) -> Pos {
 fn nav_toward(actor: EntityId, point: Pos, state: &BattleState) -> Pos {
     let a = state.entity(actor);
     let from = a.pos;
-    let speed = a.move_speed;
+    let speed = a.effective_move_speed();
 
     if let Some(t) = state.terrain.as_ref() {
         let start = t.tile_of(from);
@@ -148,7 +148,7 @@ fn nav_toward(actor: EntityId, point: Pos, state: &BattleState) -> Pos {
 fn flee(actor: EntityId, threat: Pos, state: &BattleState) -> Pos {
     let a = state.entity(actor);
     let from = a.pos;
-    let speed = a.move_speed;
+    let speed = a.effective_move_speed();
 
     // Base "directly away" heading; a deterministic fallback when we're on top
     // of the threat lets overlapping units still separate.
