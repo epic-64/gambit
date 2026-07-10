@@ -32,7 +32,7 @@ fn push_skill(skills: &mut Vec<Skill>, s: Skill) -> SkillId {
 pub fn scenarios() -> Vec<(&'static str, fn() -> Combat)> {
     vec![
         ("Duel — Hero & Mage vs Goblin & Ogre (hill + wall)", demo as fn() -> Combat),
-        ("Skirmish — 6v5 party battle (plateau + cover)", skirmish as fn() -> Combat),
+        ("Skirmish — 6v5 party battle (chasm, bridge & twin crowns)", skirmish as fn() -> Combat),
     ]
 }
 
@@ -1009,13 +1009,16 @@ pub fn skirmish() -> Combat {
             ],
         ),
     );
-    // Assassin dives the weakest player: dash in (gap-close + snare so it can't
-    // kite away) when off cooldown, then finish or wear down. Reap outranks
-    // backstab but only against marks already under 65% HP — that's where its
-    // missing-HP scaling beats backstab's flat hit + poison; on healthier
-    // targets it falls through to backstab (stack the DoT first). Strike is the
-    // always-feasible floor: with everything on cooldown it still swings
-    // instead of idling with a full bar.
+    // Assassin hunts the frailest *frame* on the field — lowest max HP (the
+    // mage-shaped mark), not whoever happens to be dinged, so it commits to
+    // one quarry instead of ping-ponging to whatever the scrum has chewed on —
+    // dash in (gap-close + snare so it can't kite away) when off cooldown,
+    // then finish or wear down. Reap outranks backstab but only against marks
+    // already under 65% HP — that's where its missing-HP scaling beats
+    // backstab's flat hit + poison; on healthier targets it falls through to
+    // backstab (stack the DoT first). Strike is the always-feasible floor:
+    // with everything on cooldown it still swings instead of idling with a
+    // full bar.
     // A kill-ready mark for a stealth opening: an enemy already bleeding out.
     let weak_mark = || {
         TargetQuery::new(Pool::Enemies)
@@ -1072,7 +1075,7 @@ pub fn skirmish() -> Combat {
                 // ever frontline — the rest hold a ranged standoff). Until
                 // then the assassin stalks instead of opening the battle solo;
                 // its melee kit below still answers anyone who comes to *it*.
-                Node::act(weakest_enemy(), dash).when(Condition::Count {
+                Node::act(squishiest_enemy(), dash).when(Condition::Count {
                     q: ally_attacker(),
                     cmp: Cmp::Ge,
                     n: 2,
@@ -1083,7 +1086,7 @@ pub fn skirmish() -> Combat {
                 Node::act(
                     TargetQuery::new(Pool::Enemies)
                         .filter(Filter::Not(Box::new(Filter::HasStatus(StatusKind::MortalWound))))
-                        .sort(SortKey::Hp, Order::Asc),
+                        .sort(SortKey::MaxHp, Order::Asc),
                     maim,
                 ),
                 // At 70% the execute already out-hits Backstab's flat 13
@@ -1097,7 +1100,7 @@ pub fn skirmish() -> Combat {
                         .sort(SortKey::HpPct, Order::Asc),
                     reap,
                 ),
-                Node::act(weakest_enemy(), backstab),
+                Node::act(squishiest_enemy(), backstab),
                 Node::act(nearest_enemy(), strike),
             ],
         ),
@@ -1313,11 +1316,22 @@ pub fn skirmish() -> Combat {
     move_gambits.insert(EntityId(6), ranged_move());
     move_gambits.insert(EntityId(3), ranged_move());
     move_gambits.insert(EntityId(7), ranged_move());
-    // The assassin stalks, then dives — the movement mirror of its dash gate.
-    // The dive pull homes on the squishiest foe already trading blows with a
-    // teammate; before the lines meet that query matches nothing and drops
-    // out, leaving only the pack-riding term, so the assassin never marches
-    // out ahead to open the battle alone.
+    // The assassin stalks, then hunts — the movement mirror of its action
+    // rules, and the same quarry hidden or seen: the frailest frame on the
+    // field (lowest max HP), *not* whoever the scrum is currently chewing on.
+    // The hunt pull is gated on the fight having formed — its reference filter
+    // only matches while some foe is tied up in melee with a teammate (the
+    // 100.0 is "anywhere on the map") — so before the lines meet it drops out,
+    // leaving only the pack-riding term, and the assassin never marches out
+    // ahead to open the battle alone.
+    let hunted_mark = || {
+        TargetQuery::new(Pool::Enemies)
+            .filter(Filter::WithinDistanceOf(
+                Box::new(ally_attacker().pick(Pick::All)),
+                100.0,
+            ))
+            .sort(SortKey::MaxHp, Order::Asc)
+    };
     move_gambits.insert(
         EntityId(5),
         MoveGambit::new(vec![
@@ -1329,7 +1343,7 @@ pub fn skirmish() -> Combat {
             // matches when the nested self-query does (i.e. the assassin is
             // actually hidden; the 100.0 is "anywhere on the map"), so the
             // whole term drops out while visible — the same query-drops-out
-            // gating as the dive pull below.
+            // gating as the hunt pull below.
             (
                 Term::Near(
                     TargetQuery::new(Pool::Enemies)
@@ -1345,14 +1359,15 @@ pub fn skirmish() -> Combat {
                 ),
                 2.5,
             ),
-            (Term::Near(ally_attacker(), 0.0), 1.5),
-            // Invade from behind: the dive target is busy attacking a
-            // teammate (its focus — the direction it "faces"), so the rear
-            // arc is open. This term curves the same approach the dive pull
-            // drives around to the mark's back instead of walking straight
-            // through its front; it shares the dive's query, so it drops out
-            // together with it when no foe is engaged.
-            (Term::Behind(ally_attacker()), 0.7),
+            (Term::Near(hunted_mark(), 0.0), 1.5),
+            // Invade from behind: the mark is busy attacking someone (its
+            // focus — the direction it "faces"), so the rear arc is open.
+            // This term curves the same approach the hunt pull drives around
+            // to the mark's back instead of walking straight through its
+            // front; it shares the hunt's query, so it drops out together
+            // with it when no foe is engaged (and on a mark with no focus
+            // yet, the facing-less term drops out on its own).
+            (Term::Behind(hunted_mark()), 0.7),
             (
                 Term::Near(
                     TargetQuery::new(Pool::Allies)
@@ -1432,38 +1447,55 @@ pub fn skirmish() -> Combat {
     Combat::new(state, gambits).with_movement(move_gambits)
 }
 
-/// The skirmish map: a 24×14 arena with **two hills** — one flanking each side of
-/// the open central lane — plus a few **small rocks** at their bases. Each hill is
-/// contested high ground (ranged units climb it to shoot across the lane); the
-/// rocks are tall + impassable, so they break the sightlines of low units and
-/// force paths around them without walling off the lanes.
+/// The skirmish map: a 24×14 arena cleft down the middle by a **chasm** — an
+/// impassable rift you can shoot across but never walk — crossed in exactly
+/// three places: an open **ford** along each map edge (north and south) and a
+/// two-tile **stone bridge** dead centre. A three-tier **hill** rises on each
+/// side, one per team, and its crown (elevation 3, the tallest ground on the
+/// map) overlooks the bridge directly — the contested perch every archer wants,
+/// tall enough that the two crowns even see (and snipe at) *each other* over
+/// everything between them. **Boulders** guard each ford's mouths, breaking
+/// low sightlines into the crossings without choking them, and a ragged pit
+/// notch bites into each bank so the chasm edge isn't a straight wall. The
+/// net effect: melee must commit to one of three crossings, all of them
+/// watched from high ground, while ranged units trade fire across the rift.
 fn skirmish_terrain() -> Terrain {
     let mut t = Terrain::flat(24, 14, 1.0);
     let rock = Tile3 { elevation: 3, passable: false };
+    let pit = Tile3 { elevation: -2, passable: false };
 
-    // A hill on each side of centre (players' west, enemies' east).
-    add_hill(&mut t, 7);
-    add_hill(&mut t, 16);
+    // The chasm: columns 11–12, split by the bridge (rows 6..=7 stay solid
+    // ground). Rows 0..=2 and 11..=13 stay open as the north/south fords.
+    t.fill(11..=12, 3..=5, pit);
+    t.fill(11..=12, 8..=10, pit);
+    // Ragged banks: one pit notch biting west, one east (point-symmetric).
+    // The elevation-1 hill skirt alongside keeps the corridor two tiles wide.
+    t.set(10, 5, pit);
+    t.set(13, 8, pit);
 
-    // Small rocks scattered near each hill's base — cover and routing, not walls.
-    t.set(7, 3, rock); // north of the west hill
-    t.fill(5..=5, 10..=11, rock); // south-west of the west hill
-    t.set(16, 3, rock); // north of the east hill
-    t.fill(18..=18, 10..=11, rock); // south-east of the east hill
+    // A three-tier hill per side (players' west, enemies' east); every tier is
+    // a single walkable step, and the crown looks straight down the bridge.
+    add_hill(&mut t, 6);
+    add_hill(&mut t, 17);
+
+    // Boulders at the ford mouths — cover on the approach to each crossing,
+    // placed a tile shy of the ford so the crossing itself never chokes.
+    t.set(9, 1, rock);
+    t.set(14, 1, rock);
+    t.set(9, 12, rock);
+    t.set(14, 12, rock);
 
     t
 }
 
-/// Paint a climbable hill centred on column `cx`, rows 5..=9: an elevation-2
-/// crown ringed by an elevation-1 skirt one tile wider on every side, so each
-/// edge is a single (walkable) step up from the flat ground.
+/// Paint a climbable three-tier hill centred on column `cx`, rows 4..=10: an
+/// elevation-3 crown spine ringed by elevation-2 and elevation-1 terraces, each
+/// one tile wider than the last, so every edge is a single (walkable) step.
 fn add_hill(t: &mut Terrain, cx: i32) {
     let ground = |elevation| Tile3 { elevation, passable: true };
-    t.fill(cx - 1..=cx + 1, 6..=8, ground(2)); // crown
-    t.fill(cx - 2..=cx + 2, 5..=5, ground(1)); // north skirt
-    t.fill(cx - 2..=cx + 2, 9..=9, ground(1)); // south skirt
-    t.fill(cx - 2..=cx - 2, 6..=8, ground(1)); // west skirt
-    t.fill(cx + 2..=cx + 2, 6..=8, ground(1)); // east skirt
+    t.fill(cx - 2..=cx + 2, 4..=10, ground(1)); // base terrace
+    t.fill(cx - 1..=cx + 1, 5..=9, ground(2)); // mid terrace
+    t.fill(cx..=cx, 6..=8, ground(3)); // crown
 }
 
 #[cfg(test)]
@@ -1520,6 +1552,23 @@ mod tests {
             Event::Acted { actor, targets, .. } if *actor == brawler && targets.contains(&assassin)
         ));
         assert!(peeled, "the brawler should attack the diving assassin at least once");
+    }
+
+    /// Target-preference regression: the assassin hunts the frailest *frame*.
+    /// Over a full battle its kit must land on the mage — the lowest-max-HP
+    /// player — not only on whoever the scrum happens to have dinged (it once
+    /// stalked the mage while sneaking, then abandoned it for the fray the
+    /// moment the status dropped).
+    #[test]
+    fn skirmish_assassin_hunts_the_squishiest_frame() {
+        let mut combat = skirmish();
+        let log = combat.run(4000);
+        let (assassin, mage) = (EntityId(5), EntityId(2));
+        let hunted = log.iter().any(|e| matches!(
+            e,
+            Event::Acted { actor, targets, .. } if *actor == assassin && targets.contains(&mage)
+        ));
+        assert!(hunted, "the assassin should attack the mage (lowest max HP) at least once");
     }
 
     /// The 6v5 skirmish resolves and units leave their start positions.
