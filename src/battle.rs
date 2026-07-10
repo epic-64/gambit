@@ -135,7 +135,14 @@ pub struct Entity {
     pub team: Team,
     pub hp: f32,
     pub max_hp: f32,
-    pub mp: u32,
+    /// Current magic points — the resource skills spend (`Skill::cost`). Regens
+    /// `mp_regen` per tick up to `max_mp`. `f32` so future mechanics (drains,
+    /// partial costs, regen auras) can move it in fractions.
+    pub mp: f32,
+    pub max_mp: f32,
+    /// MP restored per tick (capped at `max_mp`). `0.0` == no regen (the
+    /// pre-regen behaviour). Sourced from stats/equipment, never a class.
+    pub mp_regen: f32,
     pub pos: Pos,
     pub statuses: Vec<Status>,
     pub weaknesses: Vec<DamageType>,

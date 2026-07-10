@@ -22,7 +22,7 @@ use std::collections::HashMap;
 
 use macroquad::prelude::*;
 
-use battle::{Entity, EntityId, SkillId, Team, ENTITY_RADIUS};
+use battle::{DamageType, Effect, Entity, EntityId, Pos, Skill, SkillId, Team, ENTITY_RADIUS};
 use combat::{Combat, Event};
 use terrain::{Terrain, Tile3};
 
@@ -30,6 +30,16 @@ use terrain::{Terrain, Tile3};
 const TICK_INTERVAL: f32 = 0.25;
 /// Width reserved on the right for the event log.
 const LOG_W: f32 = 300.0;
+
+/// Lifetime (real seconds) of a ranged projectile — the time it takes to fly
+/// from shooter to target.
+const PROJECTILE_LIFE: f32 = 0.18;
+/// Lifetime (real seconds) of a melee pierce-beam before it fades out.
+const PIERCE_LIFE: f32 = 0.22;
+/// Skills reaching past this many world units read as *ranged* (shoot a
+/// projectile); at or under it they're *melee* (a pierce-line). Gap-closers
+/// (Dash/Charge) are always melee — they close to contact before they hit.
+const MELEE_RANGE: f32 = 3.0;
 
 /// Arena size in world units. Taken from the running battle's bounds so
 /// differently-sized scenario maps all render to fit.
@@ -44,11 +54,12 @@ struct Snap {
     pos: battle::Pos,
     action_bar: f32,
     hp: f32,
+    mp: f32,
 }
 
 impl Snap {
     fn of(e: &Entity) -> Snap {
-        Snap { pos: e.pos, action_bar: e.action_bar, hp: e.hp }
+        Snap { pos: e.pos, action_bar: e.action_bar, hp: e.hp, mp: e.mp }
     }
 }
 
@@ -59,6 +70,75 @@ fn capture(combat: &Combat) -> HashMap<EntityId, Snap> {
 
 fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
+}
+
+/// A transient attack visual, animated in real time (independent of the sim
+/// tick) and dropped once it ages past its `life`. Spawned whenever a skill
+/// resolves (an `Acted` event) — one per target it hits.
+struct Vfx {
+    kind: VfxKind,
+    /// World position the attack originates from (the actor).
+    from: Pos,
+    /// World position it lands on (a target).
+    to: Pos,
+    color: Color,
+    /// Seconds elapsed since it spawned.
+    age: f32,
+    /// Total lifetime in seconds.
+    life: f32,
+}
+
+enum VfxKind {
+    /// A shot that travels from `from` to `to` across its lifetime (ranged skills).
+    Projectile,
+    /// A beam that snaps from `from` through `to` and fades in place (melee attacks).
+    Pierce,
+}
+
+/// Whether a skill reads as ranged (shoots a projectile) rather than melee (a
+/// pierce-line). Gap-closers dash to contact first, so they're melee regardless
+/// of their reach; otherwise anything with more than melee range shoots.
+fn is_ranged(skill: &Skill) -> bool {
+    let gap_closer = skill.effects.iter().any(|e| matches!(e, Effect::Dash { .. }));
+    !gap_closer && skill.range > MELEE_RANGE
+}
+
+/// Tint an attack visual by its element (heals/utility with no damage type get
+/// a restorative green).
+fn skill_color(skill: &Skill) -> Color {
+    match skill.damage_type {
+        Some(DamageType::Physical) => Color::new(0.85, 0.86, 0.92, 1.0),
+        Some(DamageType::Fire) => Color::new(1.0, 0.55, 0.2, 1.0),
+        Some(DamageType::Ice) => Color::new(0.5, 0.85, 1.0, 1.0),
+        Some(DamageType::Lightning) => Color::new(0.95, 0.9, 0.35, 1.0),
+        Some(DamageType::Poison) => Color::new(0.6, 0.85, 0.35, 1.0),
+        Some(DamageType::Holy) => Color::new(1.0, 0.96, 0.72, 1.0),
+        None => Color::new(0.4, 0.9, 0.5, 1.0),
+    }
+}
+
+/// Spawn attack visuals for an `Acted` event: a projectile per target for ranged
+/// skills, a pierce-beam per target for melee. Positions are read from the
+/// current (post-resolution) world, so a dash's beam fires from where it landed.
+fn spawn_attack_vfx(combat: &Combat, ev: &Event, vfx: &mut Vec<Vfx>) {
+    let Event::Acted { actor, skill, targets } = ev else {
+        return;
+    };
+    let s = combat.state.skill(*skill);
+    let from = combat.state.entity(*actor).pos;
+    let color = skill_color(s);
+    let ranged = is_ranged(s);
+    for &t in targets {
+        let to = combat.state.entity(t).pos;
+        vfx.push(Vfx {
+            kind: if ranged { VfxKind::Projectile } else { VfxKind::Pierce },
+            from,
+            to,
+            color,
+            age: 0.0,
+            life: if ranged { PROJECTILE_LIFE } else { PIERCE_LIFE },
+        });
+    }
 }
 
 /// Which screen the viewer is showing: the scenario picker or a live battle.
@@ -89,6 +169,8 @@ async fn main() {
     // State one tick behind the sim, so the draw pass can interpolate toward the
     // current tick and render smoothly instead of jumping 4×/sec.
     let mut prev: HashMap<EntityId, Snap> = HashMap::new();
+    // In-flight attack visuals (projectiles / pierce-beams), aged in real time.
+    let mut vfx: Vec<Vfx> = Vec::new();
 
     loop {
         match screen {
@@ -101,6 +183,7 @@ async fn main() {
                         combat = Some(c);
                         current = i;
                         log.clear();
+                        vfx.clear();
                         acc = 0.0;
                         paused = false;
                         screen = Screen::Playing;
@@ -120,6 +203,7 @@ async fn main() {
                     prev = capture(&c);
                     combat = Some(c);
                     log.clear();
+                    vfx.clear();
                     acc = 0.0;
                     paused = false;
                 }
@@ -141,8 +225,10 @@ async fn main() {
                         // Remember the state entering this tick so the draw pass
                         // can interpolate from it toward the post-tick state.
                         prev = capture(combat);
-                        for ev in combat.tick() {
-                            log.push(format_event(combat, &ev));
+                        let events = combat.tick();
+                        for ev in &events {
+                            log.push(format_event(combat, ev));
+                            spawn_attack_vfx(combat, ev, &mut vfx);
                         }
                     }
                     // Keep the log from growing without bound.
@@ -151,6 +237,14 @@ async fn main() {
                         log.drain(0..log.len() - MAX_LOG);
                     }
                 }
+
+                // Age attack visuals in real time and drop the finished ones.
+                // (Independent of the sim cadence, so they animate smoothly.)
+                let dt = get_frame_time();
+                for v in &mut vfx {
+                    v.age += dt;
+                }
+                vfx.retain(|v| v.age < v.life);
 
                 // --- draw ---
                 let world = combat.state.bounds;
@@ -170,6 +264,10 @@ async fn main() {
                 for e in &combat.state.entities {
                     let p = prev.get(&e.id).copied().unwrap_or_else(|| Snap::of(e));
                     draw_entity(world, e, combat.is_casting(e.id), p, alpha);
+                }
+                // Attack visuals ride on top of the tokens.
+                for v in &vfx {
+                    draw_vfx(world, v);
                 }
                 draw_log(&log);
                 draw_hud(combat, paused, scenarios[current].0);
@@ -302,6 +400,7 @@ fn draw_entity(world: World, e: &Entity, casting: bool, prev: Snap, alpha: f32) 
     let px = lerp(prev.pos.x, e.pos.x, alpha);
     let py = lerp(prev.pos.y, e.pos.y, alpha);
     let hp = lerp(prev.hp, e.hp, alpha);
+    let mp = lerp(prev.mp, e.mp, alpha);
     let action_bar = lerp(prev.action_bar, e.action_bar, alpha);
     let (sx, sy) = world_to_screen(world, px, py);
     let alive = e.is_alive();
@@ -354,15 +453,74 @@ fn draw_entity(world: World, e: &Entity, casting: bool, prev: Snap, alpha: f32) 
     let ab = action_bar.clamp(0.0, 1.0);
     draw_rectangle(bx, ay, bw * ab, bh, Color::new(0.95, 0.85, 0.3, 1.0));
 
-    // Compact status readout (e.g. "Poison x2").
+    // MP bar (thin, just under the action bar). Shows the resource skills spend
+    // and its regen. Only meaningful for MP-users, but drawn for all so the pool
+    // (and any drain/regen on it) is always legible.
+    let mut next_y = ay + bh + 1.0;
+    if e.max_mp > 0.0 {
+        let mh = 4.0;
+        draw_rectangle(bx, next_y, bw, mh, Color::new(0.06, 0.08, 0.16, 1.0));
+        let mp_frac = (mp / e.max_mp).clamp(0.0, 1.0);
+        draw_rectangle(bx, next_y, bw * mp_frac, mh, Color::new(0.3, 0.6, 0.95, 1.0));
+        next_y += mh + 2.0;
+    }
+
+    // Compact status readout (e.g. "Poison x2"), below whatever bars are shown.
     if !e.statuses.is_empty() {
         let s: Vec<String> = e
             .statuses
             .iter()
             .map(|st| format!("{:?}x{}", st.kind, st.stacks))
             .collect();
-        draw_text(&s.join(" "), bx, ay + 16.0, 14.0, Color::new(0.8, 0.7, 0.9, 1.0));
+        draw_text(&s.join(" "), bx, next_y + 12.0, 14.0, Color::new(0.8, 0.7, 0.9, 1.0));
     }
+}
+
+/// Draw one attack visual: a glowing projectile lerping toward its target, or a
+/// melee pierce-beam that snaps through the target and fades.
+fn draw_vfx(world: World, v: &Vfx) {
+    let t = (v.age / v.life).clamp(0.0, 1.0);
+    let scale = world_scale(world);
+    match v.kind {
+        VfxKind::Projectile => {
+            // The head travels from source to target across the projectile's life.
+            let cx = lerp(v.from.x, v.to.x, t);
+            let cy = lerp(v.from.y, v.to.y, t);
+            let (hx, hy) = world_to_screen(world, cx, cy);
+            // A short trail a few frames behind the head.
+            let tail_t = (t - 0.3).max(0.0);
+            let (tx, ty) = world_to_screen(
+                world,
+                lerp(v.from.x, v.to.x, tail_t),
+                lerp(v.from.y, v.to.y, tail_t),
+            );
+            let r = (ENTITY_RADIUS * scale * 0.5).max(4.0);
+            draw_line(tx, ty, hx, hy, r * 0.9, with_alpha(v.color, 0.35));
+            draw_circle(hx, hy, r * 1.8, with_alpha(v.color, 0.25)); // glow
+            draw_circle(hx, hy, r, v.color);
+            draw_circle(hx, hy, r * 0.5, WHITE); // hot core
+        }
+        VfxKind::Pierce => {
+            // A beam from the actor through the target; fades over its life.
+            let a = 1.0 - t;
+            let dx = v.to.x - v.from.x;
+            let dy = v.to.y - v.from.y;
+            let len = (dx * dx + dy * dy).sqrt().max(f32::EPSILON);
+            let (nx, ny) = (dx / len, dy / len);
+            // Extend a little past the target so it reads as piercing through it.
+            let ext = 2.0 * ENTITY_RADIUS;
+            let (sx, sy) = world_to_screen(world, v.from.x, v.from.y);
+            let (ex, ey) = world_to_screen(world, v.to.x + nx * ext, v.to.y + ny * ext);
+            let w = (ENTITY_RADIUS * scale * 0.5).max(3.0);
+            draw_line(sx, sy, ex, ey, w * 1.6, with_alpha(v.color, 0.28 * a)); // glow
+            draw_line(sx, sy, ex, ey, w * 0.7, with_alpha(WHITE, a)); // bright core
+        }
+    }
+}
+
+/// A copy of `c` with its alpha scaled by `a`.
+fn with_alpha(c: Color, a: f32) -> Color {
+    Color::new(c.r, c.g, c.b, c.a * a)
 }
 
 fn draw_log(log: &[String]) {

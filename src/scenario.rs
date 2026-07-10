@@ -12,6 +12,13 @@ use crate::terrain::{Terrain, Tile3};
 /// (skills deal fixed damage) without touching per-entity balance.
 const HP_SCALE: f32 = 3.0;
 
+/// Every spawn's MP pool and per-tick regen (uniform for the demos — a real
+/// game sources these from equipment/stats, per entity). Tuned so a healer roughly
+/// breaks even mending every action cycle and refills fully during any lull, rather
+/// than draining to zero and falling back to plinking.
+const SPAWN_MP: f32 = 100.0;
+const MP_REGEN: f32 = 2.0;
+
 fn push_skill(skills: &mut Vec<Skill>, s: Skill) -> SkillId {
     let id = SkillId(skills.len());
     skills.push(s);
@@ -87,7 +94,9 @@ pub fn demo() -> Combat {
         team,
         hp: hp * HP_SCALE,
         max_hp: hp * HP_SCALE,
-        mp: 100,
+        mp: SPAWN_MP,
+        max_mp: SPAWN_MP,
+        mp_regen: MP_REGEN,
         pos: Pos { x, y },
         statuses: Vec::new(),
         weaknesses: weak.to_vec(),
@@ -174,25 +183,21 @@ pub fn demo() -> Combat {
     let nearest_enemy = || TargetQuery::new(Pool::Enemies).sort(SortKey::Distance, Order::Asc);
 
     let mut move_gambits = HashMap::new();
-    // Melee closes on the nearest foe (A* routes it through the gap). The mage
-    // seeks the high ground to shoot over the wall, kiting only if it can't climb.
-    move_gambits.insert(hero, vec![MoveRule::new(MoveIntent::Toward(nearest_enemy()))]);
-    // Mage: hold the high ground and shoot over the wall while it can see a foe;
-    // only advance (toward the gap) when it has *no* line-of-sight to anyone —
-    // otherwise it stays put and fires instead of wandering off its perch.
-    let sees_a_foe =
-        || Condition::Exists(TargetQuery::new(Pool::Enemies).filter(Filter::HasLineOfSight));
+    // Melee closes on the nearest foe (A* routes it through the gap).
+    move_gambits.insert(hero, MoveGambit::toward(nearest_enemy()));
+    // Mage: a standoff blend — hold ~7 units out, preferring high ground with a
+    // sightline. The three pulls sum into one best perch (the hill crest, which
+    // sees over the wall); no dedicated "seek high ground" rule needed.
     move_gambits.insert(
         mage,
-        vec![
-            MoveRule::new(MoveIntent::SeekHighGround(nearest_enemy())),
-            MoveRule::new(MoveIntent::Toward(nearest_enemy())).when(Condition::Not(Box::new(
-                sees_a_foe(),
-            ))),
-        ],
+        MoveGambit::new(vec![
+            (Term::Near(nearest_enemy(), 7.0), 0.4),
+            (Term::HighGround, 0.6),
+            (Term::SightOf(nearest_enemy()), 1.0),
+        ]),
     );
-    move_gambits.insert(goblin, vec![MoveRule::new(MoveIntent::Toward(nearest_enemy()))]);
-    move_gambits.insert(ogre, vec![MoveRule::new(MoveIntent::Toward(nearest_enemy()))]);
+    move_gambits.insert(goblin, MoveGambit::toward(nearest_enemy()));
+    move_gambits.insert(ogre, MoveGambit::toward(nearest_enemy()));
 
     Combat::new(state, gambits).with_movement(move_gambits)
 }
@@ -234,6 +239,22 @@ fn demo_terrain() -> Terrain {
 /// intent ("focus the weakest foe", "heal the most-hurt ally", "seek high ground").
 pub fn skirmish() -> Combat {
     let mut skills = Vec::new();
+    // Universal basic attack: the swing every weapon grants (authored per-kit
+    // until equipment exists). Free, no cooldown, melee reach — the guarantee
+    // that a cornered unit is never ready-but-toothless. Kits whose own basics
+    // are already always-feasible (Bash, Shot) don't need it.
+    let strike = push_skill(
+        &mut skills,
+        Skill {
+            name: "Strike".into(),
+            cost: 0,
+            range: 2.5,
+            cooldown: 0,
+            cast_time: 0,
+            damage_type: Some(DamageType::Physical),
+            effects: vec![Effect::Damage(8.0)],
+        },
+    );
     // Melee: brawler / tank swing. Short range, so they must close in.
     let bash = push_skill(
         &mut skills,
@@ -374,7 +395,9 @@ pub fn skirmish() -> Combat {
         team,
         hp: hp * HP_SCALE,
         max_hp: hp * HP_SCALE,
-        mp: 100,
+        mp: SPAWN_MP,
+        max_mp: SPAWN_MP,
+        mp_regen: MP_REGEN,
         pos: Pos { x, y },
         statuses: Vec::new(),
         weaknesses: weak.to_vec(),
@@ -393,7 +416,7 @@ pub fn skirmish() -> Combat {
         mk(2, "Mage", Team::Player, 50.0, 0.22, 0.30, 2.0, 11.0, vec![fireball, shot], &[]),
         mk(3, "Cleric", Team::Player, 60.0, 0.24, 0.34, 2.0, 7.0, vec![heal, shot], &[]),
         mk(4, "Ogre", Team::Enemy, 160.0, 0.20, 0.30, 20.5, 7.0, vec![bash], &[DamageType::Fire]),
-        mk(5, "Assassin", Team::Enemy, 55.0, 0.34, 0.50, 22.0, 2.5, vec![dash, backstab], &[]),
+        mk(5, "Assassin", Team::Enemy, 55.0, 0.34, 0.50, 22.0, 2.5, vec![dash, backstab, strike], &[]),
         mk(6, "Raider", Team::Enemy, 62.0, 0.30, 0.36, 22.0, 11.0, vec![shot], &[]),
         mk(7, "Shaman", Team::Enemy, 60.0, 0.24, 0.34, 22.0, 7.0, vec![heal, shot], &[DamageType::Holy]),
     ];
@@ -463,6 +486,8 @@ pub fn skirmish() -> Combat {
     // Assassin dives the weakest player: dash in (gap-close + snare so it can't
     // kite away) when off cooldown, otherwise backstab (poison). Same implicit
     // feasibility split — the dash's 5m range/cooldown vs. the melee backstab.
+    // Strike is the always-feasible floor: with dash AND backstab both on
+    // cooldown, it still swings instead of idling with a full bar.
     gambits.insert(
         EntityId(5),
         Node::context(
@@ -471,6 +496,7 @@ pub fn skirmish() -> Combat {
             vec![
                 Node::act(weakest_enemy(), dash),
                 Node::act(weakest_enemy(), backstab),
+                Node::act(nearest_enemy(), strike),
             ],
         ),
     );
@@ -479,68 +505,31 @@ pub fn skirmish() -> Combat {
     gambits.insert(EntityId(7), healer_gambit(heal, shot));
 
     // --- movement gambits (run every tick, independent of the action bar) ---
-    // How close a foe must get before a squishy ranged unit kites away from it.
-    // Kept *well inside* SHOT_RANGE: the band [KITE_RANGE, SHOT_RANGE] is the
-    // window where a unit stands its ground and fires. A wide band means a unit
-    // spends most of its time shooting, not fleeing — a narrow one (kite radius
-    // near the shot range) collapses into the back-and-forth wobble. This sits
-    // just above the melee reach (Backstab/Bash range 2.5), so a squishy only
-    // peels away once an attacker is right on top of it.
-    const KITE_RANGE: f32 = 3.5;
-    // Effective firing range for the "do I already have a shot?" test below —
-    // matches the Shot skill's range.
-    const SHOT_RANGE: f32 = 9.0;
-    // The nearest foe that has closed inside kite range — the thing to back away
-    // from. Empty (so the rule declines) whenever no foe is that close.
-    let closing_threat = || {
-        TargetQuery::new(Pool::Enemies)
-            .filter(Filter::WithinDistance(KITE_RANGE))
-            .sort(SortKey::Distance, Order::Asc)
-    };
-    // "I can actually hit something from where I stand": a foe in shot range with
-    // line-of-sight. This is the standoff test — when it holds, the unit stops
-    // moving and just fires, which is what breaks the wobble.
-    let has_a_shot = || {
-        Condition::Exists(
-            TargetQuery::new(Pool::Enemies)
-                .filter(Filter::WithinDistance(SHOT_RANGE))
-                .filter(Filter::HasLineOfSight),
-        )
-    };
-    // Ranged units kite a diver; otherwise they reposition *only when they don't
-    // already have a shot* (climb for line-of-sight or close the distance). The
-    // moment a shot lines up they hold and fire — a stable standoff. Repositioning
-    // unconditionally is what caused the back-and-forth wobble: fleeing opened the
-    // gap, then SeekHighGround immediately pulled them back into it.
+    // Ranged units hold a standoff band: `Near(ideal 6.5)` pushes in when out
+    // of shot range (9) and backs off when dived — approach, standoff and
+    // retreat in one smooth term, so there is no kite threshold to wobble on.
+    // High ground and a sightline tip the choice of perch when the distance
+    // term is near its peak.
     let ranged_move = || {
-        vec![
-            // Bounded kite: back away from a foe only while it's inside KITE_RANGE
-            // (the WithinDistance filter is the distance guard). Once the gap
-            // re-opens the query goes empty and this rule declines.
-            MoveRule::new(MoveIntent::Away(closing_threat())),
-            MoveRule::new(MoveIntent::SeekHighGround(nearest_enemy()))
-                .when(Condition::Not(Box::new(has_a_shot()))),
-            MoveRule::new(MoveIntent::Toward(nearest_enemy()))
-                .when(Condition::Not(Box::new(has_a_shot()))),
-        ]
+        MoveGambit::new(vec![
+            (Term::Near(nearest_enemy(), 6.5), 1.0),
+            (Term::HighGround, 0.5),
+            (Term::SightOf(nearest_enemy()), 0.8),
+        ])
     };
 
     let mut move_gambits = HashMap::new();
     // Melee closes on the nearest foe.
-    move_gambits.insert(EntityId(0), vec![MoveRule::new(MoveIntent::Toward(nearest_enemy()))]);
-    move_gambits.insert(EntityId(4), vec![MoveRule::new(MoveIntent::Toward(nearest_enemy()))]);
-    // Ranged attackers (archers, mage) and healers alike seek high ground and
-    // shoot/mend from range, advancing only when they've lost line-of-sight to
-    // everyone. (A pure `Away` kite has no distance guard to express with the
-    // current filters, so it just flees to a corner and stalemates — the
-    // high-ground seek keeps ranged units engaged instead.)
+    move_gambits.insert(EntityId(0), MoveGambit::toward(nearest_enemy()));
+    move_gambits.insert(EntityId(4), MoveGambit::toward(nearest_enemy()));
+    // Ranged attackers (archers, mage) and healers alike hold the standoff band.
     move_gambits.insert(EntityId(1), ranged_move());
     move_gambits.insert(EntityId(2), ranged_move());
     move_gambits.insert(EntityId(6), ranged_move());
     move_gambits.insert(EntityId(3), ranged_move());
     move_gambits.insert(EntityId(7), ranged_move());
     // The assassin dives the squishiest target directly.
-    move_gambits.insert(EntityId(5), vec![MoveRule::new(MoveIntent::Toward(weakest_enemy()))]);
+    move_gambits.insert(EntityId(5), MoveGambit::toward(weakest_enemy()));
 
     Combat::new(state, gambits).with_movement(move_gambits)
 }
@@ -660,6 +649,51 @@ mod tests {
         assert!(acted_skill("Dash"), "the assassin should dash at least once");
         assert!(inflicted(StatusKind::Stun), "a charge should land a stun");
         assert!(inflicted(StatusKind::Snare), "a dash should land a snare");
+    }
+
+    /// Livelock invariant: no unit may sit *ready-but-idle* (`Waited`) for a
+    /// long stretch while going nowhere. Waiting is fine while marching toward
+    /// range (net displacement grows) or as a deliberate Commit choice — but
+    /// "full bar + no action + no net movement, forever" is the wobble-livelock
+    /// signature (the Raider/Shaman bug) and must never come back.
+    #[test]
+    fn no_unit_livelocks_ready_but_idle() {
+        for (label, build) in scenarios() {
+            let mut combat = build();
+            let n = combat.state.entities.len();
+            let mut streak = vec![0u32; n];
+            // Position at the start of each unit's current wait-streak.
+            let mut anchor: Vec<Pos> = combat.state.entities.iter().map(|e| e.pos).collect();
+
+            for _ in 0..2000 {
+                if combat.is_over() {
+                    break;
+                }
+                let events = combat.tick();
+                let mut waited = vec![false; n];
+                for ev in &events {
+                    if let Event::Waited(id) = ev {
+                        waited[id.0] = true;
+                    }
+                }
+                for i in 0..n {
+                    if waited[i] {
+                        streak[i] += 1;
+                        let moved = combat.state.entities[i].pos.dist(anchor[i]);
+                        assert!(
+                            streak[i] < 40 || moved > 1.0,
+                            "{label}: {} livelocked — waited {} consecutive ticks \
+                             with only {moved:.2} units of net movement",
+                            combat.state.entities[i].name,
+                            streak[i],
+                        );
+                    } else {
+                        streak[i] = 0;
+                        anchor[i] = combat.state.entities[i].pos;
+                    }
+                }
+            }
+        }
     }
 
     /// Every scenario in the registry builds and its every entity has a gambit
