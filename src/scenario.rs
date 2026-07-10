@@ -10,7 +10,7 @@ use crate::terrain::{Terrain, Tile3};
 
 /// Global multiplier applied to every entity's spawn HP. Bumps battle length
 /// (skills deal fixed damage) without touching per-entity balance.
-const HP_SCALE: f32 = 3.0;
+const HP_SCALE: f32 = 2.0;
 
 /// Every spawn's MP pool and per-tick regen (uniform for the demos — a real
 /// game sources these from equipment/stats, per entity). Deliberately does NOT
@@ -845,7 +845,7 @@ pub fn skirmish() -> Combat {
         // Blue's sixth: a storm-bearer whose field only pays inside the scrum,
         // so it's built to wade in — bulkier than the casters, with a plain
         // strike as its floor between storms.
-        mk(10, "Tempest", Team::Player, 85.0, 0.26, 0.40, 3.5, 9.5, vec![storm, strike], &[]),
+        // mk(10, "Tempest", Team::Player, 85.0, 0.26, 0.40, 3.5, 9.5, vec![storm, strike], &[]),
     ];
     let terrain = skirmish_terrain();
     let state = BattleState {
