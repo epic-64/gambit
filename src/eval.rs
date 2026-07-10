@@ -8,9 +8,9 @@
 
 use std::cmp::Ordering;
 
-use crate::battle::{BattleState, EntityId, SkillId};
+use crate::battle::{BattleState, EntityId, Pos, SkillId};
 use crate::gambit::{
-    Body, Condition, Filter, GroupMode, Node, Order, Pick, Pool, SortKey, TargetQuery,
+    Body, Condition, Filter, GroupMode, MoveRule, Node, Order, Pick, Pool, SortKey, TargetQuery,
 };
 
 /// The action a character commits to for this turn.
@@ -41,6 +41,82 @@ pub fn decide(root: &Node, actor: EntityId, state: &BattleState) -> Option<Actio
         Outcome::Act(a) => Some(a),
         Outcome::Fall | Outcome::Wait => None,
     }
+}
+
+/// Decide where `actor` drifts this tick from its movement gambit, independent
+/// of the action gambit. Walks the rules in order; the first whose guard holds
+/// and whose intent resolves to a reference target yields a destination.
+///
+/// Returns the actor's *new* position (already bounds-clamped and limited to
+/// one `move_speed` step), or `None` to hold position. Pure — mutation is the
+/// caller's job.
+pub fn decide_move(gambit: &[MoveRule], actor: EntityId, state: &BattleState) -> Option<Pos> {
+    for rule in gambit {
+        let (passed, matched) = eval_condition(&rule.condition, actor, state);
+        if !passed {
+            continue;
+        }
+        // Movement is rangeless: the whole point is to *reach* range, so we
+        // don't pre-filter the reference set by any skill's range.
+        let refs = select(rule.intent.query(), actor, state, &matched, None);
+        let Some(point) = centroid(&refs, state) else {
+            continue; // nothing to move relative to — try the next rule
+        };
+        return Some(step(rule.intent.is_toward(), actor, point, state));
+    }
+    None
+}
+
+/// The midpoint of a set of entities — the reference point a movement intent
+/// steers relative to (handles both single picks and AoE-style `All`).
+fn centroid(ids: &[EntityId], state: &BattleState) -> Option<Pos> {
+    if ids.is_empty() {
+        return None;
+    }
+    let (mut x, mut y) = (0.0f32, 0.0f32);
+    for &id in ids {
+        let p = state.entity(id).pos;
+        x += p.x;
+        y += p.y;
+    }
+    let n = ids.len() as f32;
+    Some(Pos { x: x / n, y: y / n })
+}
+
+/// One `move_speed` step toward or away from `point`, bounds-clamped. Toward
+/// never overshoots (stops on arrival); away always advances a full step.
+fn step(toward: bool, actor: EntityId, point: Pos, state: &BattleState) -> Pos {
+    let a = state.entity(actor);
+    let from = a.pos;
+    let speed = a.move_speed;
+
+    let (mut dx, mut dy) = (point.x - from.x, point.y - from.y);
+    if !toward {
+        dx = -dx;
+        dy = -dy;
+    }
+    let dist = (dx * dx + dy * dy).sqrt();
+
+    let dest = if dist <= f32::EPSILON {
+        // On top of the reference point. Toward → stay; away → break the tie
+        // deterministically so overlapping units can still separate.
+        if toward {
+            from
+        } else {
+            Pos { x: from.x + speed, y: from.y }
+        }
+    } else if toward && dist <= speed {
+        point // would overshoot — land exactly on the target
+    } else {
+        Pos {
+            x: from.x + dx / dist * speed,
+            y: from.y + dy / dist * speed,
+        }
+    };
+    // Keep the destination on the field. Radius-aware bounds and entity-vs-entity
+    // collision are resolved by the caller (`combat::resolve_collisions`), which
+    // has the other entities; here we just clamp the point.
+    state.clamp_pos(dest)
 }
 
 fn eval_node(node: &Node, actor: EntityId, state: &BattleState) -> Outcome {
@@ -282,6 +358,7 @@ mod tests {
                 state: BattleState {
                     entities: Vec::new(),
                     skills: Vec::new(),
+                    bounds: (1000.0, 1000.0),
                 },
             }
         }
@@ -293,6 +370,7 @@ mod tests {
                 cost,
                 range,
                 cooldown: 0,
+                cast_time: 0,
                 damage_type: dt,
                 effects: Vec::new(),
             });
@@ -313,7 +391,8 @@ mod tests {
                 weaknesses: Vec::new(),
                 skills: Vec::new(),
                 cooldowns: HashMap::new(),
-                speed: 0.25,
+                atb_speed: 0.25,
+                move_speed: 0.0,
                 action_bar: 0.0,
             });
             id
@@ -483,6 +562,61 @@ mod tests {
         let action = decide(&rule, hero, &w.state).unwrap();
         assert_eq!(action.skill, panic_skill);
         assert_eq!(action.targets, vec![hero]);
+    }
+
+    // --- movement --------------------------------------------------------
+
+    fn nearest_enemy() -> TargetQuery {
+        TargetQuery::new(Pool::Enemies).sort(SortKey::Distance, Order::Asc)
+    }
+
+    /// `MoveToward` steps one `move_speed` along the line to the target and
+    /// never overshoots it.
+    #[test]
+    fn move_toward_steps_then_stops_on_arrival() {
+        let mut w = World::new();
+        let hero = w.add("hero", Team::Player, 100.0, 0.0);
+        let _enemy = w.add("enemy", Team::Enemy, 100.0, 10.0);
+        w.ent(hero).move_speed = 3.0;
+
+        let gambit = vec![MoveRule::new(MoveIntent::Toward(nearest_enemy()))];
+        let dest = decide_move(&gambit, hero, &w.state).unwrap();
+        assert_eq!(dest.x, 3.0); // one 3-unit step from 0 toward 10
+
+        // Close enough that a full step would overshoot -> land exactly on it.
+        w.ent(hero).pos.x = 8.5;
+        let dest = decide_move(&gambit, hero, &w.state).unwrap();
+        assert_eq!(dest.x, 10.0);
+    }
+
+    /// `MoveAway` steps directly away and is clamped to the arena bounds.
+    #[test]
+    fn move_away_steps_and_clamps_to_bounds() {
+        let mut w = World::new();
+        let hero = w.add("hero", Team::Player, 100.0, 5.0);
+        let _enemy = w.add("enemy", Team::Enemy, 100.0, 10.0);
+        w.ent(hero).move_speed = 2.0;
+
+        let gambit = vec![MoveRule::new(MoveIntent::Away(nearest_enemy()))];
+        let dest = decide_move(&gambit, hero, &w.state).unwrap();
+        assert_eq!(dest.x, 3.0); // fled 2 units away from the enemy at 10
+
+        // Backed against the wall: a step past 0 clamps to the boundary.
+        w.ent(hero).pos.x = 1.0;
+        let dest = decide_move(&gambit, hero, &w.state).unwrap();
+        assert_eq!(dest.x, 0.0);
+    }
+
+    /// A movement rule whose target query is empty holds position (falls to the
+    /// next rule / returns None), rather than moving toward nothing.
+    #[test]
+    fn move_holds_when_no_target() {
+        let mut w = World::new();
+        let hero = w.add("hero", Team::Player, 100.0, 0.0);
+        w.ent(hero).move_speed = 1.0;
+        // No enemies exist.
+        let gambit = vec![MoveRule::new(MoveIntent::Toward(nearest_enemy()))];
+        assert_eq!(decide_move(&gambit, hero, &w.state), None);
     }
 
     /// AoE pick returns every matching target.

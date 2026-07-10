@@ -5,6 +5,11 @@
 
 use std::collections::HashMap;
 
+/// Every entity is a circle of this radius (world units). Uniform for now — a
+/// single knob keeps movement/collision simple; if size ever needs to vary it
+/// should come from equipment, not a per-entity field (see CLAUDE.md).
+pub const ENTITY_RADIUS: f32 = 0.5;
+
 /// Index of an entity within [`BattleState::entities`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct EntityId(pub usize);
@@ -92,6 +97,10 @@ pub struct Skill {
     pub range: f32,
     /// Ticks of cooldown incurred after use.
     pub cooldown: u32,
+    /// Ticks the actor is rooted (Casting) before this skill resolves. `0` means
+    /// it resolves the instant it's chosen; `> 0` opens a vulnerability window —
+    /// the actor stands still and its ATB stops filling until the cast completes.
+    pub cast_time: u32,
     /// Element used for weakness checks, if any.
     pub damage_type: Option<DamageType>,
     /// What resolving this skill does to each target.
@@ -114,7 +123,11 @@ pub struct Entity {
     /// Remaining cooldown per skill; absent == ready.
     pub cooldowns: HashMap<SkillId, u32>,
     /// How fast the action bar fills per tick (ATB rate).
-    pub speed: f32,
+    pub atb_speed: f32,
+    /// World units the entity can drift per tick when moving. Independent of
+    /// `atb_speed`: a unit moves *and* fills its bar every tick — never one or
+    /// the other. `0.0` == stationary (the pre-movement behaviour).
+    pub move_speed: f32,
     /// Action bar in `0.0..=1.0`; the entity acts when it reaches 1.0.
     pub action_bar: f32,
 }
@@ -151,11 +164,30 @@ impl Entity {
 pub struct BattleState {
     pub entities: Vec<Entity>,
     pub skills: Vec<Skill>,
+    /// Playable arena size in world units, `(width, height)`. Movement is
+    /// clamped to `0..=width` × `0..=height` so drifting units can't leave the
+    /// field. (When terrain lands this becomes the tile-grid extent.)
+    pub bounds: (f32, f32),
 }
 
 impl BattleState {
     pub fn entity(&self, id: EntityId) -> &Entity {
         &self.entities[id.0]
+    }
+
+    /// Clamp a position to the arena bounds.
+    pub fn clamp_pos(&self, p: Pos) -> Pos {
+        self.clamp_within(p, 0.0)
+    }
+
+    /// Clamp a *circle's* centre so the whole circle of the given `radius` stays
+    /// inside the arena — the body can't hang over the edge. Degrades gracefully
+    /// (to the centre line) if the arena is narrower than the circle.
+    pub fn clamp_within(&self, p: Pos, radius: f32) -> Pos {
+        Pos {
+            x: p.x.clamp(radius, (self.bounds.0 - radius).max(radius)),
+            y: p.y.clamp(radius, (self.bounds.1 - radius).max(radius)),
+        }
     }
 
     pub fn skill(&self, id: SkillId) -> &Skill {
