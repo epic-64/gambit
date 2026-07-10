@@ -406,15 +406,49 @@ pub fn skirmish() -> Combat {
     gambits.insert(EntityId(7), healer_gambit(heal, shot));
 
     // --- movement gambits (run every tick, independent of the action bar) ---
-    let sees_a_foe =
-        || Condition::Exists(TargetQuery::new(Pool::Enemies).filter(Filter::HasLineOfSight));
-    // Ranged units hold the high ground and shoot over cover; they only advance
-    // toward the gap when they have no line-of-sight to anyone.
+    // How close a foe must get before a squishy ranged unit kites away from it.
+    // Kept *well inside* SHOT_RANGE: the band [KITE_RANGE, SHOT_RANGE] is the
+    // window where a unit stands its ground and fires. A wide band means a unit
+    // spends most of its time shooting, not fleeing — a narrow one (kite radius
+    // near the shot range) collapses into the back-and-forth wobble. This sits
+    // just above the melee reach (Backstab/Bash range 2.5), so a squishy only
+    // peels away once an attacker is right on top of it.
+    const KITE_RANGE: f32 = 3.5;
+    // Effective firing range for the "do I already have a shot?" test below —
+    // matches the Shot skill's range.
+    const SHOT_RANGE: f32 = 9.0;
+    // The nearest foe that has closed inside kite range — the thing to back away
+    // from. Empty (so the rule declines) whenever no foe is that close.
+    let closing_threat = || {
+        TargetQuery::new(Pool::Enemies)
+            .filter(Filter::WithinDistance(KITE_RANGE))
+            .sort(SortKey::Distance, Order::Asc)
+    };
+    // "I can actually hit something from where I stand": a foe in shot range with
+    // line-of-sight. This is the standoff test — when it holds, the unit stops
+    // moving and just fires, which is what breaks the wobble.
+    let has_a_shot = || {
+        Condition::Exists(
+            TargetQuery::new(Pool::Enemies)
+                .filter(Filter::WithinDistance(SHOT_RANGE))
+                .filter(Filter::HasLineOfSight),
+        )
+    };
+    // Ranged units kite a diver; otherwise they reposition *only when they don't
+    // already have a shot* (climb for line-of-sight or close the distance). The
+    // moment a shot lines up they hold and fire — a stable standoff. Repositioning
+    // unconditionally is what caused the back-and-forth wobble: fleeing opened the
+    // gap, then SeekHighGround immediately pulled them back into it.
     let ranged_move = || {
         vec![
-            MoveRule::new(MoveIntent::SeekHighGround(nearest_enemy())),
+            // Bounded kite: back away from a foe only while it's inside KITE_RANGE
+            // (the WithinDistance filter is the distance guard). Once the gap
+            // re-opens the query goes empty and this rule declines.
+            MoveRule::new(MoveIntent::Away(closing_threat())),
+            MoveRule::new(MoveIntent::SeekHighGround(nearest_enemy()))
+                .when(Condition::Not(Box::new(has_a_shot()))),
             MoveRule::new(MoveIntent::Toward(nearest_enemy()))
-                .when(Condition::Not(Box::new(sees_a_foe()))),
+                .when(Condition::Not(Box::new(has_a_shot()))),
         ]
     };
 

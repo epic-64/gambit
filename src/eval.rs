@@ -419,6 +419,7 @@ fn pass_filter(filter: &Filter, id: EntityId, actor: EntityId, state: &BattleSta
         Filter::OnHigherGround => {
             state.elevation_at(e.pos) > state.elevation_at(state.entity(actor).pos)
         }
+        Filter::WithinDistance(d) => state.entity(actor).pos.dist(e.pos) <= *d,
         Filter::Not(inner) => !pass_filter(inner, id, actor, state),
     }
 }
@@ -743,6 +744,32 @@ mod tests {
         w.ent(hero).pos.x = 1.0;
         let dest = decide_move(&gambit, hero, &w.state).unwrap();
         assert_eq!(dest.x, 0.0);
+    }
+
+    /// A `WithinDistance` filter on a flee query makes the kite *bounded*: the
+    /// actor backs away only while the threat is inside the guard distance, and
+    /// holds once the gap is open (so it doesn't flee to a corner and stalemate).
+    #[test]
+    fn within_distance_bounds_the_kite() {
+        let mut w = World::new();
+        let hero = w.add("hero", Team::Player, 100.0, 5.0);
+        let enemy = w.add("enemy", Team::Enemy, 100.0, 9.0); // 4 units away
+        w.ent(hero).move_speed = 1.0;
+
+        // Kite only a foe that has closed inside 6 units.
+        let gambit = vec![MoveRule::new(MoveIntent::Away(
+            TargetQuery::new(Pool::Enemies)
+                .filter(Filter::WithinDistance(6.0))
+                .sort(SortKey::Distance, Order::Asc),
+        ))];
+
+        // Threat is within 6 -> flee away from it (westward, x decreases).
+        let dest = decide_move(&gambit, hero, &w.state).expect("should kite a close threat");
+        assert_eq!(dest.x, 4.0);
+
+        // Push the threat out past 6 units -> query is empty -> hold, don't flee.
+        w.ent(enemy).pos.x = 15.0; // now 10 units away
+        assert_eq!(decide_move(&gambit, hero, &w.state), None);
     }
 
     /// A movement rule whose target query is empty holds position (falls to the

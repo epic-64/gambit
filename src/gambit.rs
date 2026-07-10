@@ -54,6 +54,12 @@ pub enum Filter {
     /// The candidate stands on higher ground than the actor. Never true when
     /// flat. Its negation (`Not(OnHigherGround)`) covers "same-or-lower ground".
     OnHigherGround,
+    /// The candidate is within `d` world-units of the actor. The distance guard
+    /// that makes a *bounded* kite expressible: `MoveAway` a foe filtered by
+    /// `WithinDistance` retreats only while the threat is close, then stops once
+    /// the gap is open (instead of fleeing to a corner). `Not(WithinDistance)`
+    /// covers "at least this far away".
+    WithinDistance(f32),
     Not(Box<Filter>),
 }
 

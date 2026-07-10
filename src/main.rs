@@ -18,6 +18,8 @@ mod nav;
 mod scenario;
 mod terrain;
 
+use std::collections::HashMap;
+
 use macroquad::prelude::*;
 
 use battle::{Entity, EntityId, SkillId, Team, ENTITY_RADIUS};
@@ -32,6 +34,32 @@ const LOG_W: f32 = 300.0;
 /// Arena size in world units. Taken from the running battle's bounds so
 /// differently-sized scenario maps all render to fit.
 type World = (f32, f32);
+
+/// A snapshot of the per-entity values the viewer animates, captured just before
+/// a tick so the draw pass can interpolate from the previous tick to the current
+/// one. The sim still advances in discrete `TICK_INTERVAL` steps; this only
+/// smooths what's *shown*, so nothing here touches the ATB or sim cadence.
+#[derive(Clone, Copy)]
+struct Snap {
+    pos: battle::Pos,
+    action_bar: f32,
+    hp: f32,
+}
+
+impl Snap {
+    fn of(e: &Entity) -> Snap {
+        Snap { pos: e.pos, action_bar: e.action_bar, hp: e.hp }
+    }
+}
+
+/// Snapshot every entity's animated state, keyed by id.
+fn capture(combat: &Combat) -> HashMap<EntityId, Snap> {
+    combat.state.entities.iter().map(|e| (e.id, Snap::of(e))).collect()
+}
+
+fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t
+}
 
 /// Which screen the viewer is showing: the scenario picker or a live battle.
 enum Screen {
@@ -58,6 +86,9 @@ async fn main() {
     let mut log: Vec<String> = Vec::new();
     let mut acc = 0.0f32;
     let mut paused = false;
+    // State one tick behind the sim, so the draw pass can interpolate toward the
+    // current tick and render smoothly instead of jumping 4×/sec.
+    let mut prev: HashMap<EntityId, Snap> = HashMap::new();
 
     loop {
         match screen {
@@ -65,7 +96,9 @@ async fn main() {
                 // Number keys pick a scenario and drop into the battle.
                 for i in 0..scenarios.len() {
                     if digit_key(i).is_some_and(is_key_pressed) {
-                        combat = Some(scenarios[i].1());
+                        let c = scenarios[i].1();
+                        prev = capture(&c);
+                        combat = Some(c);
                         current = i;
                         log.clear();
                         acc = 0.0;
@@ -83,7 +116,9 @@ async fn main() {
                     paused = !paused;
                 }
                 if is_key_pressed(KeyCode::R) {
-                    combat = Some(scenarios[current].1());
+                    let c = scenarios[current].1();
+                    prev = capture(&c);
+                    combat = Some(c);
                     log.clear();
                     acc = 0.0;
                     paused = false;
@@ -103,6 +138,9 @@ async fn main() {
                     while acc >= TICK_INTERVAL && steps < 4 {
                         acc -= TICK_INTERVAL;
                         steps += 1;
+                        // Remember the state entering this tick so the draw pass
+                        // can interpolate from it toward the post-tick state.
+                        prev = capture(combat);
                         for ev in combat.tick() {
                             log.push(format_event(combat, &ev));
                         }
@@ -121,8 +159,17 @@ async fn main() {
                 if let Some(t) = combat.state.terrain.as_ref() {
                     draw_terrain(world, t);
                 }
+                // Interpolate from the previous tick toward the current one so
+                // motion and bars read smoothly. Frozen when paused/over so the
+                // view reflects the true sim state.
+                let alpha = if paused || combat.is_over() {
+                    1.0
+                } else {
+                    (acc / TICK_INTERVAL).clamp(0.0, 1.0)
+                };
                 for e in &combat.state.entities {
-                    draw_entity(world, e, combat.is_casting(e.id));
+                    let p = prev.get(&e.id).copied().unwrap_or_else(|| Snap::of(e));
+                    draw_entity(world, e, combat.is_casting(e.id), p, alpha);
                 }
                 draw_log(&log);
                 draw_hud(combat, paused, scenarios[current].0);
@@ -250,8 +297,13 @@ fn tile_color(t: Tile3) -> Color {
     }
 }
 
-fn draw_entity(world: World, e: &Entity, casting: bool) {
-    let (sx, sy) = world_to_screen(world, e.pos.x, e.pos.y);
+fn draw_entity(world: World, e: &Entity, casting: bool, prev: Snap, alpha: f32) {
+    // Interpolated (rendered) values — the sim itself still lives at e.*.
+    let px = lerp(prev.pos.x, e.pos.x, alpha);
+    let py = lerp(prev.pos.y, e.pos.y, alpha);
+    let hp = lerp(prev.hp, e.hp, alpha);
+    let action_bar = lerp(prev.action_bar, e.action_bar, alpha);
+    let (sx, sy) = world_to_screen(world, px, py);
     let alive = e.is_alive();
     // Draw the token at the shared collision radius, so overlaps (or the lack of
     // them) are visible. A small floor keeps it legible when zoomed out.
@@ -284,7 +336,7 @@ fn draw_entity(world: World, e: &Entity, casting: bool) {
     }
 
     // HP number in the token.
-    draw_text(&format!("{:.0}", e.hp), sx - 9.0, sy + 5.0, 16.0, WHITE);
+    draw_text(&format!("{:.0}", hp), sx - 9.0, sy + 5.0, 16.0, WHITE);
 
     let bw = 54.0;
     let bh = 6.0;
@@ -293,13 +345,13 @@ fn draw_entity(world: World, e: &Entity, casting: bool) {
     // HP bar (above the token).
     let hy = sy - r - 8.0;
     draw_rectangle(bx, hy, bw, bh, Color::new(0.25, 0.05, 0.05, 1.0));
-    let hp_frac = (e.hp / e.max_hp).clamp(0.0, 1.0);
+    let hp_frac = (hp / e.max_hp).clamp(0.0, 1.0);
     draw_rectangle(bx, hy, bw * hp_frac, bh, Color::new(0.35, 0.8, 0.4, 1.0));
 
     // Action bar (below the token).
     let ay = sy + r + 2.0;
     draw_rectangle(bx, ay, bw, bh, Color::new(0.15, 0.15, 0.17, 1.0));
-    let ab = e.action_bar.clamp(0.0, 1.0);
+    let ab = action_bar.clamp(0.0, 1.0);
     draw_rectangle(bx, ay, bw * ab, bh, Color::new(0.95, 0.85, 0.3, 1.0));
 
     // Compact status readout (e.g. "Poison x2").
