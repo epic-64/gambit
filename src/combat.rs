@@ -1,7 +1,9 @@
-//! The combat loop: an ATB (active-time-battle) driver that fills action bars
-//! over discrete ticks, asks each ready entity's gambit what to do via
-//! [`decide`], and resolves the chosen action (damage, healing, statuses,
-//! cooldowns). Engine-agnostic — no Macroquad — so the whole fight is testable.
+//! The combat loop: an ATB (active-time-battle) driver in continuous time
+//! measured in ticks. `step(dt)` integrates the continuous quantities
+//! (movement, bar fill, MP regen) over any fraction of a tick and fires the
+//! discrete phases (statuses, cooldowns, cast resolution, gambit decisions
+//! via [`decide`]) on whole-tick boundaries; `tick()` = `step(1.0)`.
+//! Engine-agnostic — no Macroquad — so the whole fight is testable.
 
 use std::collections::HashMap;
 
@@ -9,7 +11,7 @@ use crate::battle::{
     BattleState, DamageType, EntityId, Effect, Pos, Skill, SkillId, Status, StatusKind, Team,
     ENTITY_RADIUS,
 };
-use crate::eval::{decide, decide_move, Action};
+use crate::eval::{self, decide, Action, MoveIntent};
 use crate::gambit::{MoveGambit, Node};
 
 /// Action-bar value at which an entity gets to act.
@@ -82,7 +84,15 @@ pub struct Combat {
     pub move_gambits: HashMap<EntityId, MoveGambit>,
     /// Casts currently in flight, keyed by caster. Presence == "is casting".
     casts: HashMap<EntityId, Cast>,
+    /// Each mover's movement intent from the latest tick (goal stand point +
+    /// term references), for the viewer's intent lines. Absent while holding
+    /// position, casting, stunned, or dead.
+    move_intents: HashMap<EntityId, MoveIntent>,
+    /// Whole-tick boundaries crossed so far.
     pub time: u32,
+    /// Fractional progress (0..1) toward the next tick boundary — the
+    /// accumulator `step` integrates continuous phases against.
+    frac: f32,
     over: bool,
 }
 
@@ -93,7 +103,9 @@ impl Combat {
             gambits,
             move_gambits: HashMap::new(),
             casts: HashMap::new(),
+            move_intents: HashMap::new(),
             time: 0,
+            frac: 0.0,
             over: false,
         }
     }
@@ -118,6 +130,18 @@ impl Combat {
         self.casts.get(&id).map(|c| c.remaining)
     }
 
+    /// The committed targets of `id`'s in-flight cast, if any — the cast's
+    /// intent, drawn by the viewer while the caster is rooted.
+    pub fn cast_targets(&self, id: EntityId) -> Option<&[EntityId]> {
+        self.casts.get(&id).map(|c| c.action.targets.as_slice())
+    }
+
+    /// `id`'s movement intent from the latest tick, if it moved (see
+    /// [`eval::MoveIntent`]).
+    pub fn move_intent(&self, id: EntityId) -> Option<&MoveIntent> {
+        self.move_intents.get(&id)
+    }
+
     /// Run ticks until the battle ends or `max_ticks` is reached, returning the
     /// full event log. The cap is a safety net against never-ending stalemates.
     pub fn run(&mut self, max_ticks: u32) -> Vec<Event> {
@@ -131,39 +155,74 @@ impl Combat {
         log
     }
 
-    /// Advance the simulation by one tick: apply status effects, tick down
-    /// cooldowns, fill action bars, and let every newly-ready entity act.
+    /// Advance the simulation by exactly one whole tick — the unit all
+    /// durations (cast times, cooldowns, statuses, per-tick DoT) are authored
+    /// in. Equivalent to `step(1.0)`; tests use this for exact, reproducible
+    /// stepping.
     pub fn tick(&mut self) -> Vec<Event> {
+        self.step(1.0)
+    }
+
+    /// Advance the simulation by `dt` *ticks* — fractions welcome; the viewer
+    /// passes real frame time scaled by its tick interval. The sim is the
+    /// single source of truth for rendering (the viewer draws `state`
+    /// verbatim), so smoothness lives *here*, not in the renderer:
+    /// **continuous** quantities (movement, action-bar fill, MP regen)
+    /// integrate over every slice, while the **discrete** phases (status
+    /// pulses, cooldowns, cast resolution, gambit decisions) fire exactly on
+    /// whole-tick boundaries.
+    pub fn step(&mut self, mut dt: f32) -> Vec<Event> {
         let mut events = Vec::new();
-        if self.over {
-            return events;
+        while dt > 0.0 && !self.over {
+            let slice = dt.min(1.0 - self.frac);
+            self.advance_continuous(slice);
+            self.frac += slice;
+            dt -= slice;
+            // Float-tolerant boundary test: many small frame slices may sum
+            // to fractionally under 1.0.
+            if self.frac >= 1.0 - 1e-5 {
+                self.frac = 0.0;
+                self.boundary(&mut events);
+            }
         }
-        self.time += 1;
+        events
+    }
 
-        self.tick_statuses(&mut events);
-        if self.check_over(&mut events) {
-            return events;
-        }
-        self.tick_cooldowns();
-        self.tick_mp();
-
-        // Advance in-flight casts; any that complete resolve (or fizzle) now.
-        self.advance_casts(&mut events);
-        if self.check_over(&mut events) {
-            return events;
-        }
-
-        // Continuous movement: alive, non-casting units drift per their
-        // movement gambit — independent of and concurrent with the ATB.
-        self.tick_movement();
+    /// The between-boundaries phases, each scaled by the tick-fraction `dt`
+    /// that elapsed: drift movement, action-bar fill, and MP regen.
+    fn advance_continuous(&mut self, dt: f32) {
+        // Movement integrates before each boundary, so a caster stays rooted
+        // through the tick its cast resolves on ("rooted until it resolves")
+        // and roots the instant its cast starts.
+        self.tick_movement(dt);
 
         // Fill bars, capped at READY so a waiting entity doesn't accumulate.
         // Casting units are frozen (bar stays at 0 until the cast resolves), and
         // so are stunned ones (their bar is held until the stun wears off).
         for e in &mut self.state.entities {
             if e.is_alive() && !e.is_stunned() && !self.casts.contains_key(&e.id) {
-                e.action_bar = (e.action_bar + e.atb_speed).min(READY);
+                e.action_bar = (e.action_bar + e.atb_speed * dt).min(READY);
             }
+        }
+
+        self.tick_mp(dt);
+    }
+
+    /// A whole-tick boundary: apply status pulses, tick down cooldowns,
+    /// resolve casts, and let every ready entity's gambit decide.
+    fn boundary(&mut self, events: &mut Vec<Event>) {
+        self.time += 1;
+
+        self.tick_statuses(events);
+        if self.check_over(events) {
+            return;
+        }
+        self.tick_cooldowns();
+
+        // Advance in-flight casts; any that complete resolve (or fizzle) now.
+        self.advance_casts(events);
+        if self.check_over(events) {
+            return;
         }
 
         // Everyone at/over the threshold acts this tick, fullest bar first
@@ -225,8 +284,8 @@ impl Combat {
                             skill: action.skill,
                             targets: action.targets.clone(),
                         });
-                        self.apply_effects(actor, &action, &skill, &mut events);
-                        self.check_over(&mut events);
+                        self.apply_effects(actor, &action, &skill, events);
+                        self.check_over(events);
                     }
                 }
                 None => {
@@ -236,12 +295,14 @@ impl Combat {
                 }
             }
         }
-
-        events
     }
 
-    /// Move every alive, non-casting entity one step along its movement gambit.
-    fn tick_movement(&mut self) {
+    /// Drift every alive, non-casting entity along its movement gambit, scaled
+    /// by the tick-fraction `dt`.
+    fn tick_movement(&mut self, dt: f32) {
+        // Intents describe *this* slice's movement only — stale ones (a mover
+        // that died, started casting, or now holds) must not linger.
+        self.move_intents.clear();
         let movers: Vec<EntityId> = self
             .state
             .entities
@@ -257,9 +318,10 @@ impl Combat {
 
         for id in movers {
             if let Some(gambit) = self.move_gambits.get(&id) {
-                if let Some(dest) = decide_move(gambit, id, &self.state) {
-                    let resolved = self.resolve_collisions(id, dest);
+                if let Some(intent) = eval::move_intent(gambit, id, &self.state, dt) {
+                    let resolved = self.resolve_collisions(id, intent.step);
                     self.state.entities[id.0].pos = resolved;
+                    self.move_intents.insert(id, intent);
                 }
             }
         }
@@ -566,10 +628,10 @@ impl Combat {
     /// at `max_mp`. This is what keeps a costed skill (e.g. a healer's mend) from
     /// permanently drying up — and the hook future MP-drain / regen-aura effects
     /// will push against. Casting units regen too (a cast doesn't stop the clock).
-    fn tick_mp(&mut self) {
+    fn tick_mp(&mut self, dt: f32) {
         for e in &mut self.state.entities {
             if e.is_alive() && e.mp_regen != 0.0 {
-                e.mp = (e.mp + e.mp_regen).clamp(0.0, e.max_mp);
+                e.mp = (e.mp + e.mp_regen * dt).clamp(0.0, e.max_mp);
             }
         }
     }
@@ -948,6 +1010,52 @@ mod tests {
         assert!(!combat.is_casting(hero));
         assert_eq!(combat.state.entity(enemy).hp, 70.0);
         assert_eq!(combat.state.entity(hero).mp, 90.0); // not charged twice
+    }
+
+    /// Casting roots a unit that would otherwise drift: no movement from the
+    /// tick after the cast begins through — and including — the tick it
+    /// resolves on. (The drift on the start tick itself is fine: it happened
+    /// before the actor's bar fired.)
+    #[test]
+    fn casting_suppresses_drift_until_resolution() {
+        let mut a = Arena::new();
+        let caster = a.add_at("caster", Team::Player, 100.0, 1.0, 0.0, 1.0);
+        let _enemy = a.add_at("enemy", Team::Enemy, 100.0, 0.0, 20.0, 0.0);
+        let nuke = a.skill(Skill {
+            name: "Nuke".into(),
+            cost: 0,
+            range: 1000.0,
+            cooldown: 5, // so resolving doesn't chain straight into a recast
+            cast_time: 2,
+            damage_type: None,
+            effects: vec![Effect::Damage(10.0)],
+        });
+        a.gambit(caster, Node::act(TargetQuery::new(Pool::Enemies), nuke));
+        a.move_gambit(
+            caster,
+            MoveGambit::toward(TargetQuery::new(Pool::Enemies).sort(SortKey::Distance, Order::Asc)),
+        );
+        let mut combat = a.into_combat();
+
+        combat.tick(); // drifts (not yet casting), then begins the cast
+        assert!(combat.is_casting(caster));
+        let rooted_at = combat.state.entity(caster).pos;
+
+        combat.tick(); // mid-cast: frozen
+        assert!(combat.is_casting(caster));
+        assert_eq!(combat.state.entity(caster).pos, rooted_at);
+
+        combat.tick(); // resolves this tick — still no drift
+        assert!(!combat.is_casting(caster));
+        assert_eq!(combat.state.entity(_enemy).hp, 90.0, "the nuke landed");
+        assert_eq!(
+            combat.state.entity(caster).pos,
+            rooted_at,
+            "no free move on the resolution tick"
+        );
+
+        combat.tick(); // cast done: drifting resumes
+        assert_ne!(combat.state.entity(caster).pos, rooted_at);
     }
 
     /// If every committed target becomes invalid mid-cast (here: killed by an
