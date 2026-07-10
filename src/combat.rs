@@ -176,6 +176,21 @@ struct DashRun {
     budget: f32,
 }
 
+/// Running damage-dealt / healing-done totals for one entity, for the
+/// viewer's DPS/HPS meter. Credited where effects actually land: direct hits,
+/// drains and chains to the acting entity (a reflected spell to the ward
+/// bearer, since the rebound is its cast), DoT and regen pulses to whoever
+/// applied the status, the regen-aura drip to the aura's bearer, and leech
+/// payback to the Lifeleech applier. Damage counts the full landed hit
+/// (overkill included, matching the `Damage` events); healing counts only
+/// what the bar actually gained — a drip on a full-HP target is not a
+/// contribution.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Tally {
+    pub damage: f32,
+    pub healing: f32,
+}
+
 /// Owns the mutable battle plus each entity's gambit tree, and advances time.
 pub struct Combat {
     pub state: BattleState,
@@ -196,6 +211,9 @@ pub struct Combat {
     /// term references), for the viewer's intent lines. Absent while holding
     /// position, casting, stunned, or dead.
     move_intents: HashMap<EntityId, MoveIntent>,
+    /// Cumulative damage/healing credited per entity (see [`Tally`]). Reset
+    /// by rebuilding the `Combat` — a restart starts a fresh meter.
+    pub tallies: HashMap<EntityId, Tally>,
     /// Whole-tick boundaries crossed so far.
     pub time: u32,
     /// Fractional progress (0..1) toward the next tick boundary â€” the
@@ -214,6 +232,7 @@ impl Combat {
             flights: Vec::new(),
             dashes: HashMap::new(),
             move_intents: HashMap::new(),
+            tallies: HashMap::new(),
             time: 0,
             frac: 0.0,
             over: false,
@@ -228,6 +247,33 @@ impl Combat {
 
     pub fn is_over(&self) -> bool {
         self.over
+    }
+
+    /// Battle time elapsed so far, in fractional ticks — the denominator the
+    /// viewer's DPS/HPS meter divides the [`Tally`] totals by.
+    pub fn elapsed_ticks(&self) -> f32 {
+        self.time as f32 + self.frac
+    }
+
+    /// `id`'s running meter totals (zero if it hasn't dealt or healed yet).
+    pub fn tally(&self, id: EntityId) -> Tally {
+        self.tallies.get(&id).copied().unwrap_or_default()
+    }
+
+    fn credit_damage(&mut self, source: Option<EntityId>, amount: f32) {
+        if let Some(src) = source
+            && amount > 0.0
+        {
+            self.tallies.entry(src).or_default().damage += amount;
+        }
+    }
+
+    fn credit_heal(&mut self, source: Option<EntityId>, amount: f32) {
+        if let Some(src) = source
+            && amount > 0.0
+        {
+            self.tallies.entry(src).or_default().healing += amount;
+        }
     }
 
     /// Whether `id` is mid-cast (rooted, ATB frozen).
@@ -350,12 +396,12 @@ impl Combat {
     /// is sampled per slice, so drifting out of the radius cuts the drip that
     /// instant.
     fn tick_auras(&mut self, dt: f32) {
-        let bearers: Vec<(Team, Pos)> = self
+        let bearers: Vec<(EntityId, Team, Pos)> = self
             .state
             .entities
             .iter()
             .filter(|e| e.is_alive() && e.status(StatusKind::RegenAura).is_some())
-            .map(|e| (e.team, e.pos))
+            .map(|e| (e.id, e.team, e.pos))
             .collect();
         if bearers.is_empty() {
             return;
@@ -364,17 +410,28 @@ impl Combat {
             if !e.is_alive() {
                 continue;
             }
-            let covered = bearers
+            let covering: Vec<EntityId> = bearers
                 .iter()
-                .any(|&(team, pos)| team == e.team && pos.dist(e.pos) <= AURA_RADIUS);
-            if covered {
+                .filter(|&&(_, team, pos)| team == e.team && pos.dist(e.pos) <= AURA_RADIUS)
+                .map(|&(id, _, _)| id)
+                .collect();
+            if !covering.is_empty() {
                 // The aura drip is healing too â€” a MortalWound cuts it alike.
                 let mult = if e.status(StatusKind::MortalWound).is_some() {
                     1.0 - WOUND_HEAL_REDUCTION
                 } else {
                     1.0
                 };
-                e.hp = (e.hp + AURA_REGEN_PER_TICK * mult * dt).min(e.max_hp);
+                let gained = (AURA_REGEN_PER_TICK * mult * dt).min(e.max_hp - e.hp);
+                e.hp += gained;
+                // Coverage doesn't stack, so co-covering bearers split the
+                // meter credit for the one drip — only what the bar gained.
+                if gained > 0.0 {
+                    let share = gained / covering.len() as f32;
+                    for id in covering {
+                        self.tallies.entry(id).or_default().healing += share;
+                    }
+                }
             }
         }
     }
@@ -933,15 +990,17 @@ impl Combat {
                     let dealt =
                         self.apply_damage(Some(actor), target, *base, skill.damage_type, events);
                     if dealt > 0.0 {
-                        self.apply_heal(actor, dealt * DRAIN_RATIO, events);
+                        self.apply_heal(Some(actor), actor, dealt * DRAIN_RATIO, events);
                     }
                 }
-                Effect::Heal(amount) => self.apply_heal(target, *amount, events),
+                Effect::Heal(amount) => {
+                    self.apply_heal(Some(actor), target, *amount, events);
+                }
                 Effect::Inflict {
                     kind,
                     stacks,
                     duration,
-                } => self.apply_status(target, *kind, *stacks, *duration, events),
+                } => self.apply_status(actor, target, *kind, *stacks, *duration, events),
                 Effect::Cleanse => self.apply_cleanse(target, events),
                 Effect::DrainMp(amount) => {
                     let t = &mut self.state.entities[target.0];
@@ -1036,6 +1095,9 @@ impl Combat {
         let shielded = e.status(StatusKind::Shield).is_some();
         let exposed = e.status(StatusKind::Exposed).is_some();
         let leeched = e.status(StatusKind::Lifeleech).is_some();
+        // Leech payback is the *applier's* healing contribution (the support
+        // who marked the target), falling back to the attacker it feeds.
+        let leech_src = e.status(StatusKind::Lifeleech).and_then(|s| s.source);
         let target_team = e.team;
         let amount = base
             * if enraged { 1.0 + ENRAGE_BONUS } else { 1.0 }
@@ -1051,6 +1113,9 @@ impl Combat {
             weakness: weak,
             dmg_type,
         });
+        // Meter credit for attributed hits; DoT pulses arrive with no source
+        // and are credited by the caller against the statuses' appliers.
+        self.credit_damage(source, amount);
         if died {
             events.push(Event::Died(target));
             // A kill refreshes the killer's stealth (see
@@ -1066,7 +1131,12 @@ impl Combat {
         if leeched {
             if let Some(attacker) = source {
                 if self.state.entity(attacker).team != target_team {
-                    self.apply_heal(attacker, LEECH_HEAL_ON_HIT, events);
+                    self.apply_heal(
+                        leech_src.or(Some(attacker)),
+                        attacker,
+                        LEECH_HEAL_ON_HIT,
+                        events,
+                    );
                 }
             }
         }
@@ -1124,10 +1194,19 @@ impl Combat {
         }
     }
 
-    fn apply_heal(&mut self, target: EntityId, amount: f32, events: &mut Vec<Event>) {
+    /// Heal the target, crediting `source`'s meter tally (None for regen
+    /// pulses, which the caller credits per status applier). Returns the HP
+    /// the bar actually gained — the overheal-free amount the meter counts.
+    fn apply_heal(
+        &mut self,
+        source: Option<EntityId>,
+        target: EntityId,
+        amount: f32,
+        events: &mut Vec<Event>,
+    ) -> f32 {
         let e = &mut self.state.entities[target.0];
         if !e.is_alive() {
-            return;
+            return 0.0;
         }
         // A grievous wound cuts what actually arrives; the event reports the
         // reduced amount (what the bar really gained).
@@ -1136,12 +1215,16 @@ impl Combat {
         } else {
             amount
         };
+        let gained = amount.min(e.max_hp - e.hp);
         e.hp = (e.hp + amount).min(e.max_hp);
         events.push(Event::Heal { target, amount });
+        self.credit_heal(source, gained);
+        gained
     }
 
     fn apply_status(
         &mut self,
+        source: EntityId,
         target: EntityId,
         kind: StatusKind,
         stacks: u32,
@@ -1165,11 +1248,15 @@ impl Combat {
                 s.stacks += stacks;
             }
             s.duration = s.duration.max(duration);
+            // A hand-placed status gains an attributable source on the first
+            // real application; otherwise the first applier keeps the credit.
+            s.source = s.source.or(Some(source));
         } else {
             e.statuses.push(Status {
                 kind,
                 stacks,
                 duration,
+                source: Some(source),
             });
         }
         events.push(Event::Inflicted {
@@ -1186,21 +1273,38 @@ impl Combat {
             if !self.state.entities[i].is_alive() {
                 continue;
             }
-            let (mut dmg, mut heal) = (0.0f32, 0.0f32);
+            // Per-status shares, so the aggregated pulse can be credited back
+            // to each applier's meter tally in proportion.
+            let mut dmg_shares: Vec<(Option<EntityId>, f32)> = Vec::new();
+            let mut heal_shares: Vec<(Option<EntityId>, f32)> = Vec::new();
             for s in &self.state.entities[i].statuses {
                 match s.kind {
-                    StatusKind::Poison => dmg += POISON_PER_STACK * s.stacks as f32,
-                    StatusKind::Burn => dmg += BURN_PER_STACK * s.stacks as f32,
-                    StatusKind::Regen => heal += REGEN_PER_STACK * s.stacks as f32,
+                    StatusKind::Poison => {
+                        dmg_shares.push((s.source, POISON_PER_STACK * s.stacks as f32))
+                    }
+                    StatusKind::Burn => {
+                        dmg_shares.push((s.source, BURN_PER_STACK * s.stacks as f32))
+                    }
+                    StatusKind::Regen => {
+                        heal_shares.push((s.source, REGEN_PER_STACK * s.stacks as f32))
+                    }
                     _ => {}
                 }
             }
+            let dmg: f32 = dmg_shares.iter().map(|&(_, a)| a).sum();
+            let heal: f32 = heal_shares.iter().map(|&(_, a)| a).sum();
             let id = self.state.entities[i].id;
             if dmg > 0.0 {
-                self.apply_damage(None, id, dmg, None, events);
+                let dealt = self.apply_damage(None, id, dmg, None, events);
+                for (src, base) in dmg_shares {
+                    self.credit_damage(src, dealt * base / dmg);
+                }
             }
             if heal > 0.0 && self.state.entities[i].is_alive() {
-                self.apply_heal(id, heal, events);
+                let gained = self.apply_heal(None, id, heal, events);
+                for (src, base) in heal_shares {
+                    self.credit_heal(src, gained * base / heal);
+                }
             }
 
             // Age statuses and drop the expired ones.
@@ -1582,6 +1686,7 @@ mod tests {
             kind: StatusKind::MortalWound,
             stacks: 1,
             duration: 2,
+            source: None,
         });
         let mend = a.skill(Skill {
             name: "Mend".into(),
@@ -1695,6 +1800,7 @@ mod tests {
             kind: StatusKind::Sneak,
             stacks: 1,
             duration: 10,
+            source: None,
         });
         let hit = a.skill(damage_skill("Hit", 20.0, None, 0));
         a.gambit(brute, Node::act(TargetQuery::new(Pool::Enemies), hit));
@@ -1717,6 +1823,7 @@ mod tests {
             kind: StatusKind::Sneak,
             stacks: 1,
             duration: 10,
+            source: None,
         });
         let hit = a.skill(damage_skill("Hit", 20.0, None, 0));
         a.gambit(rogue, Node::act(TargetQuery::new(Pool::Enemies), hit));
@@ -1749,6 +1856,7 @@ mod tests {
             kind: StatusKind::Sneak,
             stacks: 1,
             duration: 20,
+            source: None,
         });
         combat.run(5); // plenty of time for the shot to arrive
 
@@ -1785,6 +1893,7 @@ mod tests {
             kind: StatusKind::Sneak,
             stacks: 1,
             duration: 10,
+            source: None,
         });
         combat.tick();
         let log = combat.tick(); // cast completes â€” into thin air
@@ -1808,6 +1917,7 @@ mod tests {
             kind: StatusKind::SpellWard,
             stacks: 1,
             duration: 10,
+            source: None,
         });
         let bolt = a.skill(damage_skill("Bolt", 20.0, Some(DamageType::Fire), 0));
         a.gambit(caster, Node::act(TargetQuery::new(Pool::Enemies), bolt));
@@ -1838,6 +1948,7 @@ mod tests {
             kind: StatusKind::SpellWard,
             stacks: 1,
             duration: 10,
+            source: None,
         });
         let shot = a.skill(damage_skill("Shot", 20.0, Some(DamageType::Physical), 0));
         a.gambit(archer, Node::act(TargetQuery::new(Pool::Enemies), shot));
@@ -2477,7 +2588,7 @@ mod tests {
         a.ent(enemy).pos.y = 5.0;
         a.ent(hero)
             .statuses
-            .push(Status { kind: StatusKind::Stun, stacks: 1, duration: 3 });
+            .push(Status { kind: StatusKind::Stun, stacks: 1, duration: 3, source: None });
         let jab = a.skill(damage_skill("Jab", 20.0, None, 0));
         a.gambit(hero, Node::act(TargetQuery::new(Pool::Enemies), jab));
         a.move_gambit(
@@ -2629,7 +2740,7 @@ mod tests {
         let tank = a.add("tank", Team::Enemy, 100.0, 0.0);
         a.ent(tank)
             .statuses
-            .push(Status { kind: StatusKind::Shield, stacks: 1, duration: 10 });
+            .push(Status { kind: StatusKind::Shield, stacks: 1, duration: 10, source: None });
         let hit = a.skill(damage_skill("Hit", 20.0, None, 0));
         a.gambit(hero, Node::act(TargetQuery::new(Pool::Enemies), hit));
 
@@ -2648,7 +2759,7 @@ mod tests {
         let victim = a.add("victim", Team::Enemy, 100.0, 0.0);
         a.ent(bruiser)
             .statuses
-            .push(Status { kind: StatusKind::Enrage, stacks: 1, duration: 10 });
+            .push(Status { kind: StatusKind::Enrage, stacks: 1, duration: 10, source: None });
         a.ent(victim).weaknesses.push(DamageType::Fire);
         let burn = a.skill(damage_skill("Burn", 10.0, Some(DamageType::Fire), 0));
         a.gambit(bruiser, Node::act(TargetQuery::new(Pool::Enemies), burn));
@@ -2669,7 +2780,7 @@ mod tests {
         let victim = a.add("victim", Team::Enemy, 100.0, 0.0);
         a.ent(victim)
             .statuses
-            .push(Status { kind: StatusKind::Exposed, stacks: 1, duration: 10 });
+            .push(Status { kind: StatusKind::Exposed, stacks: 1, duration: 10, source: None });
         let hit = a.skill(damage_skill("Hit", 20.0, None, 0));
         a.gambit(hero, Node::act(TargetQuery::new(Pool::Enemies), hit));
 
@@ -2690,11 +2801,11 @@ mod tests {
         let mark = a.add("mark", Team::Enemy, 100.0, 0.0);
         a.ent(mark)
             .statuses
-            .push(Status { kind: StatusKind::Lifeleech, stacks: 1, duration: 10 });
+            .push(Status { kind: StatusKind::Lifeleech, stacks: 1, duration: 10, source: None });
         // A poison pulse also damages the mark this tick — it must leech nothing.
         a.ent(mark)
             .statuses
-            .push(Status { kind: StatusKind::Poison, stacks: 1, duration: 10 });
+            .push(Status { kind: StatusKind::Poison, stacks: 1, duration: 10, source: None });
         let hit = a.skill(damage_skill("Hit", 10.0, None, 0));
         a.gambit(hero, Node::act(TargetQuery::new(Pool::Enemies), hit));
 
@@ -2716,11 +2827,11 @@ mod tests {
         let ally = a.add("ally", Team::Player, 100.0, 0.0);
         let _enemy = a.add("enemy", Team::Enemy, 100.0, 0.0);
         for kind in [StatusKind::Poison, StatusKind::Snare] {
-            a.ent(ally).statuses.push(Status { kind, stacks: 2, duration: 10 });
+            a.ent(ally).statuses.push(Status { kind, stacks: 2, duration: 10, source: None });
         }
         a.ent(ally)
             .statuses
-            .push(Status { kind: StatusKind::Regen, stacks: 1, duration: 10 });
+            .push(Status { kind: StatusKind::Regen, stacks: 1, duration: 10, source: None });
         let purify = a.skill(Skill {
             name: "Purify".into(),
             cost: 0,
@@ -2803,7 +2914,7 @@ mod tests {
         let foe = a.add_at("foe", Team::Enemy, 50.0, 0.0, 6.0, 0.0); // in the field, wrong team
         a.ent(chanter)
             .statuses
-            .push(Status { kind: StatusKind::RegenAura, stacks: 1, duration: 100 });
+            .push(Status { kind: StatusKind::RegenAura, stacks: 1, duration: 100, source: None });
 
         let mut combat = a.into_combat();
         combat.run(4);
@@ -2826,7 +2937,7 @@ mod tests {
             let victim = a.add_at("victim", Team::Enemy, 100.0, 0.0, attacker_x + 1.0, 0.0);
             a.ent(chanter)
                 .statuses
-                .push(Status { kind: StatusKind::MightAura, stacks: 1, duration: 100 });
+                .push(Status { kind: StatusKind::MightAura, stacks: 1, duration: 100, source: None });
             let hit = a.skill(damage_skill("Hit", 20.0, None, 0));
             a.gambit(hitter, Node::act(TargetQuery::new(Pool::Enemies), hit));
 
@@ -2928,7 +3039,7 @@ mod tests {
         a.ent(enemy).pos.y = 5.0; // same row -> drift is purely along x
         a.ent(hero)
             .statuses
-            .push(Status { kind: StatusKind::Snare, stacks: 1, duration: 5 });
+            .push(Status { kind: StatusKind::Snare, stacks: 1, duration: 5, source: None });
         a.move_gambit(
             hero,
             MoveGambit::toward(
@@ -2943,5 +3054,93 @@ mod tests {
         // 2.0 * (1 - 0.6) = 0.8 units this tick, not the full 2.0.
         let moved = combat.state.entity(hero).pos.x - x0;
         assert!((moved - 0.8).abs() < 1e-3, "snared drift should be 0.8, got {moved}");
+    }
+
+    /// The meter credits a landed hit to its attacker and a cast heal to its
+    /// healer — with overheal dropped: only what the bar actually gained counts.
+    #[test]
+    fn meter_credits_hits_to_attackers_and_effective_heals_to_healers() {
+        let mut a = Arena::new();
+        let hero = a.add("hero", Team::Player, 70.0, 1.0); // 30 HP missing
+        let medic = a.add("medic", Team::Player, 100.0, 1.0);
+        let enemy = a.add("enemy", Team::Enemy, 100.0, 0.0);
+        let hit = a.skill(damage_skill("Hit", 20.0, None, 0));
+        let mend = a.skill(Skill {
+            name: "Mend".into(),
+            cost: 0,
+            range: 1000.0,
+            cooldown: 0,
+            cast_time: 0,
+            damage_type: None,
+            effects: vec![Effect::Heal(50.0)],
+        });
+        a.gambit(hero, Node::act(TargetQuery::new(Pool::Enemies), hit));
+        a.gambit(
+            medic,
+            Node::act(TargetQuery::new(Pool::Allies).sort(SortKey::Hp, Order::Asc), mend),
+        );
+
+        let mut combat = a.into_combat();
+        combat.tick();
+
+        assert_eq!(combat.tally(hero).damage, 20.0);
+        // The 50-point mend only had 30 HP of wound to fill.
+        assert_eq!(combat.tally(medic).healing, 30.0);
+        assert_eq!(combat.tally(enemy), Tally::default());
+    }
+
+    /// DoT pulses credit the status's applier tick after tick — the debuffer's
+    /// contribution keeps counting long after the cast itself.
+    #[test]
+    fn meter_credits_dot_pulses_to_the_applier() {
+        let mut a = Arena::new();
+        let hero = a.add("hero", Team::Player, 100.0, 1.0);
+        let _enemy = a.add("enemy", Team::Enemy, 100.0, 0.0);
+        let venom = a.skill(Skill {
+            name: "Venom".into(),
+            cost: 0,
+            range: 1000.0,
+            cooldown: 99,
+            cast_time: 0,
+            damage_type: None,
+            effects: vec![Effect::Inflict {
+                kind: StatusKind::Poison,
+                stacks: 2,
+                duration: 3,
+            }],
+        });
+        a.gambit(hero, Node::act(TargetQuery::new(Pool::Enemies), venom));
+
+        let mut combat = a.into_combat();
+        combat.run(10);
+
+        // 2 stacks * 3.0 per stack * 3 ticks, all credited to the poisoner.
+        assert_eq!(combat.tally(hero).damage, 18.0);
+    }
+
+    /// The regen-aura drip credits the bearer — but only the HP teammates
+    /// actually gained; covering a full-HP ally contributes nothing.
+    #[test]
+    fn meter_credits_aura_drip_to_the_bearer() {
+        let mut a = Arena::new();
+        let chanter = a.add("chanter", Team::Player, 100.0, 0.0);
+        let _hurt = a.add("hurt", Team::Player, 50.0, 0.0);
+        let _full = a.add("full", Team::Player, 100.0, 0.0);
+        let _foe = a.add("foe", Team::Enemy, 100.0, 0.0);
+        a.ent(chanter).statuses.push(Status {
+            kind: StatusKind::RegenAura,
+            stacks: 1,
+            duration: 100,
+            source: None,
+        });
+
+        let mut combat = a.into_combat();
+        for _ in 0..4 {
+            combat.tick();
+        }
+
+        // Only the hurt teammate's drip lands: 0.75 x 4 ticks. The bearer and
+        // the full ally are covered too but gain nothing.
+        assert!((combat.tally(chanter).healing - 3.0).abs() < 1e-3);
     }
 }

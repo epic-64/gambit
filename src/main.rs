@@ -580,7 +580,8 @@ async fn main() {
                     draw_vfx(&view, v);
                 }
                 draw_flights(&view, combat);
-                draw_log(&log);
+                let meter_top = draw_meter(combat);
+                draw_log(&log, meter_top);
                 draw_hud(combat, paused, scenarios[current].0);
             }
             Screen::Editor => {
@@ -1500,13 +1501,81 @@ fn with_alpha(c: Color, a: f32) -> Color {
     Color::new(c.r, c.g, c.b, c.a * a)
 }
 
-fn draw_log(log: &[String]) {
+/// Bottom of the right column: a DPS/HPS meter ranking every entity by the
+/// damage dealt / healing done credited in `combat.tallies`, averaged over
+/// the battle so far (real seconds). Returns its top edge so the log above
+/// knows where to stop.
+fn draw_meter(combat: &Combat) -> f32 {
+    let x = screen_width() - LOG_W + 10.0;
+    let w = LOG_W - 20.0;
+    let secs = (combat.elapsed_ticks() * TICK_INTERVAL).max(TICK_INTERVAL);
+
+    let mut rows: Vec<(&Entity, f32, f32)> = combat
+        .state
+        .entities
+        .iter()
+        .map(|e| {
+            let t = combat.tally(e.id);
+            (e, t.damage / secs, t.healing / secs)
+        })
+        .collect();
+    // Rank by damage output, healing as the tiebreak — the classic meter view.
+    rows.sort_by(|a, b| {
+        b.1.total_cmp(&a.1).then(b.2.total_cmp(&a.2))
+    });
+    let max_dps = rows.iter().map(|r| r.1).fold(0.0f32, f32::max);
+    let max_hps = rows.iter().map(|r| r.2).fold(0.0f32, f32::max);
+
+    let line_h = 18.0;
+    let header_h = 40.0;
+    let top = screen_height() - (header_h + line_h * rows.len() as f32 + 8.0);
+
+    draw_line(x - 4.0, top, x + w + 4.0, top, 1.0, Color::new(0.3, 0.32, 0.36, 1.0));
+    draw_text("DPS / HPS", x, top + 20.0, 18.0, WHITE);
+
+    // Column layout: name | damage bar | healing bar.
+    let name_w = 88.0;
+    let gap = 6.0;
+    let dps_x = x + name_w;
+    let dps_w = (w - name_w - gap) * 0.55;
+    let hps_x = dps_x + dps_w + gap;
+    let hps_w = w - name_w - gap - dps_w;
+    let dim = Color::new(0.55, 0.57, 0.6, 1.0);
+    draw_text("dmg/s", dps_x, top + 34.0, 13.0, dim);
+    draw_text("heal/s", hps_x, top + 34.0, 13.0, dim);
+
+    let bar = |bx: f32, by: f32, bw: f32, fill: f32, color: Color, value: f32, alpha: f32| {
+        draw_rectangle(bx, by - 11.0, bw, 14.0, with_alpha(Color::new(0.16, 0.17, 0.2, 1.0), alpha));
+        if fill > 0.0 {
+            draw_rectangle(bx, by - 11.0, bw * fill.clamp(0.0, 1.0), 14.0, with_alpha(color, alpha));
+        }
+        let label = format!("{value:.1}");
+        let tw = measure_text(&label, None, 13, 1.0).width;
+        draw_text(&label, bx + bw - tw - 3.0, by, 13.0, with_alpha(WHITE, alpha));
+    };
+
+    let mut y = top + header_h + 12.0;
+    for (e, dps, hps) in rows {
+        // The dead keep their totals on the board, just dimmed.
+        let alpha = if e.is_alive() { 1.0 } else { 0.4 };
+        let name: String = e.name.chars().take(10).collect();
+        draw_text(&name, x, y, 15.0, with_alpha(team_color(e.team), alpha));
+        let dps_fill = if max_dps > 0.0 { dps / max_dps } else { 0.0 };
+        let hps_fill = if max_hps > 0.0 { hps / max_hps } else { 0.0 };
+        bar(dps_x, y, dps_w - gap, dps_fill, Color::new(0.75, 0.38, 0.22, 0.9), dps, alpha);
+        bar(hps_x, y, hps_w, hps_fill, Color::new(0.3, 0.65, 0.35, 0.9), hps, alpha);
+        y += line_h;
+    }
+    top
+}
+
+fn draw_log(log: &[String], bottom: f32) {
     let x = screen_width() - LOG_W + 10.0;
     draw_text("Combat log", x, 30.0, 22.0, WHITE);
 
     let line_h = 18.0;
     let top = 52.0;
-    let rows = ((screen_height() - top) / line_h) as usize;
+    let rows = ((bottom - top).max(0.0) / line_h) as usize;
     let start = log.len().saturating_sub(rows);
     let mut y = top;
     for line in &log[start..] {
