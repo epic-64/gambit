@@ -301,6 +301,40 @@ pub fn skirmish() -> Combat {
             effects: vec![Effect::Damage(20.0)],
         },
     );
+    // Mage's heavy nuke: a single-target ice lance — the biggest hit in the
+    // game, bought with the longest commit (a 5-tick rooted cast, past even
+    // Fireball's 3) and a deep MP bite. Five ticks is long enough for the fight
+    // to move: the mark can die to focus fire (fizzle) or a diver can be on the
+    // mage before it releases — the risk that prices the payload.
+    let ice_lance = push_skill(
+        &mut skills,
+        Skill {
+            name: "Ice Lance".into(),
+            cost: 35,
+            range: 100.0,
+            cooldown: 14,
+            cast_time: 5,
+            damage_type: Some(DamageType::Ice),
+            effects: vec![Effect::Damage(34.0)],
+        },
+    );
+    // Archer's aimed shot: a 4-tick draw for roughly 2.5× a plink Shot. Range
+    // 12 (not map-wide) so a mark that walks away mid-aim fizzles it — and the
+    // gambit only takes the shot when no foe is within melee threat range,
+    // because rooting for a full second with an assassin in your face is how
+    // archers die.
+    let snipe = push_skill(
+        &mut skills,
+        Skill {
+            name: "Snipe".into(),
+            cost: 20,
+            range: 12.0,
+            cooldown: 16,
+            cast_time: 4,
+            damage_type: Some(DamageType::Physical),
+            effects: vec![Effect::Damage(26.0)],
+        },
+    );
     // Healer's mend: map-wide range, instant. Healers also carry a Shot so they
     // still contribute (and can't stalemate) when nobody needs mending. The cost
     // outruns regen at the cooldown cadence, so sustained mending drains the
@@ -519,12 +553,12 @@ pub fn skirmish() -> Combat {
     let entities = vec![
         // Players muster on the west edge; the enemy on the east.
         mk(0, "Brawler", Team::Player, 150.0, 0.26, 0.42, 3.5, 7.0, vec![charge, bash], &[]),
-        mk(1, "Archer", Team::Player, 65.0, 0.30, 0.36, 2.0, 2.5, vec![shot], &[]),
-        mk(2, "Mage", Team::Player, 50.0, 0.22, 0.30, 2.0, 11.0, vec![fireball, shot], &[]),
+        mk(1, "Archer", Team::Player, 65.0, 0.30, 0.36, 2.0, 2.5, vec![snipe, shot], &[]),
+        mk(2, "Mage", Team::Player, 50.0, 0.22, 0.30, 2.0, 11.0, vec![ice_lance, fireball, shot], &[]),
         mk(3, "Cleric", Team::Player, 60.0, 0.24, 0.34, 2.0, 7.0, vec![prayer, heal, barrier, purify, shot], &[]),
         mk(4, "Ogre", Team::Enemy, 160.0, 0.20, 0.30, 20.5, 7.0, vec![war_cry, bash], &[DamageType::Fire]),
         mk(5, "Assassin", Team::Enemy, 55.0, 0.34, 0.50, 22.0, 2.5, vec![dash, reap, backstab, strike], &[]),
-        mk(6, "Raider", Team::Enemy, 62.0, 0.30, 0.36, 22.0, 11.0, vec![shot], &[]),
+        mk(6, "Raider", Team::Enemy, 62.0, 0.30, 0.36, 22.0, 11.0, vec![snipe, shot], &[]),
         mk(7, "Shaman", Team::Enemy, 60.0, 0.24, 0.34, 22.0, 7.0, vec![heal, siphon, shot], &[DamageType::Holy]),
     ];
     let terrain = skirmish_terrain();
@@ -603,16 +637,41 @@ pub fn skirmish() -> Combat {
             ],
         ),
     );
-    // Archers focus-fire the weakest foe to secure kills.
-    gambits.insert(EntityId(1), Node::act(weakest_enemy(), shot));
-    gambits.insert(EntityId(6), Node::act(weakest_enemy(), shot));
-    // Mage: nuke the toughest foe (the fire-weak Ogre) if it can, else plink.
+    // Archers: take the long aimed shot only while nobody threatens them up
+    // close (rooting for the 4-tick draw with a foe in melee reach is how
+    // archers die — the guard is the player-authored counterpart of the
+    // engine's implicit feasibility), otherwise focus-fire plinks at the
+    // weakest foe to secure kills.
+    let no_foe_in_my_face = || {
+        Condition::Not(Box::new(Condition::Exists(
+            TargetQuery::new(Pool::Enemies).filter(Filter::WithinDistanceOf(
+                Box::new(TargetQuery::new(Pool::Myself)),
+                4.0,
+            )),
+        )))
+    };
+    let archer_gambit = || {
+        Node::context(
+            Condition::Always,
+            GroupMode::Fallthrough,
+            vec![
+                Node::act(weakest_enemy(), snipe).when(no_foe_in_my_face()),
+                Node::act(weakest_enemy(), shot),
+            ],
+        )
+    };
+    gambits.insert(EntityId(1), archer_gambit());
+    gambits.insert(EntityId(6), archer_gambit());
+    // Mage: open the biggest commit on the biggest target — lance the toughest
+    // foe, fall back to fireball (which the fire-weak Ogre dreads) while the
+    // lance recharges, and plink when the MP pool runs dry.
     gambits.insert(
         EntityId(2),
         Node::context(
             Condition::Always,
             GroupMode::Fallthrough,
             vec![
+                Node::act(toughest_enemy(), ice_lance),
                 Node::act(toughest_enemy(), fireball),
                 Node::act(nearest_enemy(), shot),
             ],
@@ -894,6 +953,8 @@ mod tests {
         assert!(used("Siphon"), "the shaman should weave its drain");
         assert!(used("Reap"), "the assassin should execute a hurt target");
         assert!(used("Prayer"), "the cleric should group-heal a bleeding party");
+        assert!(used("Snipe"), "an archer should take the aimed shot while unthreatened");
+        assert!(used("Ice Lance"), "the mage should commit to its heavy nuke");
     }
 
     /// Livelock invariant: no unit may sit *ready-but-idle* (`Waited`) for a
