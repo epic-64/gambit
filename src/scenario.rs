@@ -13,9 +13,10 @@ use crate::terrain::{Terrain, Tile3};
 const HP_SCALE: f32 = 3.0;
 
 /// Every spawn's MP pool and per-tick regen (uniform for the demos — a real
-/// game sources these from equipment/stats, per entity). Tuned so a healer roughly
-/// breaks even mending every action cycle and refills fully during any lull, rather
-/// than draining to zero and falling back to plinking.
+/// game sources these from equipment/stats, per entity). Deliberately does NOT
+/// cover ability costs at their cooldown cadence: the pool is a burst budget
+/// that drains over a long fight, forcing units back onto their free basics
+/// between windows. Abilities being rationed (not spammed at will) is the point.
 const SPAWN_MP: f32 = 100.0;
 const MP_REGEN: f32 = 2.0;
 
@@ -55,25 +56,28 @@ pub fn demo() -> Combat {
     );
     // Long range but a 3-tick cast: the mage roots to fire it, which is the
     // window a chaser exploits (and a kited-away target can dodge by fizzle).
+    // Expensive + a long cooldown: a nuke it commits to, not a rotation filler.
     let fireball = push_skill(
         &mut skills,
         Skill {
             name: "Fireball".into(),
-            cost: 12,
+            cost: 30,
             range: 100.0,
-            cooldown: 3,
+            cooldown: 8,
             cast_time: 3,
             damage_type: Some(DamageType::Fire),
             effects: vec![Effect::Damage(18.0)],
         },
     );
+    // Costs more than regen returns per cooldown, so sustained healing drains
+    // the pool — mending is triage, not a faucet.
     let heal = push_skill(
         &mut skills,
         Skill {
             name: "Heal".into(),
-            cost: 10,
+            cost: 25,
             range: 100.0,
-            cooldown: 0,
+            cooldown: 6,
             cast_time: 0,
             damage_type: None,
             effects: vec![Effect::Heal(40.0)],
@@ -282,43 +286,47 @@ pub fn skirmish() -> Combat {
             effects: vec![Effect::Damage(11.0)],
         },
     );
-    // Mage nuke: long range, big hit, but a 3-tick cast + cooldown + MP — the
-    // classic commit/vulnerability window.
+    // Mage nuke: long range, big hit, but a 3-tick cast + a long cooldown + a
+    // hefty MP bite — the classic commit/vulnerability window, rationed to a
+    // few casts before the pool runs dry and it falls back to plinking.
     let fireball = push_skill(
         &mut skills,
         Skill {
             name: "Fireball".into(),
-            cost: 12,
+            cost: 30,
             range: 100.0,
-            cooldown: 3,
+            cooldown: 8,
             cast_time: 3,
             damage_type: Some(DamageType::Fire),
             effects: vec![Effect::Damage(20.0)],
         },
     );
     // Healer's mend: map-wide range, instant. Healers also carry a Shot so they
-    // still contribute (and can't stalemate) when nobody needs mending.
+    // still contribute (and can't stalemate) when nobody needs mending. The cost
+    // outruns regen at the cooldown cadence, so sustained mending drains the
+    // pool — a healer can no longer out-faucet steady focus fire forever.
     let heal = push_skill(
         &mut skills,
         Skill {
             name: "Heal".into(),
-            cost: 10,
+            cost: 25,
             range: 100.0,
-            cooldown: 0,
+            cooldown: 6,
             cast_time: 0,
             damage_type: None,
             effects: vec![Effect::Heal(38.0)],
         },
     );
     // Assassin's strike: melee, hits and leaves Poison ticking — punishes the
-    // squishy it dives.
+    // squishy it dives. Cooldown + cost make it a rhythm hit woven between
+    // Strikes, not the every-action default.
     let backstab = push_skill(
         &mut skills,
         Skill {
             name: "Backstab".into(),
-            cost: 0,
+            cost: 10,
             range: 2.5,
-            cooldown: 2,
+            cooldown: 6,
             cast_time: 0,
             damage_type: Some(DamageType::Physical),
             effects: vec![
@@ -333,15 +341,15 @@ pub fn skirmish() -> Combat {
     );
     // Brawler's charge: rush a foe up to 6m off, hit for moderate damage and stun
     // it for 1s (4 ticks). A gap-closer + hard CC — the tool that punishes kiting
-    // by locking a fleeing target down. Long cooldown so it's a signature opener,
-    // not a spam.
+    // by locking a fleeing target down. Long cooldown (3s / 12 ticks) + a real
+    // MP cost so it's a signature opener, not a spammable stun-lock.
     let charge = push_skill(
         &mut skills,
         Skill {
             name: "Charge".into(),
-            cost: 0,
+            cost: 15,
             range: 6.0,
-            cooldown: 5,
+            cooldown: 12,
             cast_time: 0,
             damage_type: Some(DamageType::Physical),
             effects: vec![
@@ -357,15 +365,15 @@ pub fn skirmish() -> Combat {
     );
     // Assassin's dash: a fast 4m gap-closer, moderate damage, and a 2s (8-tick)
     // snare (-60% move speed) so the squishy it dives can't simply kite back out.
-    // Long cooldown (3s / 12 ticks) so it's a periodic engage — dive, then fight
-    // with backstab — not a spammed re-dash every couple of actions.
+    // Long cooldown (5s / 20 ticks) + cost so it's a periodic engage — dive, then
+    // fight with backstab/strike — not a spammed re-dash every couple of actions.
     let dash = push_skill(
         &mut skills,
         Skill {
             name: "Dash".into(),
-            cost: 0,
+            cost: 20,
             range: 5.0,
-            cooldown: 12,
+            cooldown: 20,
             cast_time: 0,
             damage_type: Some(DamageType::Physical),
             effects: vec![
