@@ -85,6 +85,16 @@ pub enum StatusKind {
     /// Aura: teammates within [`crate::combat::AURA_RADIUS`] of the bearer
     /// (bearer included) deal `1 + AURA_MIGHT_BONUS` times damage.
     MightAura,
+    /// Cracked guard: the bearer takes [`crate::combat::EXPOSED_DAMAGE_BONUS`]
+    /// more damage from *every* source — skill hits and DoT pulses alike — while
+    /// it lasts. The focus-fire amplifier: flat regardless of stacks (like
+    /// `SNARE_SLOW`), harmful, so cleansable.
+    Exposed,
+    /// Leech mark: every damaging hit a *foe of the bearer* lands on it heals
+    /// that attacker [`crate::combat::LEECH_HEAL_ON_HIT`] — the mark turns the
+    /// whole team's offense into sustain while it lasts. DoT pulses don't proc
+    /// it (no attacker at pulse time); harmful, so cleansable.
+    Lifeleech,
 }
 
 impl StatusKind {
@@ -108,6 +118,8 @@ impl StatusKind {
                 | StatusKind::Stun
                 | StatusKind::Snare
                 | StatusKind::MortalWound
+                | StatusKind::Exposed
+                | StatusKind::Lifeleech
         )
     }
 }

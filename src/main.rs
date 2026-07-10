@@ -212,6 +212,8 @@ fn status_color(kind: StatusKind) -> Color {
         StatusKind::MortalWound => Color::new(0.85, 0.3, 0.45, 1.0),
         StatusKind::RegenAura => Color::new(0.45, 0.9, 0.6, 1.0),
         StatusKind::MightAura => Color::new(1.0, 0.6, 0.3, 1.0),
+        StatusKind::Exposed => Color::new(0.95, 0.8, 0.5, 1.0),
+        StatusKind::Lifeleech => Color::new(0.9, 0.3, 0.65, 1.0),
     }
 }
 

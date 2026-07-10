@@ -678,6 +678,49 @@ pub fn skirmish() -> Combat {
             effects: vec![Effect::Heal(12.0), Effect::Cleanse],
         },
     );
+    // Blue chanter's guard-breaker: a moderate hit that leaves the target
+    // Exposed (+10% damage taken from every source for 8s) — the chanter's
+    // way of amplifying the whole scrum's swings, not just its own. The 16s
+    // (64-tick) cooldown makes it a window to focus into, not a rotation hit.
+    let sunder = push_skill(
+        &mut skills,
+        Skill {
+            name: "Sunder".into(),
+            cost: 12,
+            range: 2.5,
+            cooldown: 64,
+            cast_time: 0,
+            damage_type: Some(DamageType::Physical),
+            effects: vec![
+                Effect::Damage(12.0),
+                Effect::Inflict {
+                    kind: StatusKind::Exposed,
+                    stacks: 1,
+                    duration: 32,
+                },
+            ],
+        },
+    );
+    // Red chanter's leech mark: for 8s, every ally hit on the marked foe pays
+    // the attacker back 3 HP — sustain that scales with how hard the pack is
+    // actually swinging, the offensive mirror of the regen aura. Same 16s
+    // window-cooldown as Sunder.
+    let leeching_mark = push_skill(
+        &mut skills,
+        Skill {
+            name: "Leeching Mark".into(),
+            cost: 12,
+            range: 9.0,
+            cooldown: 64,
+            cast_time: 0,
+            damage_type: None,
+            effects: vec![Effect::Inflict {
+                kind: StatusKind::Lifeleech,
+                stacks: 1,
+                duration: 32,
+            }],
+        },
+    );
     // Ogre's war cry: self-enrage (+50% outgoing damage for 3s). Fired only
     // once a foe is in reach so the window isn't wasted on the approach march.
     let war_cry = push_skill(
@@ -757,8 +800,8 @@ pub fn skirmish() -> Combat {
         // The chanters: one per side, mirrored roles. Blue sings the offensive
         // aura, red the defensive one; both fight at arm's reach with a
         // support-flavoured touch and a plain strike as the floor.
-        mk(8, "Warchanter", Team::Player, 75.0, 0.24, 0.38, 3.5, 4.5, vec![war_chant, mana_rend, strike], &[]),
-        mk(9, "Lifechanter", Team::Enemy, 75.0, 0.24, 0.38, 20.5, 4.5, vec![life_chant, soothing_touch, strike], &[]),
+        mk(8, "Warchanter", Team::Player, 75.0, 0.24, 0.38, 3.5, 4.5, vec![war_chant, sunder, mana_rend, strike], &[]),
+        mk(9, "Lifechanter", Team::Enemy, 75.0, 0.24, 0.38, 20.5, 4.5, vec![life_chant, leeching_mark, soothing_touch, strike], &[]),
     ];
     let terrain = skirmish_terrain();
     let state = BattleState {
@@ -1061,35 +1104,38 @@ pub fn skirmish() -> Combat {
     );
     // Chanters: the song comes first — re-sing whenever the aura has lapsed
     // (the self-query's "am I missing it?" filter makes that implicit), then
-    // work the support touch, then swing the plain strike so a full bar never
-    // idles. One shared shape, two kits.
-    let chanter_gambit = |chant: SkillId, aura: StatusKind, touch: Node| {
-        Node::context(
-            Condition::Always,
-            GroupMode::Fallthrough,
-            vec![
-                Node::act(
-                    TargetQuery::new(Pool::Myself)
-                        .filter(Filter::Not(Box::new(Filter::HasStatus(aura)))),
-                    chant,
-                ),
-                touch,
-                Node::act(nearest_enemy(), strike),
-            ],
-        )
+    // work the support rules in order, then swing the plain strike so a full
+    // bar never idles. One shared shape, two kits.
+    let chanter_gambit = |chant: SkillId, aura: StatusKind, work: Vec<Node>| {
+        let mut children = vec![Node::act(
+            TargetQuery::new(Pool::Myself)
+                .filter(Filter::Not(Box::new(Filter::HasStatus(aura)))),
+            chant,
+        )];
+        children.extend(work);
+        children.push(Node::act(nearest_enemy(), strike));
+        Node::context(Condition::Always, GroupMode::Fallthrough, children)
     };
     gambits.insert(
         EntityId(8),
         chanter_gambit(
             war_chant,
             StatusKind::MightAura,
-            // Rend the fattest MP pool in reach — range already narrows the
-            // candidates to arm's length, so the sort picks the caster in the
-            // scrum, not the dry-tanked ogre the distance sort used to favour.
-            Node::act(
-                TargetQuery::new(Pool::Enemies).sort(SortKey::Mp, Order::Desc),
-                mana_rend,
-            ),
+            vec![
+                // Crack the toughest guard in reach — the Exposed window pays
+                // most on the foe that will soak the team's hits the longest.
+                Node::act(
+                    TargetQuery::new(Pool::Enemies).sort(SortKey::Hp, Order::Desc),
+                    sunder,
+                ),
+                // Rend the fattest MP pool in reach — range already narrows the
+                // candidates to arm's length, so the sort picks the caster in the
+                // scrum, not the dry-tanked ogre the distance sort used to favour.
+                Node::act(
+                    TargetQuery::new(Pool::Enemies).sort(SortKey::Mp, Order::Desc),
+                    mana_rend,
+                ),
+            ],
         ),
     );
     gambits.insert(
@@ -1097,12 +1143,27 @@ pub fn skirmish() -> Combat {
         chanter_gambit(
             life_chant,
             StatusKind::RegenAura,
-            Node::act(
-                TargetQuery::new(Pool::Allies)
-                    .filter(Filter::HpPctBelow(0.8))
-                    .sort(SortKey::HpPct, Order::Asc),
-                soothing_touch,
-            ),
+            vec![
+                // Mark the toughest foe the pack is already trading with — the
+                // leech only pays while allies are landing hits, so an engaged
+                // target beats a distant one, and a long-lived target beats a
+                // dying one.
+                Node::act(
+                    TargetQuery::new(Pool::Enemies)
+                        .filter(Filter::WithinDistanceOf(
+                            Box::new(TargetQuery::new(Pool::Allies).pick(Pick::All)),
+                            3.0,
+                        ))
+                        .sort(SortKey::Hp, Order::Desc),
+                    leeching_mark,
+                ),
+                Node::act(
+                    TargetQuery::new(Pool::Allies)
+                        .filter(Filter::HpPctBelow(0.8))
+                        .sort(SortKey::HpPct, Order::Asc),
+                    soothing_touch,
+                ),
+            ],
         ),
     );
 
@@ -1412,6 +1473,8 @@ mod tests {
         assert!(used("Life Chant"), "the red chanter should raise its regen aura");
         assert!(used("Mana Rend"), "the blue chanter should tear MP in melee");
         assert!(used("Soothing Touch"), "the red chanter should mend at arm's reach");
+        assert!(used("Sunder"), "the blue chanter should crack a guard open");
+        assert!(used("Leeching Mark"), "the red chanter should mark the pack's target");
     }
 
     /// Uselessness regression: the chanters must *work*, not just sing. Their
