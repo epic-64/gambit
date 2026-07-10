@@ -13,6 +13,7 @@
 
 mod battle;
 mod combat;
+mod editor;
 mod eval;
 mod gambit;
 mod nav;
@@ -24,10 +25,12 @@ use std::collections::HashMap;
 use macroquad::prelude::*;
 
 use battle::{
-    DamageType, Effect, Entity, EntityId, Pos, Skill, SkillId, StatusKind, Team, ENTITY_RADIUS,
+    BattleState, DamageType, Effect, Entity, EntityId, Pos, Skill, SkillId, StatusKind, Team,
+    ENTITY_RADIUS,
 };
 use combat::{Combat, Event};
 use eval::Pull;
+use gambit::MoveGambit;
 use terrain::{Terrain, Tile3, STEP_HEIGHT};
 
 /// Seconds of real time per simulation tick.
@@ -385,10 +388,35 @@ fn spawn_impact_vfx(
     }
 }
 
-/// Which screen the viewer is showing: the scenario picker or a live battle.
+/// Which screen the viewer is showing: the scenario picker, a live battle, or
+/// the gambit editor (paused battle underneath, edits apply on resume).
 enum Screen {
     Menu,
     Playing,
+    Editor,
+}
+
+/// UI state of the gambit editor: which character is open, which panel has
+/// keyboard focus, and each panel's selection + scroll.
+#[derive(Default)]
+struct EditorState {
+    /// Index of the inspected entity (== its `EntityId`).
+    entity: usize,
+    /// Focused panel: 0 = action gambit, 1 = movement gambit.
+    panel: usize,
+    sel_action: usize,
+    sel_move: usize,
+    scroll_action: f32,
+    scroll_move: f32,
+    /// The open dropdown, if any. While present it owns every click.
+    menu: Option<OpenMenu>,
+}
+
+impl EditorState {
+    /// Reset per-character selection state (when switching characters).
+    fn select_entity(&mut self, entity: usize) {
+        *self = EditorState { entity, panel: self.panel, ..EditorState::default() };
+    }
 }
 
 fn window_conf() -> Conf {
@@ -418,6 +446,8 @@ async fn main() {
     let mut flash: HashMap<EntityId, (f32, Color)> = HashMap::new();
     // Per-entity trailing shadows for the HP/MP bars, animated in real time.
     let mut shadows: HashMap<EntityId, ShadowBars> = HashMap::new();
+    // Gambit-editor UI state (selection, focus, scroll).
+    let mut editor_state = EditorState::default();
 
     loop {
         match screen {
@@ -432,6 +462,7 @@ async fn main() {
                         flash.clear();
                         shadows.clear();
                         paused = false;
+                        editor_state = EditorState::default();
                         screen = Screen::Playing;
                     }
                 }
@@ -445,7 +476,10 @@ async fn main() {
                     paused = !paused;
                 }
                 if is_key_pressed(KeyCode::R) {
-                    combat = Some(scenarios[current].1());
+                    // Restart the scenario but keep any gambit edits: the fresh
+                    // build's rules are overwritten with the current (possibly
+                    // edited) ones. Re-picking from the menu gets a pristine copy.
+                    restart_keeping_edits(&scenarios, current, &mut combat);
                     log.clear();
                     vfx.clear();
                     flash.clear();
@@ -457,6 +491,10 @@ async fn main() {
                 }
                 if is_key_pressed(KeyCode::I) {
                     show_intent = !show_intent;
+                }
+                if is_key_pressed(KeyCode::G) {
+                    paused = true;
+                    screen = Screen::Editor;
                 }
 
                 let Some(combat) = combat.as_mut() else {
@@ -543,6 +581,56 @@ async fn main() {
                 draw_log(&log);
                 draw_hud(combat, paused, scenarios[current].0);
             }
+            Screen::Editor => {
+                if is_key_pressed(KeyCode::R) {
+                    // Apply the edits from the top: fresh battle, edited rules.
+                    restart_keeping_edits(&scenarios, current, &mut combat);
+                    log.clear();
+                    vfx.clear();
+                    flash.clear();
+                    shadows.clear();
+                    paused = false;
+                    editor_state.menu = None;
+                    screen = Screen::Playing;
+                } else if is_key_pressed(KeyCode::G) || is_key_pressed(KeyCode::Escape) {
+                    // Esc/G close an open dropdown first, then leave to the
+                    // (paused) battle; edits are already live.
+                    if editor_state.menu.is_some() {
+                        editor_state.menu = None;
+                    } else {
+                        screen = Screen::Playing;
+                    }
+                } else if is_key_pressed(KeyCode::M) {
+                    editor_state.menu = None;
+                    screen = Screen::Menu;
+                } else if let Some(combat) = combat.as_mut() {
+                    let n = combat.state.entities.len();
+                    if is_key_pressed(KeyCode::Tab) && n > 0 {
+                        editor_state.select_entity((editor_state.entity + 1) % n);
+                    }
+                    // Up/Down move the focused panel's selection (clamped when
+                    // the panels draw).
+                    if is_key_pressed(KeyCode::Down) {
+                        if editor_state.panel == 0 {
+                            editor_state.sel_action += 1;
+                        } else {
+                            editor_state.sel_move += 1;
+                        }
+                    }
+                    if is_key_pressed(KeyCode::Up) {
+                        if editor_state.panel == 0 {
+                            editor_state.sel_action = editor_state.sel_action.saturating_sub(1);
+                        } else {
+                            editor_state.sel_move = editor_state.sel_move.saturating_sub(1);
+                        }
+                    }
+
+                    clear_background(Color::new(0.09, 0.10, 0.12, 1.0));
+                    draw_editor(&mut editor_state, combat, scenarios[current].0);
+                } else {
+                    screen = Screen::Menu;
+                }
+            }
         }
 
         next_frame().await;
@@ -590,7 +678,7 @@ fn draw_menu(scenarios: &[(&'static str, fn() -> Combat)]) {
         Color::new(0.65, 0.68, 0.72, 1.0),
     );
     draw_text(
-        "In battle:  Space pause  ·  R restart  ·  I intent lines  ·  M / Esc menu",
+        "In battle:  Space pause  ·  G gambit editor  ·  R restart  ·  I intent lines  ·  M / Esc menu",
         46.0,
         y + 54.0,
         20.0,
@@ -1248,10 +1336,874 @@ fn draw_hud(combat: &Combat, paused: bool, scenario: &str) {
         "RUNNING"
     };
     let hud = format!(
-        "{scenario}  |  tick {}  [{}]   —   Space: pause · R: restart · I: intent · M: menu",
+        "{scenario}  |  tick {}  [{}]   —   Space: pause · G: gambits · R: restart · I: intent · M: menu",
         combat.time, state
     );
     draw_text(&hud, 20.0, 28.0, 22.0, WHITE);
+}
+
+// --- gambit editor ----------------------------------------------------------
+
+/// Button/row height of the editor's hand-drawn widgets.
+const BTN_H: f32 = 20.0;
+/// Height of one list row in the editor panels.
+const EDITOR_ROW_H: f32 = 20.0;
+
+/// Rebuild the current scenario but carry the (possibly edited) gambits over —
+/// the "restart with my edits" the editor promises. Entity ids are stable
+/// across rebuilds of the same scenario, so the maps transplant directly.
+fn restart_keeping_edits(
+    scenarios: &[(&'static str, fn() -> Combat)],
+    current: usize,
+    combat: &mut Option<Combat>,
+) {
+    let mut fresh = scenarios[current].1();
+    if let Some(old) = combat.take() {
+        fresh.gambits = old.gambits;
+        fresh.move_gambits = old.move_gambits;
+    }
+    *combat = Some(fresh);
+}
+
+/// Immediate-mode input context for the editor's hand-drawn widgets: one
+/// snapshot of the mouse per frame.
+struct Ui {
+    mx: f32,
+    my: f32,
+    clicked: bool,
+}
+
+impl Ui {
+    fn frame() -> Ui {
+        let (mx, my) = mouse_position();
+        Ui { mx, my, clicked: is_mouse_button_pressed(MouseButton::Left) }
+    }
+
+    fn hover(&self, r: Rect4) -> bool {
+        rect_contains(r, self.mx, self.my)
+    }
+
+    /// Draw a small labelled button; true when clicked this frame.
+    fn button(&self, x: f32, y: f32, w: f32, label: &str) -> bool {
+        let r = (x, y, w, BTN_H);
+        let hov = self.hover(r);
+        let fill = if hov {
+            Color::new(0.30, 0.34, 0.42, 1.0)
+        } else {
+            Color::new(0.20, 0.23, 0.28, 1.0)
+        };
+        draw_rectangle(x, y, w, BTN_H, fill);
+        draw_rectangle_lines(x, y, w, BTN_H, 1.0, Color::new(0.45, 0.50, 0.58, 1.0));
+        let d = measure_text(label, None, 15, 1.0);
+        draw_text(label, x + (w - d.width) / 2.0, y + BTN_H - 6.0, 15.0, WHITE);
+        hov && self.clicked
+    }
+
+    /// Selectable list row: highlight + click detection; true when clicked.
+    fn row(&self, r: Rect4, selected: bool) -> bool {
+        if selected {
+            draw_rectangle(r.0, r.1, r.2, r.3, Color::new(0.22, 0.28, 0.38, 1.0));
+        } else if self.hover(r) {
+            draw_rectangle(r.0, r.1, r.2, r.3, Color::new(0.15, 0.17, 0.21, 1.0));
+        }
+        self.hover(r) && self.clicked
+    }
+}
+
+/// Lays a row of toolbar buttons left to right; `drop` remembers where a
+/// dropdown hung under the most recently drawn button should anchor.
+struct Toolbar<'a> {
+    ui: &'a Ui,
+    x: f32,
+    y: f32,
+    drop: (f32, f32),
+}
+
+impl<'a> Toolbar<'a> {
+    fn new(ui: &'a Ui, x: f32, y: f32) -> Toolbar<'a> {
+        Toolbar { ui, x, y, drop: (x, y + BTN_H + 2.0) }
+    }
+
+    fn button(&mut self, label: &str, w: f32) -> bool {
+        self.drop = (self.x, self.y + BTN_H + 2.0);
+        let hit = self.ui.button(self.x, self.y, w, label);
+        self.x += w + 6.0;
+        hit
+    }
+}
+
+// --- dropdown menus ---------------------------------------------------------
+
+/// Height of one dropdown row.
+const MENU_ROW_H: f32 = 22.0;
+
+/// Which field an open dropdown edits, with the address of the edited thing
+/// captured at open time (paths re-resolve on apply, so a stale one is a
+/// harmless no-op).
+#[derive(Clone)]
+enum MenuKind {
+    Condition { path: Vec<usize> },
+    Target { path: Vec<usize> },
+    Skill { path: Vec<usize> },
+    Term { index: usize },
+}
+
+/// An open dropdown: what it edits, whose gambit, where it hangs, and which
+/// submenu is currently flown out.
+struct OpenMenu {
+    kind: MenuKind,
+    /// Entity the menu was opened for (the roster can't change underneath it —
+    /// an open menu owns every click — but keep the id explicit anyway).
+    entity: usize,
+    /// Screen anchor (top-left; clamped to the screen when laid out).
+    anchor: (f32, f32),
+    /// Expanded submenu, as an index into the entries.
+    sub: Option<usize>,
+}
+
+enum MenuOutcome<T> {
+    StillOpen,
+    Close,
+    Pick(T),
+}
+
+/// Box size fitting the given labels, one per row.
+fn menu_box(labels: &[&str]) -> (f32, f32) {
+    let w = labels
+        .iter()
+        .map(|l| measure_text(l, None, 15, 1.0).width)
+        .fold(0.0, f32::max);
+    (w + 36.0, labels.len() as f32 * MENU_ROW_H + 8.0)
+}
+
+/// The main dropdown column, anchored under its button and clamped on-screen.
+fn menu_main_rect<T>(om: &OpenMenu, entries: &[editor::MenuEntry<T>]) -> Rect4 {
+    let labels: Vec<&str> = entries.iter().map(|e| e.label()).collect();
+    let (w, h) = menu_box(&labels);
+    let x = om.anchor.0.min(screen_width() - w - 4.0).max(4.0);
+    let y = om.anchor.1.min(screen_height() - h - 4.0).max(4.0);
+    (x, y, w, h)
+}
+
+/// The flyout column of the submenu at `si`, beside its parent row (flipped
+/// to the left edge when it wouldn't fit on the right).
+fn menu_sub_rect<T>(main: Rect4, entries: &[editor::MenuEntry<T>], si: usize) -> Option<Rect4> {
+    let editor::MenuEntry::Sub(_, items) = &entries[si] else {
+        return None;
+    };
+    let labels: Vec<&str> = items.iter().map(|(l, _)| l.as_str()).collect();
+    let (w, h) = menu_box(&labels);
+    let mut x = main.0 + main.2 - 2.0;
+    if x + w > screen_width() - 4.0 {
+        x = (main.0 - w + 2.0).max(4.0);
+    }
+    let y = (main.1 + 4.0 + si as f32 * MENU_ROW_H)
+        .min(screen_height() - h - 4.0)
+        .max(4.0);
+    Some((x, y, w, h))
+}
+
+/// Input side of an open dropdown for one frame: fly submenus out on hover,
+/// resolve clicks (pick / expand / close), and consume the click either way —
+/// an open menu owns the mouse. Drawing happens separately (after the panels)
+/// so the overlay sits on top; both share the same layout functions.
+fn drive_menu<T: Clone>(
+    ui: &mut Ui,
+    om: &mut OpenMenu,
+    entries: &[editor::MenuEntry<T>],
+) -> MenuOutcome<T> {
+    let main = menu_main_rect(om, entries);
+    // Hovering a submenu entry flies it out. Hovering a plain item leaves an
+    // open flyout alone, so the diagonal mouse path into it never slams it
+    // shut; picking or expanding elsewhere is what closes it.
+    for (i, e) in entries.iter().enumerate() {
+        let r = (main.0, main.1 + 4.0 + i as f32 * MENU_ROW_H, main.2, MENU_ROW_H);
+        if ui.hover(r) && matches!(e, editor::MenuEntry::Sub(..)) {
+            om.sub = Some(i);
+        }
+    }
+    let sub_rect = om.sub.and_then(|si| menu_sub_rect(main, entries, si));
+    if !ui.clicked {
+        return MenuOutcome::StillOpen;
+    }
+    ui.clicked = false;
+    if let Some(si) = om.sub
+        && let Some(sr) = sub_rect
+        && let editor::MenuEntry::Sub(_, items) = &entries[si]
+    {
+        for (j, (_, v)) in items.iter().enumerate() {
+            let r = (sr.0, sr.1 + 4.0 + j as f32 * MENU_ROW_H, sr.2, MENU_ROW_H);
+            if rect_contains(r, ui.mx, ui.my) {
+                return MenuOutcome::Pick(v.clone());
+            }
+        }
+        if rect_contains(sr, ui.mx, ui.my) {
+            return MenuOutcome::StillOpen; // the box's padding
+        }
+    }
+    if rect_contains(main, ui.mx, ui.my) {
+        for (i, e) in entries.iter().enumerate() {
+            let r = (main.0, main.1 + 4.0 + i as f32 * MENU_ROW_H, main.2, MENU_ROW_H);
+            if !rect_contains(r, ui.mx, ui.my) {
+                continue;
+            }
+            match e {
+                editor::MenuEntry::Item(_, v) => return MenuOutcome::Pick(v.clone()),
+                editor::MenuEntry::Sub(..) => {
+                    om.sub = if om.sub == Some(i) { None } else { Some(i) };
+                    return MenuOutcome::StillOpen;
+                }
+            }
+        }
+        return MenuOutcome::StillOpen;
+    }
+    MenuOutcome::Close
+}
+
+/// One dropdown column: shadowed box, hover highlight, `>` on submenu rows.
+fn draw_menu_column<'a>(
+    ui: &Ui,
+    r: Rect4,
+    rows: impl Iterator<Item = (&'a str, bool)>,
+    expanded: Option<usize>,
+) {
+    draw_rectangle(r.0 + 3.0, r.1 + 3.0, r.2, r.3, with_alpha(BLACK, 0.35));
+    draw_rectangle(r.0, r.1, r.2, r.3, Color::new(0.16, 0.18, 0.22, 1.0));
+    draw_rectangle_lines(r.0, r.1, r.2, r.3, 1.5, Color::new(0.50, 0.56, 0.66, 1.0));
+    for (i, (label, is_sub)) in rows.enumerate() {
+        let rr = (r.0, r.1 + 4.0 + i as f32 * MENU_ROW_H, r.2, MENU_ROW_H);
+        if ui.hover(rr) || expanded == Some(i) {
+            draw_rectangle(rr.0 + 2.0, rr.1, rr.2 - 4.0, rr.3, Color::new(0.28, 0.34, 0.44, 1.0));
+        }
+        draw_text(label, rr.0 + 10.0, rr.1 + 16.0, 15.0, WHITE);
+        if is_sub {
+            draw_text(">", rr.0 + rr.2 - 14.0, rr.1 + 16.0, 15.0, Color::new(0.70, 0.75, 0.80, 1.0));
+        }
+    }
+}
+
+/// Render an open dropdown (main column + flown-out submenu) on top of
+/// everything.
+fn draw_menu_overlay<T>(ui: &Ui, om: &OpenMenu, entries: &[editor::MenuEntry<T>]) {
+    let main = menu_main_rect(om, entries);
+    draw_menu_column(
+        ui,
+        main,
+        entries
+            .iter()
+            .map(|e| (e.label(), matches!(e, editor::MenuEntry::Sub(..)))),
+        om.sub,
+    );
+    if let Some(si) = om.sub
+        && let Some(sr) = menu_sub_rect(main, entries, si)
+        && let editor::MenuEntry::Sub(_, items) = &entries[si]
+    {
+        draw_menu_column(ui, sr, items.iter().map(|(l, _)| (l.as_str(), false)), None);
+    }
+}
+
+/// Drive the open dropdown's input for this frame: consume the click, apply a
+/// pick straight to the combat state, close on click-away. Runs *before* the
+/// panels (so they render the applied value and never see the menu's click);
+/// [`draw_open_menu`] draws the same menu after them, on top.
+fn drive_open_menu(es: &mut EditorState, ui: &mut Ui, combat: &mut Combat) {
+    let Some(mut om) = es.menu.take() else { return };
+    let id = EntityId(om.entity);
+    let keep = match om.kind.clone() {
+        MenuKind::Condition { path } => match drive_menu(ui, &mut om, &editor::condition_menu()) {
+            MenuOutcome::Pick(c) => {
+                if let Some(root) = combat.gambits.get_mut(&id)
+                    && let Some(node) = editor::node_at_mut(root, &path)
+                {
+                    node.condition = c;
+                }
+                false
+            }
+            MenuOutcome::Close => false,
+            MenuOutcome::StillOpen => true,
+        },
+        MenuKind::Target { path } => match drive_menu(ui, &mut om, &editor::target_menu()) {
+            MenuOutcome::Pick(q) => {
+                if let Some(root) = combat.gambits.get_mut(&id)
+                    && let Some(node) = editor::node_at_mut(root, &path)
+                {
+                    editor::set_leaf_target(node, q);
+                }
+                false
+            }
+            MenuOutcome::Close => false,
+            MenuOutcome::StillOpen => true,
+        },
+        MenuKind::Skill { path } => {
+            let known = combat.state.entities[id.0].skills.clone();
+            let entries = editor::skill_menu(&known, &combat.state);
+            match drive_menu(ui, &mut om, &entries) {
+                MenuOutcome::Pick(s) => {
+                    if let Some(root) = combat.gambits.get_mut(&id)
+                        && let Some(node) = editor::node_at_mut(root, &path)
+                    {
+                        editor::set_leaf_skill(node, s);
+                    }
+                    false
+                }
+                MenuOutcome::Close => false,
+                MenuOutcome::StillOpen => true,
+            }
+        }
+        MenuKind::Term { index } => match drive_menu(ui, &mut om, &editor::term_menu()) {
+            MenuOutcome::Pick(t) => {
+                if let Some(mg) = combat.move_gambits.get_mut(&id)
+                    && let Some(slot) = mg.terms.get_mut(index)
+                {
+                    slot.0 = t;
+                }
+                false
+            }
+            MenuOutcome::Close => false,
+            MenuOutcome::StillOpen => true,
+        },
+    };
+    if keep {
+        es.menu = Some(om);
+    }
+}
+
+/// Draw the open dropdown last, over the panels.
+fn draw_open_menu(es: &EditorState, ui: &Ui, combat: &Combat) {
+    let Some(om) = &es.menu else { return };
+    match &om.kind {
+        MenuKind::Condition { .. } => draw_menu_overlay(ui, om, &editor::condition_menu()),
+        MenuKind::Target { .. } => draw_menu_overlay(ui, om, &editor::target_menu()),
+        MenuKind::Skill { .. } => {
+            let known = combat.state.entities[om.entity].skills.clone();
+            draw_menu_overlay(ui, om, &editor::skill_menu(&known, &combat.state));
+        }
+        MenuKind::Term { .. } => draw_menu_overlay(ui, om, &editor::term_menu()),
+    }
+}
+
+/// Panel background + border (brighter when the panel has keyboard focus) +
+/// title. Content starts below the title line.
+fn panel_chrome(x: f32, y: f32, w: f32, h: f32, title: &str, focused: bool) {
+    draw_rectangle(x, y, w, h, Color::new(0.12, 0.13, 0.16, 1.0));
+    let border = if focused {
+        Color::new(0.50, 0.60, 0.80, 1.0)
+    } else {
+        Color::new(0.30, 0.34, 0.40, 1.0)
+    };
+    draw_rectangle_lines(x, y, w, h, 2.0, border);
+    draw_text(title, x + 8.0, y + 17.0, 18.0, Color::new(0.85, 0.87, 0.90, 1.0));
+}
+
+/// The gambit editor screen: roster of both teams on the left (the editor is
+/// always tied to one character at a time), the selected character's action
+/// gambit tree and movement gambit on the right. Edits mutate the live
+/// `Combat` directly — they apply the moment the battle resumes.
+fn draw_editor(es: &mut EditorState, combat: &mut Combat, scenario: &str) {
+    let mut ui = Ui::frame();
+
+    draw_text(&format!("Gambit editor — {scenario}"), 20.0, 30.0, 24.0, WHITE);
+    draw_text(
+        "click/Tab: character  ·  click a cell to edit it in place  ·  G/Esc: back to battle  ·  R: restart with edits  ·  M: menu",
+        20.0,
+        50.0,
+        15.0,
+        Color::new(0.65, 0.68, 0.72, 1.0),
+    );
+
+    let n = combat.state.entities.len();
+    if n == 0 {
+        return;
+    }
+    es.entity = es.entity.min(n - 1);
+    let id = EntityId(es.entity);
+
+    // Every entity is editable: a bare-leaf root is wrapped into a group and a
+    // missing movement gambit becomes an (equivalent) empty one.
+    let root = combat.gambits.entry(id).or_insert_with(editor::empty_root);
+    editor::normalize_root(root);
+    combat
+        .move_gambits
+        .entry(id)
+        .or_insert_with(|| MoveGambit::new(Vec::new()));
+
+    // An open dropdown eats this frame's click before anything underneath
+    // sees it; its pick is applied right here so the panels draw the result.
+    drive_open_menu(es, &mut ui, combat);
+
+    draw_roster(es, &ui, &combat.state);
+
+    let px = 225.0;
+    let pw = screen_width() - px - 16.0;
+    let top = 66.0;
+    let bottom = screen_height() - 16.0;
+    let action_h = ((bottom - top) * 0.60).floor();
+    // The skill-detail card sits beside the action panel, showing the skill
+    // of whatever rule is selected.
+    let skill_w = 215.0;
+    let action_w = pw - skill_w - 10.0;
+    draw_action_panel(es, &ui, combat, id, px, top, action_w, action_h);
+    draw_skill_panel(es, combat, id, px + action_w + 10.0, top, skill_w, action_h);
+    let move_y = top + action_h + 10.0;
+    draw_move_panel(es, &ui, combat, id, px, move_y, pw, bottom - move_y);
+
+    // The dropdown draws last, over everything.
+    draw_open_menu(es, &ui, combat);
+}
+
+/// The character list, grouped by team. Clicking a row opens that character.
+fn draw_roster(es: &mut EditorState, ui: &Ui, state: &BattleState) {
+    let x = 20.0;
+    let w = 195.0;
+    let mut y = 66.0;
+    for team in [Team::Player, Team::Enemy] {
+        let label = if team == Team::Player { "PLAYER TEAM" } else { "ENEMY TEAM" };
+        draw_text(label, x, y + 12.0, 14.0, Color::new(0.60, 0.63, 0.68, 1.0));
+        y += 20.0;
+        for e in state.entities.iter().filter(|e| e.team == team) {
+            let r = (x, y, w, EDITOR_ROW_H + 2.0);
+            if ui.row(r, e.id.0 == es.entity) {
+                es.select_entity(e.id.0);
+            }
+            draw_circle(x + 10.0, y + 11.0, 5.0, team_color(e.team));
+            let col = if e.is_alive() { WHITE } else { Color::new(0.50, 0.50, 0.55, 1.0) };
+            draw_text(&e.name, x + 22.0, y + 16.0, 17.0, col);
+            y += EDITOR_ROW_H + 4.0;
+        }
+        y += 10.0;
+    }
+}
+
+/// Wheel-scroll a panel's list and clamp to its content.
+fn panel_scroll(ui: &Ui, panel: Rect4, scroll: &mut f32, rows: usize, list_h: f32) {
+    if ui.hover(panel) {
+        let wheel = mouse_wheel().1;
+        if wheel != 0.0 {
+            *scroll -= wheel.signum() * EDITOR_ROW_H * 2.0;
+        }
+    }
+    let max = (rows as f32 * EDITOR_ROW_H - list_h).max(0.0);
+    *scroll = scroll.clamp(0.0, max);
+}
+
+/// An inline-editable table cell: a faint tint marks it live under the mouse;
+/// true when clicked this frame.
+fn cell(ui: &Ui, r: Rect4) -> bool {
+    if ui.hover(r) {
+        draw_rectangle(r.0, r.1, r.2, r.3, with_alpha(WHITE, 0.07));
+    }
+    ui.hover(r) && ui.clicked
+}
+
+/// Truncate `text` (15px font) with an ellipsis so it fits `max_w` pixels.
+fn fit_text(text: &str, max_w: f32) -> String {
+    if measure_text(text, None, 15, 1.0).width <= max_w {
+        return text.into();
+    }
+    let mut s = String::from(text);
+    while !s.is_empty() && measure_text(&s, None, 15, 1.0).width + 12.0 > max_w {
+        s.pop();
+    }
+    format!("{s}...")
+}
+
+// Cell text palette: one hue per rule component, so the columns read apart.
+const COND_COLOR: Color = Color::new(0.95, 0.82, 0.50, 1.0);
+const COND_ALWAYS_COLOR: Color = Color::new(0.50, 0.53, 0.58, 1.0);
+const TARGET_COLOR: Color = Color::new(0.62, 0.80, 1.00, 1.0);
+const SKILL_COLOR: Color = Color::new(0.70, 0.95, 0.70, 1.0);
+const GROUP_COLOR: Color = Color::new(0.95, 0.85, 0.45, 1.0);
+
+/// The action-gambit panel: the rule tree as a three-column table —
+/// CONDITION | TARGET | SKILL — every cell editable in place (a click opens
+/// the matching dropdown right at the cell; clicking a group's body flips its
+/// mode). The toolbar keeps only the structural ops. Rows are snapshotted
+/// before drawing so a click's mutation never races the borrow.
+fn draw_action_panel(
+    es: &mut EditorState,
+    ui: &Ui,
+    combat: &mut Combat,
+    id: EntityId,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+) {
+    panel_chrome(x, y, w, h, "Action gambit", es.panel == 0);
+
+    // Snapshot the tree as owned rows: (path, depth) plus the split cells.
+    let root = &combat.gambits[&id];
+    let rows = editor::rows(root);
+    es.sel_action = es.sel_action.min(rows.len().saturating_sub(1));
+    let views: Vec<(usize, editor::RowParts)> = rows
+        .iter()
+        .map(|(p, d)| (*d, editor::row_parts(editor::node_at(root, p).unwrap(), &combat.state)))
+        .collect();
+    let sel = rows.get(es.sel_action).map(|(p, _)| p.clone());
+
+    // The actor's known skills — the skill dropdown's set and "+ rule" default.
+    let known = combat.state.entities[id.0].skills.clone();
+    let skill_names: Vec<String> = known
+        .iter()
+        .map(|&s| combat.state.skill(s).name.clone())
+        .collect();
+
+    // --- column layout: CONDITION | TARGET | SKILL ---
+    let inner_x = x + 8.0;
+    let inner_w = w - 16.0;
+    let cw_cond = inner_w * 0.42;
+    let cw_target = inner_w * 0.34;
+    let cx_cond = inner_x;
+    let cx_target = cx_cond + cw_cond + 10.0;
+    let cx_skill = cx_target + cw_target + 10.0;
+    let cw_skill = inner_x + inner_w - cx_skill;
+
+    let head_y = y + 24.0 + BTN_H + 8.0;
+    let head_col = Color::new(0.55, 0.58, 0.64, 1.0);
+    draw_text("CONDITION", cx_cond + 2.0, head_y + 11.0, 13.0, head_col);
+    draw_text("TARGET", cx_target + 2.0, head_y + 11.0, 13.0, head_col);
+    draw_text("SKILL", cx_skill + 2.0, head_y + 11.0, 13.0, head_col);
+
+    let list_y = head_y + 16.0;
+    let list_h = h - (list_y - y) - 22.0;
+    // Faint column separators through the list area.
+    for cx in [cx_target - 5.0, cx_skill - 5.0] {
+        draw_line(cx, list_y, cx, list_y + list_h, 1.0, with_alpha(WHITE, 0.08));
+    }
+
+    panel_scroll(ui, (x, y, w, h), &mut es.scroll_action, views.len(), list_h);
+
+    for (i, (depth, parts)) in views.iter().enumerate() {
+        let ry = list_y + i as f32 * EDITOR_ROW_H - es.scroll_action;
+        if ry < list_y - 1.0 || ry + EDITOR_ROW_H > list_y + list_h + 1.0 {
+            continue;
+        }
+        if ui.row((x + 4.0, ry, w - 8.0, EDITOR_ROW_H), i == es.sel_action) {
+            es.sel_action = i;
+            es.panel = 0;
+        }
+        let path = &rows[i].0;
+        let open_at = |kind: MenuKind, ax: f32| OpenMenu {
+            kind,
+            entity: id.0,
+            anchor: (ax, ry + EDITOR_ROW_H),
+            sub: None,
+        };
+
+        // Condition cell (every row has one); tree depth indents it.
+        let indent = *depth as f32 * 16.0;
+        let cond = match parts {
+            editor::RowParts::Leaf { condition, .. }
+            | editor::RowParts::Group { condition, .. } => condition,
+        };
+        if cell(ui, (cx_cond, ry, cw_cond, EDITOR_ROW_H)) {
+            es.sel_action = i;
+            es.panel = 0;
+            es.menu = Some(open_at(MenuKind::Condition { path: path.clone() }, cx_cond + indent));
+        }
+        let cond_col = if cond == "always" { COND_ALWAYS_COLOR } else { COND_COLOR };
+        draw_text(
+            &fit_text(cond, cw_cond - indent - 8.0),
+            cx_cond + 4.0 + indent,
+            ry + 15.0,
+            15.0,
+            cond_col,
+        );
+
+        match parts {
+            editor::RowParts::Leaf { target, skill, .. } => {
+                // Target cell — "= condition" is the passthrough pick.
+                if cell(ui, (cx_target, ry, cw_target, EDITOR_ROW_H)) {
+                    es.sel_action = i;
+                    es.panel = 0;
+                    es.menu = Some(open_at(MenuKind::Target { path: path.clone() }, cx_target));
+                }
+                draw_text(
+                    &fit_text(target, cw_target - 8.0),
+                    cx_target + 4.0,
+                    ry + 15.0,
+                    15.0,
+                    TARGET_COLOR,
+                );
+
+                // Skill cell.
+                if cell(ui, (cx_skill, ry, cw_skill, EDITOR_ROW_H)) {
+                    es.sel_action = i;
+                    es.panel = 0;
+                    es.menu = Some(open_at(MenuKind::Skill { path: path.clone() }, cx_skill));
+                }
+                draw_text(
+                    &fit_text(skill, cw_skill - 8.0),
+                    cx_skill + 4.0,
+                    ry + 15.0,
+                    15.0,
+                    SKILL_COLOR,
+                );
+            }
+            editor::RowParts::Group { commit, children, .. } => {
+                // A group has no target/skill: its body cell spans both
+                // columns and a click flips fallthrough <-> commit in place.
+                let gw = inner_x + inner_w - cx_target;
+                if cell(ui, (cx_target, ry, gw, EDITOR_ROW_H)) {
+                    es.sel_action = i;
+                    es.panel = 0;
+                    let root = combat.gambits.get_mut(&id).unwrap();
+                    if let Some(node) = editor::node_at_mut(root, path) {
+                        editor::toggle_mode(node);
+                    }
+                }
+                let mode = if *commit { "commit" } else { "fallthrough" };
+                let label = format!("group — {mode} · {children} rules");
+                draw_text(&fit_text(&label, gw - 8.0), cx_target + 4.0, ry + 15.0, 15.0, GROUP_COLOR);
+            }
+        }
+    }
+    if views.is_empty() {
+        draw_text(
+            "(no rules — this unit only waits; add one with + rule)",
+            x + 12.0,
+            list_y + 16.0,
+            16.0,
+            GRAY,
+        );
+    }
+    draw_text(
+        &format!("knows: {}", skill_names.join(", ")),
+        x + 8.0,
+        y + h - 7.0,
+        14.0,
+        Color::new(0.60, 0.63, 0.68, 1.0),
+    );
+
+    // --- toolbar: structural ops only (cells edit everything else inline) ---
+    let ty = y + 24.0;
+    let mut tb = Toolbar::new(ui, x + 8.0, ty);
+
+    if tb.button("+ rule", 56.0) {
+        if let Some(leaf) = editor::new_leaf(&known) {
+            let root = combat.gambits.get_mut(&id).unwrap();
+            editor::insert_at_selection(root, sel.as_deref(), leaf);
+        }
+    }
+    if tb.button("+ group", 64.0) {
+        let root = combat.gambits.get_mut(&id).unwrap();
+        editor::insert_at_selection(root, sel.as_deref(), editor::empty_root());
+    }
+    let Some(path) = sel else { return };
+    for (label, bw, up) in [("up", 36.0, true), ("down", 48.0, false)] {
+        if tb.button(label, bw) {
+            let root = combat.gambits.get_mut(&id).unwrap();
+            if editor::shift(root, &path, up) {
+                // Follow the moved node: its new path is the same but for the
+                // last step, so find where that lands in the fresh row list.
+                let mut moved = path.clone();
+                let last = moved.last_mut().unwrap();
+                *last = if up { *last - 1 } else { *last + 1 };
+                if let Some(i) = editor::rows(root).iter().position(|(p, _)| *p == moved) {
+                    es.sel_action = i;
+                }
+            }
+        }
+    }
+    if tb.button("delete", 56.0) {
+        let root = combat.gambits.get_mut(&id).unwrap();
+        editor::remove_at(root, &path);
+        es.sel_action = es.sel_action.saturating_sub(1);
+    }
+}
+
+/// The skill-detail card beside the action panel: metadata + effects of the
+/// skill in the currently selected rule, so a pick's numbers (cost, range,
+/// cast commit, what it actually does) are visible while authoring. Read-only.
+fn draw_skill_panel(es: &EditorState, combat: &Combat, id: EntityId, x: f32, y: f32, w: f32, h: f32) {
+    panel_chrome(x, y, w, h, "Skill details", false);
+
+    let root = &combat.gambits[&id];
+    let rows = editor::rows(root);
+    let sid = rows
+        .get(es.sel_action.min(rows.len().saturating_sub(1)))
+        .and_then(|(p, _)| editor::node_at(root, p))
+        .and_then(editor::leaf_skill_id);
+    let Some(sid) = sid else {
+        draw_text(
+            "select a rule to inspect",
+            x + 10.0,
+            y + 46.0,
+            15.0,
+            GRAY,
+        );
+        draw_text("its skill", x + 10.0, y + 64.0, 15.0, GRAY);
+        return;
+    };
+    let s = combat.state.skill(sid);
+
+    // Name, tinted like the skill's combat visuals.
+    draw_text(&s.name, x + 10.0, y + 46.0, 22.0, skill_color(s));
+
+    // Metadata: label column + value column.
+    let ticks = |t: u32| {
+        if t == 0 {
+            "—".to_string()
+        } else {
+            format!("{t} ticks ({:.1}s)", t as f32 * TICK_INTERVAL)
+        }
+    };
+    let stats: [(&str, String, Color); 5] = [
+        (
+            "element",
+            s.damage_type.map_or("—".into(), |dt| format!("{dt:?}")),
+            damage_color(s.damage_type),
+        ),
+        ("mp cost", if s.cost == 0 { "free".into() } else { s.cost.to_string() }, WHITE),
+        (
+            "range",
+            if s.range >= 90.0 { "map-wide".into() } else { editor::num(s.range) },
+            WHITE,
+        ),
+        ("cooldown", ticks(s.cooldown), WHITE),
+        (
+            "cast time",
+            if s.cast_time == 0 { "instant".into() } else { ticks(s.cast_time) },
+            WHITE,
+        ),
+    ];
+    let label_col = Color::new(0.60, 0.63, 0.68, 1.0);
+    let mut ty = y + 72.0;
+    for (label, value, col) in &stats {
+        draw_text(label, x + 10.0, ty, 15.0, label_col);
+        draw_text(&fit_text(value, w - 96.0), x + 86.0, ty, 15.0, *col);
+        ty += 19.0;
+    }
+
+    // What resolving it does, one effect per line.
+    ty += 8.0;
+    draw_text("ON USE", x + 10.0, ty, 13.0, label_col);
+    ty += 17.0;
+    for effect in &s.effects {
+        let line = editor::describe_effect(effect);
+        draw_text(&format!("- {}", fit_text(&line, w - 30.0)), x + 10.0, ty, 15.0, WHITE);
+        ty += 18.0;
+        if ty > y + h - 10.0 {
+            break;
+        }
+    }
+}
+
+/// The movement-gambit panel: the weighted scoring terms as a WEIGHT | TERM
+/// table — the term cell edits in place via the dropdown, while the toolbar
+/// nudges weight / distance and reorders.
+fn draw_move_panel(
+    es: &mut EditorState,
+    ui: &Ui,
+    combat: &mut Combat,
+    id: EntityId,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+) {
+    panel_chrome(
+        x,
+        y,
+        w,
+        h,
+        "Movement gambit  (weighted terms, blended — not priority rules)",
+        es.panel == 1,
+    );
+
+    let terms_len = combat.move_gambits[&id].terms.len();
+    es.sel_move = es.sel_move.min(terms_len.saturating_sub(1));
+    let labels: Vec<(String, String)> = combat.move_gambits[&id]
+        .terms
+        .iter()
+        .map(|(t, wt)| (format!("{wt:+.1}"), editor::describe_term(t)))
+        .collect();
+
+    // --- column layout: WEIGHT | TERM ---
+    let inner_x = x + 8.0;
+    let cw_wt = 58.0;
+    let cx_term = inner_x + cw_wt + 10.0;
+    let cw_term = x + w - 8.0 - cx_term;
+
+    let head_y = y + 24.0 + BTN_H + 8.0;
+    let head_col = Color::new(0.55, 0.58, 0.64, 1.0);
+    draw_text("WEIGHT", inner_x + 2.0, head_y + 11.0, 13.0, head_col);
+    draw_text("TERM", cx_term + 2.0, head_y + 11.0, 13.0, head_col);
+
+    let list_y = head_y + 16.0;
+    let list_h = h - (list_y - y) - 6.0;
+    draw_line(cx_term - 5.0, list_y, cx_term - 5.0, list_y + list_h, 1.0, with_alpha(WHITE, 0.08));
+
+    panel_scroll(ui, (x, y, w, h), &mut es.scroll_move, labels.len(), list_h);
+    for (i, (wt, term)) in labels.iter().enumerate() {
+        let ry = list_y + i as f32 * EDITOR_ROW_H - es.scroll_move;
+        if ry < list_y - 1.0 || ry + EDITOR_ROW_H > list_y + list_h + 1.0 {
+            continue;
+        }
+        if ui.row((x + 4.0, ry, w - 8.0, EDITOR_ROW_H), i == es.sel_move) {
+            es.sel_move = i;
+            es.panel = 1;
+        }
+        draw_text(wt, inner_x + 4.0, ry + 15.0, 15.0, WHITE);
+        // The term cell edits in place: a click opens the term dropdown here.
+        if cell(ui, (cx_term, ry, cw_term, EDITOR_ROW_H)) {
+            es.sel_move = i;
+            es.panel = 1;
+            es.menu = Some(OpenMenu {
+                kind: MenuKind::Term { index: i },
+                entity: id.0,
+                anchor: (cx_term, ry + EDITOR_ROW_H),
+                sub: None,
+            });
+        }
+        draw_text(&fit_text(term, cw_term - 8.0), cx_term + 4.0, ry + 15.0, 15.0, TARGET_COLOR);
+    }
+    if labels.is_empty() {
+        draw_text(
+            "(no terms — this unit holds position; add one with + term)",
+            x + 12.0,
+            list_y + 16.0,
+            16.0,
+            GRAY,
+        );
+    }
+
+    // --- toolbar: numeric nudges + structural ops (the term edits inline) ---
+    let ty = y + 24.0;
+    let mut tb = Toolbar::new(ui, x + 8.0, ty);
+
+    if tb.button("+ term", 58.0) {
+        combat.move_gambits.get_mut(&id).unwrap().terms.push(editor::default_term());
+    }
+    if terms_len == 0 {
+        return;
+    }
+    let i = es.sel_move;
+    for (label, delta) in [("wt -", -0.1f32), ("wt +", 0.1)] {
+        if tb.button(label, 44.0) {
+            let (_, wt) = &mut combat.move_gambits.get_mut(&id).unwrap().terms[i];
+            // Round to one decimal so repeated nudges don't accumulate float dust.
+            *wt = (((*wt + delta) * 10.0).round() / 10.0).clamp(-5.0, 5.0);
+        }
+    }
+    for (label, delta) in [("rng -", -0.5f32), ("rng +", 0.5)] {
+        if tb.button(label, 48.0) {
+            let (t, _) = &mut combat.move_gambits.get_mut(&id).unwrap().terms[i];
+            editor::adjust_ideal(t, delta);
+        }
+    }
+    if tb.button("up", 36.0) && i > 0 {
+        combat.move_gambits.get_mut(&id).unwrap().terms.swap(i, i - 1);
+        es.sel_move = i - 1;
+    }
+    if tb.button("down", 48.0) && i + 1 < terms_len {
+        combat.move_gambits.get_mut(&id).unwrap().terms.swap(i, i + 1);
+        es.sel_move = i + 1;
+    }
+    if tb.button("delete", 56.0) {
+        combat.move_gambits.get_mut(&id).unwrap().terms.remove(i);
+        es.sel_move = es.sel_move.saturating_sub(1);
+    }
 }
 
 // --- event formatting ------------------------------------------------------
