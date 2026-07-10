@@ -130,6 +130,11 @@ pub struct Status {
     pub stacks: u32,
     /// Remaining ticks before the status expires.
     pub duration: u32,
+    /// Who applied this status (`None` for hand-placed ones). Attribution
+    /// only — DoT/regen pulses and leech payback credit this entity's meter
+    /// tally; it never feeds back into resolution (a pulse still scales off
+    /// the *bearer's* state, not the applier's).
+    pub source: Option<EntityId>,
 }
 
 /// What a skill does when it resolves against each of its targets.
