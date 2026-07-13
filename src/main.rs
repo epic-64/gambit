@@ -16,6 +16,7 @@ mod combat;
 mod editor;
 mod eval;
 mod gambit;
+mod gauntlet;
 mod nav;
 mod scenario;
 mod terrain;
@@ -413,12 +414,19 @@ fn spawn_impact_vfx(
     }
 }
 
-/// Which screen the viewer is showing: the scenario picker, a live battle, or
-/// the gambit editor (paused battle underneath, edits apply on resume).
+/// Which screen the viewer is showing: the scenario picker, a live battle, the
+/// gambit editor (paused battle underneath, edits apply on resume), or one of
+/// the gauntlet's between-fight screens (pick an encounter, prepare the party).
 enum Screen {
     Menu,
     Playing,
     Editor,
+    /// Gauntlet: choose between the wave's two rolled encounters.
+    GauntletChoose,
+    /// Gauntlet: muster the party — cycle behavior presets or open the editor.
+    GauntletPrep,
+    /// Gauntlet: the upgrade shop — spend points on skill/tactic addons.
+    GauntletShop,
 }
 
 /// Where a gauntlet run stands within the current wave's battle. Only meaningful
@@ -489,44 +497,73 @@ async fn main() {
     // The active gauntlet run, if the gauntlet game mode is being played, plus
     // where the current wave stands (win/lose transitions live here). `None`
     // means an ordinary scenario is loaded instead.
-    let mut gauntlet: Option<scenario::GauntletRun> = None;
+    let mut gauntlet: Option<gauntlet::GauntletRun> = None;
     let mut gauntlet_phase = GauntletPhase::Fighting;
+    // Highlighted entry on the title menu (scenarios + the gauntlet).
+    let mut menu_sel = 0usize;
+    // Selection state of the gauntlet's between-fight screens, plus whether
+    // the editor was opened from the muster screen (to return there on exit).
+    let mut choose_sel = 0usize;
+    let mut prep_sel = 0usize;
+    let mut editor_from_prep = false;
+    // Shop screen state: highlighted catalog row, the member the purchase
+    // equips onto, and feedback from the last buy.
+    let mut shop_sel = 0usize;
+    let mut shop_member = 0usize;
+    let mut shop_msg = String::new();
+    // The banner's Enter also lands on the choose screen in the same frame
+    // (the Playing branch `continue`s straight into it); swallow that edge so
+    // the encounter choice isn't insta-confirmed and skipped.
+    let mut suppress_choose_enter = false;
 
     loop {
         match screen {
             Screen::Menu => {
-                // Number keys pick a scenario and drop into the battle.
-                for i in 0..scenarios.len() {
+                // Arrow keys walk the list, Enter starts the highlighted entry.
+                // Number keys still work as quiet shortcuts.
+                let total = scenarios.len() + 1; // + the gauntlet entry
+                if is_key_pressed(KeyCode::Down) {
+                    menu_sel = (menu_sel + 1) % total;
+                }
+                if is_key_pressed(KeyCode::Up) {
+                    menu_sel = (menu_sel + total - 1) % total;
+                }
+                let mut start: Option<usize> = None;
+                if is_key_pressed(KeyCode::Enter) {
+                    start = Some(menu_sel);
+                }
+                for i in 0..total {
                     if digit_key(i).is_some_and(is_key_pressed) {
-                        combat = Some(scenarios[i].1());
-                        current = i;
-                        gauntlet = None;
-                        log.clear();
-                        vfx.clear();
-                        flash.clear();
-                        shadows.clear();
-                        paused = false;
-                        editor_state = EditorState::default();
-                        screen = Screen::Playing;
+                        start = Some(i);
                     }
                 }
-                // The entry after the scenarios starts a fresh gauntlet run.
-                if digit_key(scenarios.len()).is_some_and(is_key_pressed) {
-                    let run = scenario::GauntletRun::new();
-                    combat = Some(run.build());
-                    gauntlet = Some(run);
-                    gauntlet_phase = GauntletPhase::Fighting;
+                if let Some(i) = start {
                     log.clear();
                     vfx.clear();
                     flash.clear();
                     shadows.clear();
                     paused = false;
                     editor_state = EditorState::default();
-                    screen = Screen::Playing;
+                    if i < scenarios.len() {
+                        // A demo scenario: straight into the battle.
+                        combat = Some(scenarios[i].1());
+                        current = i;
+                        gauntlet = None;
+                        screen = Screen::Playing;
+                    } else {
+                        // The gauntlet: a fresh run, first stop the encounter
+                        // choice for wave 1.
+                        let seed = (macroquad::miniquad::date::now() * 1000.0) as u64;
+                        gauntlet = Some(gauntlet::GauntletRun::new(seed));
+                        gauntlet_phase = GauntletPhase::Fighting;
+                        combat = None;
+                        choose_sel = 0;
+                        screen = Screen::GauntletChoose;
+                    }
                 }
 
                 clear_background(Color::new(0.10, 0.11, 0.13, 1.0));
-                draw_menu(&scenarios);
+                draw_menu(&scenarios, menu_sel);
             }
             Screen::Playing => {
                 // --- input ---
@@ -534,9 +571,10 @@ async fn main() {
                     paused = !paused;
                 }
                 if is_key_pressed(KeyCode::R) {
-                    if let Some(run) = gauntlet.as_mut() {
-                        // Restart the whole run from wave 1 (a fresh hero).
-                        *run = scenario::GauntletRun::new();
+                    if let Some(run) = gauntlet.as_ref() {
+                        // Retry the current wave: same encounter, same party
+                        // behaviors, everyone back at full HP — the iterate-on-
+                        // your-rules loop the mode is about.
                         combat = Some(run.build());
                         gauntlet_phase = GauntletPhase::Fighting;
                     } else {
@@ -558,26 +596,30 @@ async fn main() {
                 if is_key_pressed(KeyCode::I) {
                     show_intent = !show_intent;
                 }
-                // The gambit editor keys off the scenario registry, so it's only
-                // available in scenario mode — a gauntlet run has no registry slot.
-                if is_key_pressed(KeyCode::G) && gauntlet.is_none() {
+                // The gambit editor — in a gauntlet, edits made here are banked
+                // into the run (as Custom behaviors) when the editor closes.
+                if is_key_pressed(KeyCode::G) {
                     paused = true;
+                    editor_from_prep = false;
                     screen = Screen::Editor;
                 }
-                // Between-wave input: Enter carries a cleared run into the next
-                // (harder) wave, or leaves a lost run back to the menu.
+                // Between-wave input: Enter carries a cleared run on to the next
+                // wave's encounter choice, or leaves a lost run back to the menu.
                 if gauntlet.is_some() && is_key_pressed(KeyCode::Enter) {
                     match gauntlet_phase {
                         GauntletPhase::Cleared => {
                             let run = gauntlet.as_mut().unwrap();
                             run.clear_wave();
-                            combat = Some(run.build());
                             gauntlet_phase = GauntletPhase::Fighting;
+                            combat = None;
+                            choose_sel = 0;
                             log.clear();
                             vfx.clear();
                             flash.clear();
                             shadows.clear();
                             paused = false;
+                            suppress_choose_enter = true;
+                            screen = Screen::GauntletChoose;
                         }
                         GauntletPhase::Defeated => {
                             gauntlet = None;
@@ -704,7 +746,15 @@ async fn main() {
             Screen::Editor => {
                 if is_key_pressed(KeyCode::R) {
                     // Apply the edits from the top: fresh battle, edited rules.
-                    restart_keeping_edits(&scenarios, current, &mut combat);
+                    if let Some(run) = gauntlet.as_mut() {
+                        if let Some(c) = combat.as_ref() {
+                            run.capture_custom(c);
+                        }
+                        combat = Some(run.build());
+                        gauntlet_phase = GauntletPhase::Fighting;
+                    } else {
+                        restart_keeping_edits(&scenarios, current, &mut combat);
+                    }
                     log.clear();
                     vfx.clear();
                     flash.clear();
@@ -713,15 +763,24 @@ async fn main() {
                     editor_state.menu = None;
                     screen = Screen::Playing;
                 } else if is_key_pressed(KeyCode::G) || is_key_pressed(KeyCode::Escape) {
-                    // Esc/G close an open dropdown first, then leave to the
-                    // (paused) battle; edits are already live.
+                    // Esc/G close an open dropdown first, then leave to wherever
+                    // we came from; edits are already live (and, in a gauntlet,
+                    // banked into the run as Custom behaviors).
                     if editor_state.menu.is_some() {
                         editor_state.menu = None;
                     } else {
-                        screen = Screen::Playing;
+                        if let (Some(run), Some(c)) = (gauntlet.as_mut(), combat.as_ref()) {
+                            run.capture_custom(c);
+                        }
+                        screen = if editor_from_prep {
+                            Screen::GauntletPrep
+                        } else {
+                            Screen::Playing
+                        };
                     }
                 } else if is_key_pressed(KeyCode::M) {
                     editor_state.menu = None;
+                    gauntlet = None;
                     screen = Screen::Menu;
                 } else if let Some(combat) = combat.as_mut() {
                     let n = combat.state.entities.len();
@@ -746,7 +805,149 @@ async fn main() {
                     }
 
                     clear_background(Color::new(0.09, 0.10, 0.12, 1.0));
-                    draw_editor(&mut editor_state, combat, scenarios[current].0);
+                    let title = match gauntlet.as_ref() {
+                        Some(run) => format!("Gauntlet — Wave {}", run.wave()),
+                        None => scenarios[current].0.to_string(),
+                    };
+                    draw_editor(&mut editor_state, combat, &title);
+                } else {
+                    screen = Screen::Menu;
+                }
+            }
+            Screen::GauntletChoose => {
+                if is_key_pressed(KeyCode::M) || is_key_pressed(KeyCode::Escape) {
+                    gauntlet = None;
+                    screen = Screen::Menu;
+                }
+                if let Some(run) = gauntlet.as_mut() {
+                    if is_key_pressed(KeyCode::Left) || is_key_pressed(KeyCode::Key1) {
+                        choose_sel = 0;
+                    }
+                    if is_key_pressed(KeyCode::Right) || is_key_pressed(KeyCode::Key2) {
+                        choose_sel = 1;
+                    }
+                    choose_sel = choose_sel.min(run.offers().len().saturating_sub(1));
+                    if is_key_pressed(KeyCode::Enter) && !suppress_choose_enter {
+                        run.choose(choose_sel);
+                        prep_sel = 0;
+                        screen = Screen::GauntletPrep;
+                    }
+                    clear_background(Color::new(0.10, 0.11, 0.13, 1.0));
+                    draw_gauntlet_choose(run, choose_sel);
+                } else {
+                    screen = Screen::Menu;
+                }
+                suppress_choose_enter = false;
+            }
+            Screen::GauntletPrep => {
+                if is_key_pressed(KeyCode::M) {
+                    gauntlet = None;
+                    screen = Screen::Menu;
+                }
+                if is_key_pressed(KeyCode::Escape) {
+                    // Back out to the encounter choice (nothing is lost — the
+                    // party's behaviors live on the run).
+                    screen = Screen::GauntletChoose;
+                }
+                if let Some(run) = gauntlet.as_mut() {
+                    // The muster screen is one list: a row per member, then
+                    // "Upgrade shop" and "Start battle" rows — everything on
+                    // arrows + Enter + Esc. S/G stay as quiet shortcuts.
+                    let members = run.party.len();
+                    let rows = members + 2;
+                    if is_key_pressed(KeyCode::Down) {
+                        prep_sel = (prep_sel + 1) % rows;
+                    }
+                    if is_key_pressed(KeyCode::Up) {
+                        prep_sel = (prep_sel + rows - 1) % rows;
+                    }
+                    if prep_sel < members {
+                        if is_key_pressed(KeyCode::Right) {
+                            run.cycle_preset(prep_sel, true);
+                        }
+                        if is_key_pressed(KeyCode::Left) {
+                            run.cycle_preset(prep_sel, false);
+                        }
+                    }
+                    let enter = is_key_pressed(KeyCode::Enter);
+                    if is_key_pressed(KeyCode::S) || (enter && prep_sel == members) {
+                        // The upgrade shop; a member row carries its member
+                        // along as the purchase target.
+                        if prep_sel < members {
+                            shop_member = prep_sel;
+                        }
+                        shop_sel = 0;
+                        shop_msg.clear();
+                        screen = Screen::GauntletShop;
+                    } else if is_key_pressed(KeyCode::G) || (enter && prep_sel < members) {
+                        // Full custom mode: open the gambit editor on the
+                        // mustered battle (at the selected member); edits are
+                        // captured on the way out.
+                        combat = Some(run.build());
+                        editor_state = EditorState {
+                            entity: prep_sel.min(members - 1),
+                            ..EditorState::default()
+                        };
+                        editor_from_prep = true;
+                        paused = true;
+                        screen = Screen::Editor;
+                    } else if enter && prep_sel == members + 1 {
+                        combat = Some(run.build());
+                        gauntlet_phase = GauntletPhase::Fighting;
+                        log.clear();
+                        vfx.clear();
+                        flash.clear();
+                        shadows.clear();
+                        paused = false;
+                        screen = Screen::Playing;
+                    }
+                    clear_background(Color::new(0.10, 0.11, 0.13, 1.0));
+                    draw_gauntlet_prep(run, prep_sel);
+                } else {
+                    screen = Screen::Menu;
+                }
+            }
+            Screen::GauntletShop => {
+                if is_key_pressed(KeyCode::M) {
+                    gauntlet = None;
+                    screen = Screen::Menu;
+                }
+                if is_key_pressed(KeyCode::Escape) || is_key_pressed(KeyCode::S) {
+                    screen = Screen::GauntletPrep;
+                }
+                if let Some(run) = gauntlet.as_mut() {
+                    let items = gauntlet::CATALOG.len();
+                    if is_key_pressed(KeyCode::Down) {
+                        shop_sel = (shop_sel + 1) % items;
+                    }
+                    if is_key_pressed(KeyCode::Up) {
+                        shop_sel = (shop_sel + items - 1) % items;
+                    }
+                    let members = run.party.len();
+                    if is_key_pressed(KeyCode::Right) {
+                        shop_member = (shop_member + 1) % members;
+                    }
+                    if is_key_pressed(KeyCode::Left) {
+                        shop_member = (shop_member + members - 1) % members;
+                    }
+                    if is_key_pressed(KeyCode::Enter) {
+                        let item = &gauntlet::CATALOG[shop_sel];
+                        let name = run.party[shop_member].name;
+                        shop_msg = match run.buy(shop_member, shop_sel) {
+                            Ok(()) => format!("{} equipped on {name}.", item.name),
+                            Err(gauntlet::BuyError::AlreadyOwned) => {
+                                format!("{name} already owns {}.", item.name)
+                            }
+                            Err(gauntlet::BuyError::NotEnoughPoints) => format!(
+                                "Not enough points for {} ({} pts, {} banked).",
+                                item.name,
+                                item.cost,
+                                run.points()
+                            ),
+                        };
+                    }
+                    clear_background(Color::new(0.10, 0.11, 0.13, 1.0));
+                    draw_gauntlet_shop(run, shop_sel, shop_member, &shop_msg);
                 } else {
                     screen = Screen::Menu;
                 }
@@ -773,44 +974,44 @@ fn digit_key(i: usize) -> Option<KeyCode> {
     }
 }
 
-fn draw_menu(scenarios: &[(&'static str, fn() -> Combat)]) {
+fn draw_menu(scenarios: &[(&'static str, fn() -> Combat)], sel: usize) {
     draw_text("gambit", 44.0, 92.0, 52.0, WHITE);
     draw_text(
-        "Select a scenario",
+        "Select a game",
         46.0,
         140.0,
         26.0,
         Color::new(0.78, 0.80, 0.84, 1.0),
     );
 
+    let gold = Color::new(0.95, 0.85, 0.3, 1.0);
+    // The scenarios, then the gauntlet as the final entry — one highlighted
+    // list the arrow keys walk.
     let mut y = 196.0;
-    for (i, (name, _)) in scenarios.iter().enumerate() {
-        draw_text(&format!("{}.", i + 1), 60.0, y, 28.0, Color::new(0.95, 0.85, 0.3, 1.0));
-        draw_text(name, 96.0, y, 26.0, WHITE);
+    let mut row = |i: usize, name: &str, tint: Color| {
+        let selected = i == sel;
+        if selected {
+            draw_rectangle(
+                48.0,
+                y - 26.0,
+                screen_width() - 96.0,
+                36.0,
+                Color::new(0.18, 0.21, 0.27, 1.0),
+            );
+            draw_text(">", 60.0, y, 28.0, gold);
+        }
+        draw_text(name, 96.0, y, 26.0, if selected { gold } else { tint });
         y += 44.0;
+    };
+    for (i, (name, _)) in scenarios.iter().enumerate() {
+        row(i, name, WHITE);
     }
-    // The gauntlet game mode sits after the scenarios, on the next number key.
-    draw_text(
-        &format!("{}.", scenarios.len() + 1),
-        60.0,
-        y,
-        28.0,
-        Color::new(0.95, 0.85, 0.3, 1.0),
-    );
-    draw_text(scenario::GAUNTLET_LABEL, 96.0, y, 26.0, Color::new(0.95, 0.9, 0.7, 1.0));
-    y += 44.0;
+    row(scenarios.len(), gauntlet::GAUNTLET_LABEL, Color::new(0.95, 0.9, 0.7, 1.0));
 
     draw_text(
-        "Press a number key to begin.",
+        "Up/Down: select   ·   Enter: begin",
         46.0,
         y + 28.0,
-        20.0,
-        Color::new(0.65, 0.68, 0.72, 1.0),
-    );
-    draw_text(
-        "In battle:  Space pause  ·  G gambit editor  ·  R restart  ·  I intent lines  ·  M / Esc menu",
-        46.0,
-        y + 54.0,
         20.0,
         Color::new(0.65, 0.68, 0.72, 1.0),
     );
@@ -1752,13 +1953,16 @@ fn draw_gauntlet_banner(phase: GauntletPhase, wave: u32) {
     );
     let (headline, prompt, color) = match phase {
         GauntletPhase::Cleared => (
-            format!("Wave {wave} cleared!"),
-            "Enter: face the next wave   ·   M: menu".to_string(),
+            format!(
+                "Wave {wave} cleared!   +{} upgrade points",
+                gauntlet::GauntletRun::wave_award(wave)
+            ),
+            "Enter: choose the next battle".to_string(),
             Color::new(0.45, 0.85, 0.5, 1.0),
         ),
         GauntletPhase::Defeated => (
-            format!("You fell on Wave {wave}"),
-            "Enter / M: menu   ·   R: run it again from Wave 1".to_string(),
+            format!("Your party fell on Wave {wave}"),
+            "Enter: back to menu   ·   R: retry this wave".to_string(),
             Color::new(0.9, 0.45, 0.4, 1.0),
         ),
         GauntletPhase::Fighting => return,
@@ -1776,6 +1980,305 @@ fn draw_gauntlet_banner(phase: GauntletPhase, wave: u32) {
         cy + 34.0,
         psize,
         Color::new(0.82, 0.85, 0.9, 1.0),
+    );
+}
+
+// --- gauntlet between-fight screens ------------------------------------------
+
+/// A to-scale preview of an encounter's arena: every tile in its true top-face
+/// color plus spawn markers — blue dots where the party musters, red where the
+/// rolled roster fans out. Drawn from the same tiles (and the same spawn
+/// functions) the fight will use, so the preview *is* the battle.
+fn draw_minimap(enc: &gauntlet::Encounter, party_n: usize, x: f32, y: f32, w: f32, h: f32) {
+    let t = &enc.terrain;
+    let s = (w / t.cols as f32).min(h / t.rows as f32);
+    let ox = x + (w - s * t.cols as f32) / 2.0;
+    let oy = y + (h - s * t.rows as f32) / 2.0;
+    for r in 0..t.rows {
+        for c in 0..t.cols {
+            let Some(tile) = t.tile(c, r) else { continue };
+            draw_rectangle(ox + c as f32 * s, oy + r as f32 * s, s, s, tile_top_color(tile));
+        }
+    }
+    draw_rectangle_lines(
+        ox,
+        oy,
+        s * t.cols as f32,
+        s * t.rows as f32,
+        1.5,
+        Color::new(0.3, 0.34, 0.4, 1.0),
+    );
+    let dot = (s * 0.45).max(2.5);
+    for p in gauntlet::party_spawns(t, party_n) {
+        draw_circle(ox + p.x * s, oy + p.y * s, dot, team_color(Team::Player));
+    }
+    for p in gauntlet::foe_spawns(t, enc.foes.len()) {
+        draw_circle(ox + p.x * s, oy + p.y * s, dot, team_color(Team::Enemy));
+    }
+}
+
+/// The encounter-choice screen: the wave's two rolled offers side by side, each
+/// previewing exactly what you'd fight — the arena and the roster with its
+/// effective numbers.
+fn draw_gauntlet_choose(run: &gauntlet::GauntletRun, sel: usize) {
+    draw_text(&format!("Gauntlet — Wave {}", run.wave()), 44.0, 60.0, 40.0, WHITE);
+    draw_text(
+        "Choose your battle",
+        46.0,
+        96.0,
+        24.0,
+        Color::new(0.78, 0.80, 0.84, 1.0),
+    );
+
+    let offers = run.offers();
+    let margin = 44.0;
+    let gap = 28.0;
+    let pw = (screen_width() - margin * 2.0 - gap) / offers.len().max(1) as f32;
+    let py = 118.0;
+    let ph = screen_height() - py - 60.0;
+    let gold = Color::new(0.95, 0.85, 0.3, 1.0);
+    let dim = Color::new(0.65, 0.68, 0.72, 1.0);
+
+    for (i, off) in offers.iter().enumerate() {
+        let px = margin + i as f32 * (pw + gap);
+        let selected = i == sel;
+        draw_rectangle(px, py, pw, ph, Color::new(0.13, 0.145, 0.175, 1.0));
+        let border = if selected { gold } else { Color::new(0.3, 0.34, 0.4, 1.0) };
+        draw_rectangle_lines(px, py, pw, ph, if selected { 3.0 } else { 1.5 }, border);
+
+        draw_text(
+            &format!("{}.  {} x {} field", i + 1, off.terrain.cols, off.terrain.rows),
+            px + 16.0,
+            py + 30.0,
+            24.0,
+            if selected { gold } else { WHITE },
+        );
+
+        let map_h = ph * 0.52;
+        draw_minimap(off, run.party.len(), px + 16.0, py + 44.0, pw - 32.0, map_h);
+
+        let mut y = py + 44.0 + map_h + 30.0;
+        for (name, count, hp) in off.foe_summary() {
+            draw_text(
+                &format!("{count} x {name}   ({hp:.0} HP each)"),
+                px + 20.0,
+                y,
+                22.0,
+                Color::new(0.9, 0.62, 0.55, 1.0),
+            );
+            y += 28.0;
+        }
+        draw_text(
+            &format!("{} foes, {:.0} HP total", off.foes.len(), off.total_enemy_hp()),
+            px + 20.0,
+            y + 6.0,
+            20.0,
+            dim,
+        );
+    }
+
+    draw_text(
+        "Left/Right: select   ·   Enter: prepare the party   ·   Esc: menu",
+        44.0,
+        screen_height() - 22.0,
+        20.0,
+        dim,
+    );
+}
+
+/// The muster screen: one list the arrow keys walk — a card per party member
+/// (Left/Right cycles its behavior preset, Enter opens its rules in the gambit
+/// editor), then "Upgrade shop" and "Start battle" rows. A member's behavior is
+/// a preset off the catalog or "Custom", the captured result of hand-editing.
+fn draw_gauntlet_prep(run: &gauntlet::GauntletRun, sel: usize) {
+    draw_text(&format!("Gauntlet — Wave {}", run.wave()), 44.0, 60.0, 40.0, WHITE);
+    let enc = run.chosen_encounter();
+    let gold = Color::new(0.95, 0.85, 0.3, 1.0);
+    let dim = Color::new(0.65, 0.68, 0.72, 1.0);
+    draw_text(
+        &format!(
+            "Prepare your party — facing {} foes on a {} x {} field",
+            enc.foes.len(),
+            enc.terrain.cols,
+            enc.terrain.rows
+        ),
+        46.0,
+        96.0,
+        24.0,
+        Color::new(0.78, 0.80, 0.84, 1.0),
+    );
+    let pts = format!("{} upgrade points", run.points());
+    let pd = measure_text(&pts, None, 24, 1.0);
+    draw_text(&pts, screen_width() - pd.width - 44.0, 60.0, 24.0, gold);
+
+    let margin = 44.0;
+    let py = 116.0;
+    let card_h = 110.0;
+    let w = screen_width() - margin * 2.0;
+
+    for (i, member) in run.party.iter().enumerate() {
+        let cy = py + i as f32 * (card_h + 8.0);
+        let selected = i == sel;
+        draw_rectangle(margin, cy, w, card_h, Color::new(0.13, 0.145, 0.175, 1.0));
+        let border = if selected { gold } else { Color::new(0.3, 0.34, 0.4, 1.0) };
+        draw_rectangle_lines(margin, cy, w, card_h, if selected { 3.0 } else { 1.5 }, border);
+
+        draw_text(member.name, margin + 18.0, cy + 28.0, 26.0, team_color(Team::Player));
+        draw_text(
+            &format!("{:.0} HP", run.member_hp(i)),
+            margin + 160.0,
+            cy + 28.0,
+            20.0,
+            WHITE,
+        );
+        draw_text(
+            &format!("Kit: {}", gauntlet::GauntletRun::kit_names(i).join(", ")),
+            margin + 260.0,
+            cy + 28.0,
+            20.0,
+            dim,
+        );
+
+        let (label, blurb) = match &member.behavior {
+            gauntlet::Behavior::Preset(p) => {
+                (gauntlet::PRESETS[*p].name, gauntlet::PRESETS[*p].blurb)
+            }
+            gauntlet::Behavior::Custom { .. } => {
+                ("Custom", "hand-authored rules from the gambit editor")
+            }
+        };
+        draw_text(
+            &format!("<  {label}  >"),
+            margin + 18.0,
+            cy + 58.0,
+            24.0,
+            if selected { gold } else { Color::new(0.85, 0.87, 0.9, 1.0) },
+        );
+        draw_text(blurb, margin + 220.0, cy + 58.0, 19.0, dim);
+
+        let addons = if member.addons.is_empty() {
+            "Addons: none".to_string()
+        } else {
+            format!(
+                "Addons: {}",
+                member
+                    .addons
+                    .iter()
+                    .map(|&a| gauntlet::CATALOG[a].name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        draw_text(&addons, margin + 18.0, cy + 88.0, 19.0, Color::new(0.6, 0.8, 0.95, 1.0));
+    }
+
+    // The two action rows: the shop and the launch button.
+    let members = run.party.len();
+    let btn_h = 36.0;
+    let mut by = py + members as f32 * (card_h + 8.0) + 4.0;
+    for (idx, label) in [
+        (members, format!("Upgrade shop   —   {} points to spend", run.points())),
+        (members + 1, "Start battle".to_string()),
+    ] {
+        let selected = idx == sel;
+        draw_rectangle(margin, by, w, btn_h, Color::new(0.15, 0.17, 0.21, 1.0));
+        let border = if selected { gold } else { Color::new(0.3, 0.34, 0.4, 1.0) };
+        draw_rectangle_lines(margin, by, w, btn_h, if selected { 3.0 } else { 1.5 }, border);
+        if selected {
+            draw_text(">", margin + 14.0, by + 25.0, 24.0, gold);
+        }
+        draw_text(
+            &label,
+            margin + 36.0,
+            by + 25.0,
+            24.0,
+            if selected { gold } else { Color::new(0.85, 0.87, 0.9, 1.0) },
+        );
+        by += btn_h + 8.0;
+    }
+
+    draw_text(
+        "Up/Down: select   ·   Left/Right: change behavior   ·   Enter: edit rules / open   ·   Esc: back",
+        44.0,
+        screen_height() - 22.0,
+        19.0,
+        dim,
+    );
+}
+
+/// The upgrade shop: the addon catalog with costs, categories and blurbs.
+/// Up/Down walks the catalog, Left/Right retargets which member the purchase
+/// equips onto, Enter buys. Ownership is per member; injected rules take
+/// priority in purchase order (equipping is programming).
+fn draw_gauntlet_shop(run: &gauntlet::GauntletRun, sel: usize, member: usize, msg: &str) {
+    let gold = Color::new(0.95, 0.85, 0.3, 1.0);
+    let dim = Color::new(0.65, 0.68, 0.72, 1.0);
+    draw_text(&format!("Gauntlet — Wave {}", run.wave()), 44.0, 60.0, 40.0, WHITE);
+    draw_text(
+        &format!(
+            "Upgrade shop — buying for {}   (Left/Right to change)",
+            run.party[member].name
+        ),
+        46.0,
+        96.0,
+        24.0,
+        Color::new(0.78, 0.80, 0.84, 1.0),
+    );
+    let pts = format!("{} points", run.points());
+    let pd = measure_text(&pts, None, 28, 1.0);
+    draw_text(&pts, screen_width() - pd.width - 44.0, 60.0, 28.0, gold);
+
+    let margin = 44.0;
+    let top = 126.0;
+    let row_h = 30.0;
+    for (i, item) in gauntlet::CATALOG.iter().enumerate() {
+        let y = top + i as f32 * row_h;
+        let selected = i == sel;
+        if selected {
+            draw_rectangle(
+                margin - 8.0,
+                y - row_h + 9.0,
+                screen_width() - margin * 2.0 + 16.0,
+                row_h - 2.0,
+                Color::new(0.20, 0.23, 0.30, 1.0),
+            );
+        }
+        let owned = run.party[member].addons.contains(&i);
+        let affordable = run.points() >= item.cost;
+        let name_color = if owned {
+            Color::new(0.5, 0.75, 0.5, 1.0)
+        } else if selected {
+            gold
+        } else if affordable {
+            WHITE
+        } else {
+            Color::new(0.55, 0.45, 0.45, 1.0)
+        };
+        draw_text(&format!("{:>2} pts", item.cost), margin, y, 20.0, if affordable { gold } else { dim });
+        draw_text(item.name, margin + 78.0, y, 22.0, name_color);
+        draw_text(&format!("[{}]", item.category()), margin + 268.0, y, 18.0, dim);
+        draw_text(item.blurb, margin + 340.0, y, 19.0, Color::new(0.8, 0.82, 0.86, 1.0));
+        // Which members already own it, as initials after the name.
+        let owners: String = run
+            .party
+            .iter()
+            .filter(|m| m.addons.contains(&i))
+            .map(|m| m.name.chars().next().unwrap_or('?'))
+            .collect();
+        if !owners.is_empty() {
+            draw_text(&format!("({owners})"), margin + 228.0, y, 18.0, Color::new(0.5, 0.75, 0.5, 1.0));
+        }
+    }
+
+    if !msg.is_empty() {
+        draw_text(msg, 44.0, screen_height() - 52.0, 21.0, gold);
+    }
+    draw_text(
+        "Up/Down: item   ·   Left/Right: member   ·   Enter: buy & equip   ·   Esc: back",
+        44.0,
+        screen_height() - 22.0,
+        19.0,
+        dim,
     );
 }
 
