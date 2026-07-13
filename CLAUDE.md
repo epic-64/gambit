@@ -55,11 +55,16 @@ src/
               editor, persists across waves; capture diffs against the preset baseline so
               merely opening the editor doesn't relabel a member). Progression: cleared
               waves pay upgrade points (2 + wave, small stipend at start) spent in an addon
-              CATALOG — purchasable skills (Charge/Barrier/Purify/Chain Lightning/War Cry/
-              Heal: kit entry + an auto use-rule) and tactics (Peel Allies/Focus Fire/
-              Execute the Weak as action rules; Seek High Ground/Kite/Bodyguard/Flank as
-              movement terms) — equipped per member; injected rules sit ABOVE the preset's
-              own, in purchase order ("equipping is programming"). Addons never re-inject
+              CATALOG — 25 purchasable skills (kit entry + an auto use-rule mirroring how
+              the skirmish gambits fired it; ShopSkill::def()/rules() are self-describing,
+              one variant per skill: the skirmish arsenal — Charge, Backstab, Dash, Maim,
+              Reap, Sneak, Spell Counter, Storm, Rend, Ice Lance, Prayer, Siphon, both
+              chants, Sunder, Leeching Mark, Mana Rend, Soothing Touch, … — plus shop
+              originals Ignite (Burn DoT) and Regrowth (Regen HoT)) and 7 tactics (Peel
+              Allies/Focus Fire/Execute the Weak as action rules; Seek High Ground/Kite/
+              Bodyguard/Flank as movement terms) — equipped per member; injected rules sit
+              ABOVE the preset's own, in purchase order ("equipping is programming"; the
+              shop UI scrolls). Addons never re-inject
               into a captured Custom tree (that would duplicate rules every wave) — Custom
               members only gain the bought skill in their kit and wire it by hand. (unit tests)
   editor.rs   Engine-agnostic support for the gambit editor: describe-as-text for every gambit
