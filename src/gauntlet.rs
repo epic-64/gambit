@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 
 use crate::battle::*;
-use crate::combat::Combat;
+use crate::combat::{Combat, STORM_RADIUS};
 use crate::gambit::*;
 use crate::nav;
 use crate::scenario::{push_skill, HP_SCALE, MP_REGEN, SPAWN_MP};
@@ -575,8 +575,9 @@ pub struct PartyMember {
 // ---------------------------------------------------------------------------
 
 /// A purchasable skill — pushed into every battle's skill list so an equip is
-/// just "add to the member's kit + inject a sensible use-rule".
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// just "add to the member's kit + inject a sensible use-rule". Most are the
+/// skirmish kits' proven pieces; a couple (Ignite, Regrowth) are shop originals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ShopSkill {
     Charge,
     Barrier,
@@ -584,6 +585,281 @@ pub enum ShopSkill {
     ChainLightning,
     WarCry,
     Heal,
+    Backstab,
+    Dash,
+    Maim,
+    Reap,
+    Sneak,
+    SpellCounter,
+    Storm,
+    Rend,
+    IceLance,
+    Prayer,
+    Siphon,
+    WarChant,
+    LifeChant,
+    Sunder,
+    LeechingMark,
+    ManaRend,
+    SoothingTouch,
+    Ignite,
+    Regrowth,
+}
+
+impl ShopSkill {
+    /// Every variant, in catalog order — [`GauntletRun::build`] pushes one
+    /// skill per entry so equips resolve to real ids.
+    const ALL: [ShopSkill; 25] = [
+        ShopSkill::Charge,
+        ShopSkill::Barrier,
+        ShopSkill::Purify,
+        ShopSkill::ChainLightning,
+        ShopSkill::WarCry,
+        ShopSkill::Heal,
+        ShopSkill::Backstab,
+        ShopSkill::Dash,
+        ShopSkill::Maim,
+        ShopSkill::Reap,
+        ShopSkill::Sneak,
+        ShopSkill::SpellCounter,
+        ShopSkill::Storm,
+        ShopSkill::Rend,
+        ShopSkill::IceLance,
+        ShopSkill::Prayer,
+        ShopSkill::Siphon,
+        ShopSkill::WarChant,
+        ShopSkill::LifeChant,
+        ShopSkill::Sunder,
+        ShopSkill::LeechingMark,
+        ShopSkill::ManaRend,
+        ShopSkill::SoothingTouch,
+        ShopSkill::Ignite,
+        ShopSkill::Regrowth,
+    ];
+
+    /// The skill definition — numbers mirror the skirmish versions each was
+    /// proven in (Ignite/Regrowth are tuned alongside them).
+    fn def(self) -> Skill {
+        let dmg = |name: &str, cost, range, cooldown, cast_time, dt, effects| Skill {
+            name: name.into(),
+            cost,
+            range,
+            cooldown,
+            cast_time,
+            damage_type: dt,
+            effects,
+        };
+        let phys = Some(DamageType::Physical);
+        let inflict = |kind, stacks, duration| Effect::Inflict { kind, stacks, duration };
+        match self {
+            ShopSkill::Charge => dmg(
+                "Charge", 15, 6.0, 24, 0, phys,
+                vec![Effect::Dash { max: 6.0 }, Effect::Damage(12.0), inflict(StatusKind::Stun, 1, 4)],
+            ),
+            ShopSkill::Barrier => dmg(
+                "Barrier", 20, 100.0, 16, 0, None,
+                vec![inflict(StatusKind::Shield, 1, 12)],
+            ),
+            ShopSkill::Purify => dmg("Purify", 10, 100.0, 4, 0, None, vec![Effect::Cleanse]),
+            ShopSkill::ChainLightning => dmg(
+                "Chain Lightning", 25, 100.0, 10, 2, Some(DamageType::Lightning),
+                vec![Effect::ChainDamage { base: 15.0, jumps: 3, falloff: 0.7, jump_range: 5.0 }],
+            ),
+            ShopSkill::WarCry => dmg(
+                "War Cry", 10, 100.0, 64, 0, None,
+                vec![inflict(StatusKind::Enrage, 1, 12)],
+            ),
+            ShopSkill::Heal => dmg("Heal", 25, 100.0, 6, 0, None, vec![Effect::Heal(38.0)]),
+            ShopSkill::Backstab => dmg(
+                "Backstab", 10, 2.5, 6, 0, phys,
+                vec![Effect::Damage(13.0), inflict(StatusKind::Poison, 1, 4)],
+            ),
+            ShopSkill::Dash => dmg(
+                "Dash", 20, 5.0, 20, 0, phys,
+                vec![Effect::Dash { max: 4.0 }, Effect::Damage(14.0), inflict(StatusKind::Snare, 1, 8)],
+            ),
+            ShopSkill::Maim => dmg(
+                "Maim", 10, 2.5, 48, 0, phys,
+                vec![Effect::Damage(12.0), inflict(StatusKind::MortalWound, 1, 24)],
+            ),
+            ShopSkill::Reap => dmg("Reap", 5, 2.5, 4, 0, phys, vec![Effect::ExecuteDamage(10.0)]),
+            ShopSkill::Sneak => dmg(
+                "Sneak", 15, 100.0, 80, 0, None,
+                vec![inflict(StatusKind::Sneak, 1, 20)],
+            ),
+            ShopSkill::SpellCounter => dmg(
+                "Spell Counter", 10, 100.0, 24, 1, None,
+                vec![inflict(StatusKind::SpellWard, 1, 12)],
+            ),
+            ShopSkill::Storm => dmg(
+                "Storm", 20, 100.0, 48, 1, None,
+                vec![inflict(StatusKind::StormAura, 1, 24)],
+            ),
+            ShopSkill::Rend => dmg("Rend", 15, 3.0, 40, 0, phys, vec![Effect::Damage(14.0)]),
+            ShopSkill::IceLance => dmg(
+                "Ice Lance", 35, 100.0, 14, 5, Some(DamageType::Ice),
+                vec![Effect::Damage(34.0)],
+            ),
+            ShopSkill::Prayer => dmg("Prayer", 20, 8.0, 14, 2, None, vec![Effect::Heal(24.0)]),
+            ShopSkill::Siphon => dmg("Siphon", 15, 9.0, 8, 1, None, vec![Effect::Drain(12.0)]),
+            ShopSkill::WarChant => dmg(
+                "War Chant", 10, 100.0, 10, 1, None,
+                vec![inflict(StatusKind::MightAura, 1, 24)],
+            ),
+            ShopSkill::LifeChant => dmg(
+                "Life Chant", 10, 100.0, 10, 1, None,
+                vec![inflict(StatusKind::RegenAura, 1, 24)],
+            ),
+            ShopSkill::Sunder => dmg(
+                "Sunder", 12, 2.5, 64, 0, phys,
+                vec![Effect::Damage(12.0), inflict(StatusKind::Exposed, 1, 32)],
+            ),
+            ShopSkill::LeechingMark => dmg(
+                "Leeching Mark", 12, 9.0, 64, 0, None,
+                vec![inflict(StatusKind::Lifeleech, 1, 32)],
+            ),
+            ShopSkill::ManaRend => dmg(
+                "Mana Rend", 0, 2.5, 6, 0, Some(DamageType::Lightning),
+                vec![Effect::Damage(7.0), Effect::DrainMp(15.0)],
+            ),
+            ShopSkill::SoothingTouch => dmg(
+                "Soothing Touch", 8, 2.5, 7, 0, None,
+                vec![Effect::Heal(12.0), Effect::Cleanse],
+            ),
+            ShopSkill::Ignite => dmg(
+                "Ignite", 12, 9.0, 10, 1, Some(DamageType::Fire),
+                vec![Effect::Damage(8.0), inflict(StatusKind::Burn, 2, 8)],
+            ),
+            ShopSkill::Regrowth => dmg(
+                "Regrowth", 15, 100.0, 10, 0, None,
+                vec![inflict(StatusKind::Regen, 2, 12)],
+            ),
+        }
+    }
+
+    /// The auto use-rules injected when this skill is equipped on a preset
+    /// member — each mirrors how the skirmish gambits fired it, so a purchase
+    /// visibly works out of the box.
+    fn rules(self, id: SkillId) -> Vec<Node> {
+        let myself = || TargetQuery::new(Pool::Myself);
+        let without = |q: TargetQuery, s| q.filter(Filter::Not(Box::new(Filter::HasStatus(s))));
+        let foe_in_reach = |d: f32| {
+            Condition::Exists(TargetQuery::new(Pool::Enemies).filter(
+                Filter::WithinDistanceOf(Box::new(TargetQuery::new(Pool::Myself)), d),
+            ))
+        };
+        let crowded = |d: f32, n| Condition::Count {
+            q: TargetQuery::new(Pool::Enemies).filter(Filter::WithinDistance(d)),
+            cmp: Cmp::Ge,
+            n,
+        };
+        match self {
+            ShopSkill::Charge => vec![
+                Node::act(ally_attacker(), id),
+                Node::act(nearest_enemy(), id),
+            ],
+            ShopSkill::Barrier => vec![Node::act(
+                without(hurt_ally(0.65), StatusKind::Shield),
+                id,
+            )],
+            ShopSkill::Purify => vec![
+                Node::act(ally_with(StatusKind::Poison), id),
+                Node::act(ally_with(StatusKind::Snare), id),
+            ],
+            ShopSkill::ChainLightning => vec![Node::act(clustered_enemy(), id)],
+            // Roar once a foe is in reach, so the window isn't wasted on the
+            // approach march (the ogre's pattern).
+            ShopSkill::WarCry => vec![Node::act(myself(), id).when(foe_in_reach(4.0))],
+            ShopSkill::Heal => vec![Node::act(hurt_ally(0.6), id)],
+            ShopSkill::Backstab => vec![Node::act(squishiest_enemy(), id)],
+            ShopSkill::Dash => vec![Node::act(squishiest_enemy(), id)],
+            // Open the wound on an unwounded mark, so what follows lands
+            // against halved triage.
+            ShopSkill::Maim => vec![Node::act(
+                TargetQuery::new(Pool::Enemies)
+                    .filter(Filter::Not(Box::new(Filter::HasStatus(StatusKind::MortalWound))))
+                    .sort(SortKey::MaxHp, Order::Asc),
+                id,
+            )],
+            // Only where the missing-HP scaling beats a flat hit.
+            ShopSkill::Reap => vec![Node::act(
+                TargetQuery::new(Pool::Enemies)
+                    .filter(Filter::HpPctBelow(0.7))
+                    .sort(SortKey::HpPct, Order::Asc),
+                id,
+            )],
+            // Vanish when swarmed — and only once actually scratched.
+            ShopSkill::Sneak => vec![Node::act(
+                myself().filter(Filter::HpPctBelow(1.0)),
+                id,
+            )
+            .when(crowded(4.0, 2))],
+            ShopSkill::SpellCounter => vec![Node::act(
+                without(myself(), StatusKind::SpellWard),
+                id,
+            )],
+            // Summon the field only where it bites (the tempest's gate).
+            ShopSkill::Storm => vec![Node::act(myself(), id).when(foe_in_reach(STORM_RADIUS))],
+            // Sweep only when the crowd makes the 360° hit pay.
+            ShopSkill::Rend => vec![
+                Node::act(TargetQuery::new(Pool::Enemies).pick(Pick::All), id)
+                    .when(crowded(3.0, 2)),
+            ],
+            // The longest root in the game — never with a foe in your face.
+            ShopSkill::IceLance => vec![
+                Node::act(squishiest_enemy(), id).when(no_foe_in_my_face()),
+            ],
+            // Group-heal when the party is bleeding (the cleric's loose gate).
+            ShopSkill::Prayer => vec![Node::act(hurt_ally(0.8).pick(Pick::All), id).when(
+                Condition::Count { q: hurt_ally(0.8).pick(Pick::All), cmp: Cmp::Ge, n: 2 },
+            )],
+            ShopSkill::Siphon => vec![
+                Node::act(allys_target(), id),
+                Node::act(nearest_enemy(), id),
+            ],
+            // The chanters' re-sing pattern: chant whenever the aura lapsed.
+            ShopSkill::WarChant => vec![Node::act(
+                without(myself(), StatusKind::MightAura),
+                id,
+            )],
+            ShopSkill::LifeChant => vec![Node::act(
+                without(myself(), StatusKind::RegenAura),
+                id,
+            )],
+            // Crack the toughest guard — Exposed pays most on the longest soak.
+            ShopSkill::Sunder => vec![Node::act(
+                TargetQuery::new(Pool::Enemies).sort(SortKey::Hp, Order::Desc),
+                id,
+            )],
+            // Mark the toughest foe the pack is already trading with.
+            ShopSkill::LeechingMark => vec![Node::act(
+                TargetQuery::new(Pool::Enemies)
+                    .filter(Filter::WithinDistanceOf(
+                        Box::new(TargetQuery::new(Pool::Allies).pick(Pick::All)),
+                        3.0,
+                    ))
+                    .sort(SortKey::Hp, Order::Desc),
+                id,
+            )],
+            // Tear the fattest MP pool in reach.
+            ShopSkill::ManaRend => vec![Node::act(
+                TargetQuery::new(Pool::Enemies).sort(SortKey::Mp, Order::Desc),
+                id,
+            )],
+            ShopSkill::SoothingTouch => vec![Node::act(hurt_ally(0.8), id)],
+            // Spread the burn to unburned tough targets — DoT pays over time.
+            ShopSkill::Ignite => vec![Node::act(
+                TargetQuery::new(Pool::Enemies)
+                    .filter(Filter::Not(Box::new(Filter::HasStatus(StatusKind::Burn))))
+                    .sort(SortKey::Hp, Order::Desc),
+                id,
+            )],
+            ShopSkill::Regrowth => vec![Node::act(
+                without(hurt_ally(0.8), StatusKind::Regen),
+                id,
+            )],
+        }
+    }
 }
 
 /// A purchasable tactic: a named rule- or movement-bundle (the strategies the
@@ -644,7 +920,7 @@ impl Addon {
 /// purchase visibly *does something* out of the box; tactics graft proven rule
 /// patterns (or movement pulls) onto the member's preset. Injected rules sit
 /// *above* the preset's own, in purchase order — equipping is programming.
-pub const CATALOG: [Addon; 13] = [
+pub const CATALOG: &[Addon] = &[
     Addon {
         name: "Charge",
         cost: 6,
@@ -680,6 +956,120 @@ pub const CATALOG: [Addon; 13] = [
         cost: 5,
         blurb: "learn the triage mend (most-hurt ally first)",
         kind: AddonKind::Skill(ShopSkill::Heal),
+    },
+    Addon {
+        name: "Backstab",
+        cost: 5,
+        blurb: "melee strike that leaves poison ticking on the frailest frame",
+        kind: AddonKind::Skill(ShopSkill::Backstab),
+    },
+    Addon {
+        name: "Dash",
+        cost: 6,
+        blurb: "fast gap-closer onto the squishiest foe, snaring it in place",
+        kind: AddonKind::Skill(ShopSkill::Dash),
+    },
+    Addon {
+        name: "Maim",
+        cost: 4,
+        blurb: "open a grievous wound — the mark's incoming healing is halved",
+        kind: AddonKind::Skill(ShopSkill::Maim),
+    },
+    Addon {
+        name: "Reap",
+        cost: 5,
+        blurb: "execute strike that grows with the target's missing HP",
+        kind: AddonKind::Skill(ShopSkill::Reap),
+    },
+    Addon {
+        name: "Sneak",
+        cost: 6,
+        blurb: "vanish when swarmed — untargetable until the next action",
+        kind: AddonKind::Skill(ShopSkill::Sneak),
+    },
+    Addon {
+        name: "Spell Counter",
+        cost: 4,
+        blurb: "a ward that eats the next hostile spell and hurls it back",
+        kind: AddonKind::Skill(ShopSkill::SpellCounter),
+    },
+    Addon {
+        name: "Storm",
+        cost: 7,
+        blurb: "the tempest's crackling field — pulses damage into every foe inside",
+        kind: AddonKind::Skill(ShopSkill::Storm),
+    },
+    Addon {
+        name: "Rend",
+        cost: 5,
+        blurb: "360° sweep hitting every foe in arm's reach — the anti-crowd swing",
+        kind: AddonKind::Skill(ShopSkill::Rend),
+    },
+    Addon {
+        name: "Ice Lance",
+        cost: 7,
+        blurb: "the heaviest nuke in the game, bought with a 5-tick rooted cast",
+        kind: AddonKind::Skill(ShopSkill::IceLance),
+    },
+    Addon {
+        name: "Prayer",
+        cost: 6,
+        blurb: "group-heal every hurt ally within 8m when the party is bleeding",
+        kind: AddonKind::Skill(ShopSkill::Prayer),
+    },
+    Addon {
+        name: "Siphon",
+        cost: 5,
+        blurb: "drain that returns half of what lands as self-healing",
+        kind: AddonKind::Skill(ShopSkill::Siphon),
+    },
+    Addon {
+        name: "War Chant",
+        cost: 6,
+        blurb: "aura: +5% damage per covered teammate while the song holds",
+        kind: AddonKind::Skill(ShopSkill::WarChant),
+    },
+    Addon {
+        name: "Life Chant",
+        cost: 6,
+        blurb: "aura: a pulsing HP drip for every covered teammate",
+        kind: AddonKind::Skill(ShopSkill::LifeChant),
+    },
+    Addon {
+        name: "Sunder",
+        cost: 4,
+        blurb: "crack the toughest guard open: +10% damage taken from all sources",
+        kind: AddonKind::Skill(ShopSkill::Sunder),
+    },
+    Addon {
+        name: "Leeching Mark",
+        cost: 4,
+        blurb: "mark a foe: every ally hit on it pays the attacker back in HP",
+        kind: AddonKind::Skill(ShopSkill::LeechingMark),
+    },
+    Addon {
+        name: "Mana Rend",
+        cost: 3,
+        blurb: "melee touch that tears MP out of enemy casters into your pool",
+        kind: AddonKind::Skill(ShopSkill::ManaRend),
+    },
+    Addon {
+        name: "Soothing Touch",
+        cost: 4,
+        blurb: "a mending touch — heal + cleanse in one, at arm's reach",
+        kind: AddonKind::Skill(ShopSkill::SoothingTouch),
+    },
+    Addon {
+        name: "Ignite",
+        cost: 4,
+        blurb: "set the toughest unburned foe alight — fire damage over time",
+        kind: AddonKind::Skill(ShopSkill::Ignite),
+    },
+    Addon {
+        name: "Regrowth",
+        cost: 4,
+        blurb: "plant a regeneration blessing on the most-hurt ally",
+        kind: AddonKind::Skill(ShopSkill::Regrowth),
     },
     Addon {
         name: "Peel Allies",
@@ -733,14 +1123,7 @@ pub enum BuyError {
 }
 
 /// The battle-local ids of the shop skills, resolved once per build.
-struct ShopSkills {
-    charge: SkillId,
-    barrier: SkillId,
-    purify: SkillId,
-    chain: SkillId,
-    war_cry: SkillId,
-    heal: SkillId,
-}
+type ShopSkills = HashMap<ShopSkill, SkillId>;
 
 /// Insert rules at the *front* of a root's children (keeping their order), so
 /// injected addon rules outrank the preset's own. A bare-leaf root is wrapped
@@ -779,53 +1162,12 @@ fn apply_addon(
 ) {
     match addon.kind {
         AddonKind::Skill(s) => {
-            let (skill, rules) = match s {
-                ShopSkill::Charge => (
-                    shop.charge,
-                    vec![
-                        Node::act(ally_attacker(), shop.charge),
-                        Node::act(nearest_enemy(), shop.charge),
-                    ],
-                ),
-                ShopSkill::Barrier => (
-                    shop.barrier,
-                    vec![Node::act(
-                        TargetQuery::new(Pool::Allies)
-                            .filter(Filter::HpPctBelow(0.65))
-                            .filter(Filter::Not(Box::new(Filter::HasStatus(StatusKind::Shield))))
-                            .sort(SortKey::HpPct, Order::Asc),
-                        shop.barrier,
-                    )],
-                ),
-                ShopSkill::Purify => (
-                    shop.purify,
-                    vec![
-                        Node::act(ally_with(StatusKind::Poison), shop.purify),
-                        Node::act(ally_with(StatusKind::Snare), shop.purify),
-                    ],
-                ),
-                ShopSkill::ChainLightning => (
-                    shop.chain,
-                    vec![Node::act(clustered_enemy(), shop.chain)],
-                ),
-                ShopSkill::WarCry => (
-                    shop.war_cry,
-                    vec![Node::act(TargetQuery::new(Pool::Myself), shop.war_cry).when(
-                        Condition::Exists(TargetQuery::new(Pool::Enemies).filter(
-                            Filter::WithinDistanceOf(
-                                Box::new(TargetQuery::new(Pool::Myself)),
-                                4.0,
-                            ),
-                        )),
-                    )],
-                ),
-                ShopSkill::Heal => (shop.heal, vec![Node::act(hurt_ally(0.6), shop.heal)]),
-            };
+            let skill = shop[&s];
             if !known.contains(&skill) {
                 known.push(skill);
             }
             if let Some((action, _)) = gambits {
-                prepend_rules(action, rules);
+                prepend_rules(action, s.rules(skill));
             }
         }
         AddonKind::Tactic(t) => {
@@ -1179,88 +1521,11 @@ impl GauntletRun {
         ];
 
         // --- the shop skills (always in the list; only equipped members know
-        // them). Numbers mirror the skirmish versions they were proven in. ---
-        let shop = ShopSkills {
-            charge: push_skill(
-                &mut skills,
-                Skill {
-                    name: "Charge".into(),
-                    cost: 15,
-                    range: 6.0,
-                    cooldown: 24,
-                    cast_time: 0,
-                    damage_type: Some(DamageType::Physical),
-                    effects: vec![
-                        Effect::Dash { max: 6.0 },
-                        Effect::Damage(12.0),
-                        Effect::Inflict { kind: StatusKind::Stun, stacks: 1, duration: 4 },
-                    ],
-                },
-            ),
-            barrier: push_skill(
-                &mut skills,
-                Skill {
-                    name: "Barrier".into(),
-                    cost: 20,
-                    range: 100.0,
-                    cooldown: 16,
-                    cast_time: 0,
-                    damage_type: None,
-                    effects: vec![Effect::Inflict {
-                        kind: StatusKind::Shield,
-                        stacks: 1,
-                        duration: 12,
-                    }],
-                },
-            ),
-            purify: push_skill(
-                &mut skills,
-                Skill {
-                    name: "Purify".into(),
-                    cost: 10,
-                    range: 100.0,
-                    cooldown: 4,
-                    cast_time: 0,
-                    damage_type: None,
-                    effects: vec![Effect::Cleanse],
-                },
-            ),
-            chain: push_skill(
-                &mut skills,
-                Skill {
-                    name: "Chain Lightning".into(),
-                    cost: 25,
-                    range: 100.0,
-                    cooldown: 10,
-                    cast_time: 2,
-                    damage_type: Some(DamageType::Lightning),
-                    effects: vec![Effect::ChainDamage {
-                        base: 15.0,
-                        jumps: 3,
-                        falloff: 0.7,
-                        jump_range: 5.0,
-                    }],
-                },
-            ),
-            war_cry: push_skill(
-                &mut skills,
-                Skill {
-                    name: "War Cry".into(),
-                    cost: 10,
-                    range: 100.0,
-                    cooldown: 64,
-                    cast_time: 0,
-                    damage_type: None,
-                    effects: vec![Effect::Inflict {
-                        kind: StatusKind::Enrage,
-                        stacks: 1,
-                        duration: 12,
-                    }],
-                },
-            ),
-            // The Heal addon teaches the same triage mend the Sage carries.
-            heal,
-        };
+        // them). Each variant carries its own definition and use-rules. ---
+        let shop: ShopSkills = ShopSkill::ALL
+            .iter()
+            .map(|&s| (s, push_skill(&mut skills, s.def())))
+            .collect();
 
         // --- the enemy kits, shared across the archetypes that field them ---
         let claw = push_skill(
@@ -1769,6 +2034,66 @@ mod tests {
                 if *actor == EntityId(0) && combat.state.skill(*skill).name == "Charge"
         ));
         assert!(charged, "the bought Charge should see use in battle");
+    }
+
+    /// Every skill addon in the catalog equips cleanly on every member: the
+    /// bought skill lands in the kit and its use-rule sits at the top of the
+    /// rule tree. (The catalog-to-def name match is what the shop UI shows.)
+    #[test]
+    fn every_shop_skill_equips_on_every_member() {
+        for (idx, addon) in CATALOG.iter().enumerate() {
+            let AddonKind::Skill(s) = addon.kind else { continue };
+            assert_eq!(
+                addon.name,
+                s.def().name,
+                "catalog entry and skill definition should share a name"
+            );
+            for member in 0..3 {
+                let mut run = run_at(12, 1);
+                run.points = 1000;
+                run.buy(member, idx).unwrap();
+                let combat = run.build();
+                let e = &combat.state.entities[member];
+                assert!(
+                    e.skills.iter().any(|&k| combat.state.skill(k).name == addon.name),
+                    "{}: member {member} should know the bought {}",
+                    addon.name,
+                    addon.name
+                );
+                let Body::Group { children, .. } = &combat.gambits[&EntityId(member)].body
+                else {
+                    panic!("root should be a group");
+                };
+                let top_uses_skill = children.first().is_some_and(|n| {
+                    crate::editor::leaf_skill_id(n)
+                        .is_some_and(|k| combat.state.skill(k).name == addon.name)
+                });
+                assert!(
+                    top_uses_skill,
+                    "{}: the injected use-rule should sit on top for member {member}",
+                    addon.name
+                );
+            }
+        }
+    }
+
+    /// The tempest's field, bought from the shop: a Champion carrying Storm
+    /// into the scrum actually summons it (and the field pulses damage).
+    #[test]
+    fn bought_storm_summons_in_battle() {
+        let mut run = run_at(1, 1);
+        run.points = 100;
+        let storm = CATALOG.iter().position(|a| a.name == "Storm").unwrap();
+        run.buy(0, storm).unwrap();
+
+        let mut combat = run.build();
+        let log = combat.run(6000);
+        let summoned = log.iter().any(|e| matches!(
+            e,
+            Event::Acted { actor, skill, .. }
+                if *actor == EntityId(0) && combat.state.skill(*skill).name == "Storm"
+        ));
+        assert!(summoned, "the bought Storm should be summoned once foes close in");
     }
 
     /// A movement tactic addon extends the member's movement gambit; an action

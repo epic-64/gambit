@@ -506,9 +506,10 @@ async fn main() {
     let mut choose_sel = 0usize;
     let mut prep_sel = 0usize;
     let mut editor_from_prep = false;
-    // Shop screen state: highlighted catalog row, the member the purchase
-    // equips onto, and feedback from the last buy.
+    // Shop screen state: highlighted catalog row, scroll window, the member
+    // the purchase equips onto, and feedback from the last buy.
     let mut shop_sel = 0usize;
+    let mut shop_scroll = 0usize;
     let mut shop_member = 0usize;
     let mut shop_msg = String::new();
     // The banner's Enter also lands on the choose screen in the same frame
@@ -877,6 +878,7 @@ async fn main() {
                             shop_member = prep_sel;
                         }
                         shop_sel = 0;
+                        shop_scroll = 0;
                         shop_msg.clear();
                         screen = Screen::GauntletShop;
                     } else if is_key_pressed(KeyCode::G) || (enter && prep_sel < members) {
@@ -947,7 +949,7 @@ async fn main() {
                         };
                     }
                     clear_background(Color::new(0.10, 0.11, 0.13, 1.0));
-                    draw_gauntlet_shop(run, shop_sel, shop_member, &shop_msg);
+                    draw_gauntlet_shop(run, shop_sel, shop_member, &shop_msg, &mut shop_scroll);
                 } else {
                     screen = Screen::Menu;
                 }
@@ -2206,11 +2208,18 @@ fn draw_gauntlet_prep(run: &gauntlet::GauntletRun, sel: usize) {
     );
 }
 
-/// The upgrade shop: the addon catalog with costs, categories and blurbs.
-/// Up/Down walks the catalog, Left/Right retargets which member the purchase
-/// equips onto, Enter buys. Ownership is per member; injected rules take
-/// priority in purchase order (equipping is programming).
-fn draw_gauntlet_shop(run: &gauntlet::GauntletRun, sel: usize, member: usize, msg: &str) {
+/// The upgrade shop: the addon catalog with costs, categories and blurbs,
+/// scrolled in a window that follows the selection. Up/Down walks the catalog,
+/// Left/Right retargets which member the purchase equips onto, Enter buys.
+/// Ownership is per member; injected rules take priority in purchase order
+/// (equipping is programming).
+fn draw_gauntlet_shop(
+    run: &gauntlet::GauntletRun,
+    sel: usize,
+    member: usize,
+    msg: &str,
+    scroll: &mut usize,
+) {
     let gold = Color::new(0.95, 0.85, 0.3, 1.0);
     let dim = Color::new(0.65, 0.68, 0.72, 1.0);
     draw_text(&format!("Gauntlet — Wave {}", run.wave()), 44.0, 60.0, 40.0, WHITE);
@@ -2228,11 +2237,24 @@ fn draw_gauntlet_shop(run: &gauntlet::GauntletRun, sel: usize, member: usize, ms
     let pd = measure_text(&pts, None, 28, 1.0);
     draw_text(&pts, screen_width() - pd.width - 44.0, 60.0, 28.0, gold);
 
+    // The catalog window: as many rows as fit, kept centred on the selection.
     let margin = 44.0;
-    let top = 126.0;
-    let row_h = 30.0;
-    for (i, item) in gauntlet::CATALOG.iter().enumerate() {
-        let y = top + i as f32 * row_h;
+    let top = 132.0;
+    let row_h = 28.0;
+    let bottom = screen_height() - 84.0;
+    let total = gauntlet::CATALOG.len();
+    let visible = ((((bottom - top) / row_h).floor()) as usize).clamp(1, total);
+    if sel < *scroll {
+        *scroll = sel;
+    }
+    if sel >= *scroll + visible {
+        *scroll = sel + 1 - visible;
+    }
+    *scroll = (*scroll).min(total - visible);
+
+    for (row, i) in (*scroll..*scroll + visible).enumerate() {
+        let item = &gauntlet::CATALOG[i];
+        let y = top + row as f32 * row_h;
         let selected = i == sel;
         if selected {
             draw_rectangle(
@@ -2268,6 +2290,13 @@ fn draw_gauntlet_shop(run: &gauntlet::GauntletRun, sel: usize, member: usize, ms
         if !owners.is_empty() {
             draw_text(&format!("({owners})"), margin + 228.0, y, 18.0, Color::new(0.5, 0.75, 0.5, 1.0));
         }
+    }
+    // Overflow markers so a clipped catalog is obvious.
+    if *scroll > 0 {
+        draw_text("^ more", screen_width() - 130.0, top - 6.0, 18.0, dim);
+    }
+    if *scroll + visible < total {
+        draw_text("v more", screen_width() - 130.0, bottom + 14.0, 18.0, dim);
     }
 
     if !msg.is_empty() {
