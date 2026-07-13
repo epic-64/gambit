@@ -45,6 +45,23 @@ src/
               A*-routed around terrain. (unit tests)
   combat.rs   Combat: the ATB loop + movement + cast-time state machine + action resolution. (unit tests)
   scenario.rs Hand-built demo battle + demo map (temporary, until real encounters exist).
+  gauntlet.rs Gauntlet game mode: a 3-hero party vs. endless escalating waves. A seeded RNG
+              (a run is a pure function of its seed) rolls TWO encounter offers per wave —
+              each with its own randomized arena (hills/walls/pits/boulders, muster bands
+              kept clear, connectivity-validated via nav::reachable, flat fallback) and a
+              budget-bought enemy roster. Party behavior = a preset from the catalog (named
+              action+movement gambit bundles distilled from the scenarios: Bruiser,
+              Skirmisher, Executioner, Guardian, Medic) or Custom (captured from the gambit
+              editor, persists across waves; capture diffs against the preset baseline so
+              merely opening the editor doesn't relabel a member). Progression: cleared
+              waves pay upgrade points (2 + wave, small stipend at start) spent in an addon
+              CATALOG — purchasable skills (Charge/Barrier/Purify/Chain Lightning/War Cry/
+              Heal: kit entry + an auto use-rule) and tactics (Peel Allies/Focus Fire/
+              Execute the Weak as action rules; Seek High Ground/Kite/Bodyguard/Flank as
+              movement terms) — equipped per member; injected rules sit ABOVE the preset's
+              own, in purchase order ("equipping is programming"). Addons never re-inject
+              into a captured Custom tree (that would duplicate rules every wave) — Custom
+              members only gain the bought skill in their kit and wire it by hand. (unit tests)
   editor.rs   Engine-agnostic support for the gambit editor: describe-as-text for every gambit
               value, the preset catalogs the editor cycles through (presets over raw knobs, per
               the UX principle), and path-addressed structural edits on the rule tree. (unit tests)
@@ -52,7 +69,17 @@ src/
               verbatim — terrain (elevation/walls/pits), HP/action bars, movement + casting,
               intent lines, log. No render-side interpolation. Also hosts the gambit editor
               screen (G in battle): roster → one character at a time, action-tree + movement
-              panels; edits mutate the live Combat and survive R-restarts.
+              panels; edits mutate the live Combat and survive R-restarts. Gauntlet flow:
+              menu → GauntletChoose (two offers side by side: to-scale minimap + roster
+              preview, drawn from the same tiles/spawn fns the fight uses) → GauntletPrep
+              (muster screen) → battle; cleared waves loop back to Choose, R retries the
+              current wave. **All menu/prep/shop screens navigate on arrows + Enter + Esc
+              only** (a UX rule: the title menu is an arrow-walked list; the muster screen
+              is one list of member cards + "Upgrade shop" + "Start battle" rows, Enter on
+              a member opens its rules in the editor; digit keys / S / G / M remain as
+              quiet shortcuts, never in the hint lines). (The banner's Enter would leak
+              into the same-frame Choose screen and insta-confirm it —
+              suppress_choose_enter swallows that edge.)
 ```
 
 Run `cargo test` for the behaviour specs and `cargo run` for the live viewer
