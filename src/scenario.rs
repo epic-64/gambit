@@ -1498,6 +1498,372 @@ fn add_hill(t: &mut Terrain, cx: i32) {
     t.fill(cx..=cx, 6..=8, ground(3)); // crown
 }
 
+// ======================= Gauntlet: solo escalating-waves run =======================
+//
+// A one-character game mode: a single hero faces an unbroken sequence of enemy
+// waves that grow in number and strength without end. The hero is the run's
+// only unit — fully restored between waves (and a little tougher for each one
+// cleared) — so "how far can one build get" is the whole game. No classes here
+// either: the hero is just a stat block + kit + gambit, and every foe is one of
+// a handful of archetype bundles the wave budget draws from.
+
+/// Title-screen label for the gauntlet (the viewer lists it after the scenarios).
+pub const GAUNTLET_LABEL: &str = "Gauntlet — solo run vs. endless escalating waves";
+
+/// The hero's starting HP (before [`HP_SCALE`]); each cleared wave adds
+/// [`GAUNTLET_HP_GROWTH`] to it — the run's only source of growth, so a
+/// seasoned hero can weather deeper waves a fresh one couldn't.
+const GAUNTLET_HERO_HP: f32 = 110.0;
+const GAUNTLET_HP_GROWTH: f32 = 8.0;
+/// The gauntlet arena (flat — a clean duelling ground so the lone hero never
+/// snags on terrain while swarmed). Wide enough to kite in.
+const GAUNTLET_COLS: i32 = 22;
+const GAUNTLET_ROWS: i32 = 12;
+/// Extra enemy HP per wave beyond the first, as a fraction — so even the same
+/// archetype grinds harder deep into a run (the budget adds *bodies*; this adds
+/// *bulk*).
+const GAUNTLET_ENEMY_HP_PER_WAVE: f32 = 0.06;
+/// Never spawn more than this many foes at once — past it the arena just packs
+/// up and the hero dies to positioning, not difficulty. Deeper waves escalate
+/// through per-wave HP growth instead (see [`GAUNTLET_ENEMY_HP_PER_WAVE`]).
+const GAUNTLET_MAX_FOES: usize = 6;
+
+/// One live solo run of the gauntlet, carried by the viewer across battles.
+/// `build` produces the current wave's `Combat` (hero at full HP); `clear_wave`
+/// advances the run after a win, growing the hero a touch.
+pub struct GauntletRun {
+    wave: u32,
+    hero_hp: f32,
+}
+
+impl GauntletRun {
+    /// A fresh run: wave 1, a starter hero.
+    pub fn new() -> Self {
+        GauntletRun { wave: 1, hero_hp: GAUNTLET_HERO_HP }
+    }
+
+    /// The wave the hero is currently facing (1-indexed).
+    pub fn wave(&self) -> u32 {
+        self.wave
+    }
+
+    /// Build the current wave as a fresh `Combat`, hero spawned at full HP.
+    pub fn build(&self) -> Combat {
+        gauntlet_wave(self.wave, self.hero_hp)
+    }
+
+    /// Bank a cleared wave: the hero grows a little (and is rebuilt at full HP
+    /// next `build`) and the next, harder wave arrives.
+    pub fn clear_wave(&mut self) {
+        self.hero_hp += GAUNTLET_HP_GROWTH;
+        self.wave += 1;
+    }
+}
+
+impl Default for GauntletRun {
+    fn default() -> Self {
+        GauntletRun::new()
+    }
+}
+
+/// The enemy archetypes the wave budget draws from, cheapest to deadliest. Each
+/// is a stat block + kit + a fixed gambit shape (melee close-in or ranged
+/// standoff) — never a class, just a recurring bundle.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Foe {
+    Grunt,
+    Archer,
+    Brute,
+    Mage,
+    Ogre,
+}
+
+impl Foe {
+    /// Point cost against the wave budget.
+    fn cost(self) -> i32 {
+        match self {
+            Foe::Grunt => 1,
+            Foe::Archer => 2,
+            Foe::Brute | Foe::Mage => 3,
+            Foe::Ogre => 5,
+        }
+    }
+
+    /// The wave this archetype starts appearing on — the escalation ladder:
+    /// early waves are grunts, then archers, brutes, mages and finally ogres
+    /// join the pool as the run goes deep.
+    fn unlock_wave(self) -> u32 {
+        match self {
+            Foe::Grunt => 1,
+            Foe::Archer => 2,
+            Foe::Brute => 3,
+            Foe::Mage => 4,
+            Foe::Ogre => 6,
+        }
+    }
+
+    fn is_ranged(self) -> bool {
+        matches!(self, Foe::Archer | Foe::Mage)
+    }
+}
+
+/// All archetypes, deadliest first — the order the greedy budget spends in.
+const FOE_LADDER: [Foe; 5] = [Foe::Ogre, Foe::Mage, Foe::Brute, Foe::Archer, Foe::Grunt];
+
+/// The roster a given wave fields: spend a budget of `wave + 1` points on the
+/// archetypes unlocked by now, deadliest-affordable first and cycling so a wave
+/// mixes types instead of stacking one. Capped at [`GAUNTLET_MAX_FOES`] bodies.
+/// The result grows monotonically in menace: more points buy more (and costlier)
+/// foes, and [`gauntlet_wave`] additionally fattens each one by the wave number.
+fn wave_foes(wave: u32) -> Vec<Foe> {
+    let unlocked: Vec<Foe> = FOE_LADDER
+        .into_iter()
+        .filter(|f| wave >= f.unlock_wave())
+        .collect();
+    let mut budget = wave as i32 + 1;
+    let mut foes = Vec::new();
+    loop {
+        let mut bought = false;
+        for &f in &unlocked {
+            if foes.len() >= GAUNTLET_MAX_FOES {
+                break;
+            }
+            if budget >= f.cost() {
+                foes.push(f);
+                budget -= f.cost();
+                bought = true;
+            }
+        }
+        if !bought || foes.len() >= GAUNTLET_MAX_FOES {
+            break;
+        }
+    }
+    foes
+}
+
+/// Build wave `wave` of a gauntlet run: the hero (spawned with `hero_hp` base
+/// HP, before [`HP_SCALE`]) against the wave's rolled roster on a flat arena.
+fn gauntlet_wave(wave: u32, hero_hp: f32) -> Combat {
+    let mut skills = Vec::new();
+    // --- the hero's kit: a self-sufficient solo bruiser. A strong free melee,
+    // a free ranged plink to work targets it can't reach, and a rationed
+    // self-mend so a lone unit can actually sustain a fight it can't hand off. ---
+    let strike = push_skill(
+        &mut skills,
+        Skill {
+            name: "Strike".into(),
+            cost: 0,
+            range: 2.5,
+            cooldown: 0,
+            cast_time: 0,
+            damage_type: Some(DamageType::Physical),
+            effects: vec![Effect::Damage(10.0)],
+        },
+    );
+    let bolt = push_skill(
+        &mut skills,
+        Skill {
+            name: "Bolt".into(),
+            cost: 0,
+            range: 9.0,
+            cooldown: 0,
+            cast_time: 1,
+            damage_type: Some(DamageType::Physical),
+            effects: vec![Effect::Damage(11.0)],
+        },
+    );
+    let mend = push_skill(
+        &mut skills,
+        Skill {
+            name: "Mend".into(),
+            cost: 25,
+            range: 100.0,
+            cooldown: 6,
+            cast_time: 0,
+            damage_type: None,
+            effects: vec![Effect::Heal(45.0)],
+        },
+    );
+    // --- the enemy kits, shared across the archetypes that field them. ---
+    let claw = push_skill(
+        &mut skills,
+        Skill {
+            name: "Claw".into(),
+            cost: 0,
+            range: 2.5,
+            cooldown: 0,
+            cast_time: 0,
+            damage_type: Some(DamageType::Physical),
+            effects: vec![Effect::Damage(9.0)],
+        },
+    );
+    let bash = push_skill(
+        &mut skills,
+        Skill {
+            name: "Bash".into(),
+            cost: 0,
+            range: 2.5,
+            cooldown: 0,
+            cast_time: 0,
+            damage_type: Some(DamageType::Physical),
+            effects: vec![Effect::Damage(11.0)],
+        },
+    );
+    let shot = push_skill(
+        &mut skills,
+        Skill {
+            name: "Shot".into(),
+            cost: 0,
+            range: 9.0,
+            cooldown: 0,
+            cast_time: 1,
+            damage_type: Some(DamageType::Physical),
+            effects: vec![Effect::Damage(9.0)],
+        },
+    );
+    let fireball = push_skill(
+        &mut skills,
+        Skill {
+            name: "Fireball".into(),
+            cost: 30,
+            range: 100.0,
+            cooldown: 8,
+            cast_time: 3,
+            damage_type: Some(DamageType::Fire),
+            effects: vec![Effect::Damage(18.0)],
+        },
+    );
+
+    let mk = |id: usize,
+              name: &str,
+              team: Team,
+              hp: f32,
+              atb_speed: f32,
+              move_speed: f32,
+              x: f32,
+              y: f32,
+              known: Vec<SkillId>,
+              weak: &[DamageType]| Entity {
+        id: EntityId(id),
+        name: name.into(),
+        team,
+        hp: hp * HP_SCALE,
+        max_hp: hp * HP_SCALE,
+        mp: SPAWN_MP,
+        max_mp: SPAWN_MP,
+        mp_regen: MP_REGEN,
+        pos: Pos { x, y },
+        statuses: Vec::new(),
+        weaknesses: weak.to_vec(),
+        skills: known,
+        cooldowns: HashMap::new(),
+        atb_speed,
+        move_speed,
+        action_bar: 0.0,
+        focus: None,
+    };
+
+    let mid = GAUNTLET_ROWS as f32 / 2.0;
+    let mut entities = vec![
+        // The hero musters at the west edge, mid-field.
+        mk(0, "Champion", Team::Player, hero_hp, 0.32, 0.44, 3.0, mid, vec![strike, bolt, mend], &[]),
+    ];
+
+    // The wave's roster, fattened by the wave number, fanned out along the east.
+    let foes = wave_foes(wave);
+    let hp_mult = 1.0 + GAUNTLET_ENEMY_HP_PER_WAVE * (wave.saturating_sub(1)) as f32;
+    // Spread the foes over a column on the east side; a lone foe stands mid.
+    let n = foes.len();
+    for (i, &foe) in foes.iter().enumerate() {
+        let id = i + 1;
+        let x = 17.0 + (i % 2) as f32 * 1.6;
+        let y = if n == 1 {
+            mid
+        } else {
+            2.0 + (GAUNTLET_ROWS as f32 - 4.0) * i as f32 / (n - 1) as f32
+        };
+        let (name, hp, atb, mv, kit, weak): (&str, f32, f32, f32, Vec<SkillId>, &[DamageType]) =
+            match foe {
+                Foe::Grunt => ("Grunt", 34.0, 0.30, 0.46, vec![claw], &[]),
+                Foe::Archer => ("Archer", 42.0, 0.30, 0.34, vec![shot], &[]),
+                Foe::Brute => ("Brute", 95.0, 0.20, 0.26, vec![bash], &[]),
+                Foe::Mage => ("Mage", 46.0, 0.22, 0.30, vec![fireball, shot], &[DamageType::Fire][..]),
+                Foe::Ogre => ("Ogre", 150.0, 0.18, 0.24, vec![bash], &[]),
+            };
+        entities.push(mk(id, name, Team::Enemy, hp * hp_mult, atb, mv, x, y, kit, weak));
+    }
+
+    let terrain = Terrain::flat(GAUNTLET_COLS, GAUNTLET_ROWS, 1.0);
+    let state = BattleState {
+        bounds: terrain.world_extent(),
+        entities,
+        skills,
+        terrain: Some(terrain),
+    };
+
+    // --- gambits ---
+    let nearest_enemy = || TargetQuery::new(Pool::Enemies).sort(SortKey::Distance, Order::Asc);
+    let mut gambits = HashMap::new();
+    let mut move_gambits = HashMap::new();
+
+    // Hero: survive first (mend when hurt and it's affordable — feasibility
+    // gates the guard), then plink or bash whatever is nearest. Strike outranks
+    // Bolt in the list but only reaches 2.5, so a foe out of melee falls through
+    // to the ranged Bolt automatically. It holds just off the fray so it kites
+    // with Bolt and only trades blows when something closes.
+    gambits.insert(
+        EntityId(0),
+        Node::context(
+            Condition::Always,
+            GroupMode::Fallthrough,
+            vec![
+                Node::act(
+                    TargetQuery::new(Pool::Myself).filter(Filter::HpPctBelow(0.5)),
+                    mend,
+                ),
+                Node::act(nearest_enemy(), strike),
+                Node::act(nearest_enemy(), bolt),
+            ],
+        ),
+    );
+    move_gambits.insert(
+        EntityId(0),
+        MoveGambit::new(vec![(Term::Near(nearest_enemy(), 4.0), 1.0)]),
+    );
+
+    // Foes: each archetype gets a fixed shape. Melee close on the hero; ranged
+    // hold a standoff and plink (mages nuke first, else plink). "Nearest enemy"
+    // is always the hero — there's only one — so the whole wave converges on it.
+    for (i, &foe) in foes.iter().enumerate() {
+        let id = EntityId(i + 1);
+        let gambit = match foe {
+            Foe::Grunt => Node::act(nearest_enemy(), claw),
+            Foe::Archer => Node::act(nearest_enemy(), shot),
+            Foe::Brute | Foe::Ogre => Node::act(nearest_enemy(), bash),
+            Foe::Mage => Node::context(
+                Condition::Always,
+                GroupMode::Fallthrough,
+                vec![
+                    Node::act(nearest_enemy(), fireball),
+                    Node::act(nearest_enemy(), shot),
+                ],
+            ),
+        };
+        gambits.insert(id, gambit);
+        let move_gambit = if foe.is_ranged() {
+            MoveGambit::new(vec![
+                (Term::Near(nearest_enemy(), 6.5), 1.0),
+                (Term::SightOf(nearest_enemy()), 0.6),
+            ])
+        } else {
+            MoveGambit::toward(nearest_enemy())
+        };
+        move_gambits.insert(id, move_gambit);
+    }
+
+    Combat::new(state, gambits).with_movement(move_gambits)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1737,5 +2103,112 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Advance a fresh run to `wave` (banking each earlier wave) and build it.
+    fn gauntlet_at(wave: u32) -> Combat {
+        let mut run = GauntletRun::new();
+        for _ in 1..wave {
+            run.clear_wave();
+        }
+        assert_eq!(run.wave(), wave);
+        run.build()
+    }
+
+    /// Every gauntlet wave builds a hero (id 0, the sole player) plus at least
+    /// one foe, and wires a gambit for every entity — the same "no idle unit"
+    /// guarantee the scenario registry has.
+    #[test]
+    fn gauntlet_waves_build_and_wire_every_entity() {
+        for wave in [1, 2, 3, 5, 8, 13, 20] {
+            let combat = gauntlet_at(wave);
+            let players: Vec<&Entity> =
+                combat.state.entities.iter().filter(|e| e.team == Team::Player).collect();
+            assert_eq!(players.len(), 1, "wave {wave}: the gauntlet is a solo run");
+            assert_eq!(players[0].id, EntityId(0), "wave {wave}: the hero is entity 0");
+            let foes = combat.state.entities.len() - 1;
+            assert!(foes >= 1, "wave {wave}: a wave must field at least one foe");
+            assert!(
+                foes <= GAUNTLET_MAX_FOES,
+                "wave {wave}: {foes} foes exceeds the crowd cap"
+            );
+            for e in &combat.state.entities {
+                assert!(
+                    combat.gambits.contains_key(&e.id),
+                    "wave {wave}: {} has no gambit",
+                    e.name
+                );
+            }
+        }
+    }
+
+    /// The run escalates: a deep wave fields no fewer foes than a shallow one,
+    /// and total enemy HP strictly climbs (more bodies and/or the per-wave bulk).
+    #[test]
+    fn gauntlet_escalates_in_menace() {
+        let enemy_hp = |wave| {
+            gauntlet_at(wave)
+                .state
+                .entities
+                .iter()
+                .filter(|e| e.team == Team::Enemy)
+                .map(|e| e.max_hp)
+                .sum::<f32>()
+        };
+        let early = enemy_hp(1);
+        let mid = enemy_hp(6);
+        let deep = enemy_hp(15);
+        assert!(mid > early, "wave 6 ({mid}) should outweigh wave 1 ({early})");
+        assert!(deep > mid, "wave 15 ({deep}) should outweigh wave 6 ({mid})");
+    }
+
+    /// A cleared wave leaves the hero tougher than it started — the run's growth.
+    #[test]
+    fn gauntlet_hero_grows_between_waves() {
+        let hp_at = |wave: u32| {
+            gauntlet_at(wave)
+                .state
+                .entities
+                .iter()
+                .find(|e| e.id == EntityId(0))
+                .unwrap()
+                .max_hp
+        };
+        assert!(hp_at(5) > hp_at(1), "the hero should gain max HP as waves are cleared");
+    }
+
+    /// Early gauntlet waves resolve (no livelock / stalemate) and units move.
+    /// A shallow wave the hero can clear, plus a deep one it cannot — either
+    /// way the battle must *end*.
+    #[test]
+    fn gauntlet_waves_resolve() {
+        for wave in [1, 4, 10] {
+            let mut combat = gauntlet_at(wave);
+            let start: Vec<Pos> = combat.state.entities.iter().map(|e| e.pos).collect();
+            combat.run(6000);
+            assert!(combat.is_over(), "gauntlet wave {wave} should resolve");
+            let moved = combat
+                .state
+                .entities
+                .iter()
+                .zip(&start)
+                .any(|(e, s)| e.pos.x != s.x || e.pos.y != s.y);
+            assert!(moved, "gauntlet wave {wave}: a unit should have drifted");
+        }
+    }
+
+    /// The hero can actually win the opening waves solo (the mode has to be
+    /// beatable at the start, not an instant loss).
+    #[test]
+    fn gauntlet_hero_survives_the_first_wave() {
+        let mut combat = gauntlet_at(1);
+        combat.run(6000);
+        assert!(combat.is_over());
+        let hero_alive = combat
+            .state
+            .entities
+            .iter()
+            .any(|e| e.team == Team::Player && e.is_alive());
+        assert!(hero_alive, "the hero should clear wave 1 on its own");
     }
 }

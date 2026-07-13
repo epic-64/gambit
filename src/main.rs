@@ -421,6 +421,19 @@ enum Screen {
     Editor,
 }
 
+/// Where a gauntlet run stands within the current wave's battle. Only meaningful
+/// while a run is active (`gauntlet` is `Some`); a plain scenario stays
+/// `Fighting` and the between-wave banners never show.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GauntletPhase {
+    /// The wave is live (the battle plays out normally).
+    Fighting,
+    /// The hero cleared the wave — showing the "next wave" banner.
+    Cleared,
+    /// The hero fell — showing the run-over banner.
+    Defeated,
+}
+
 /// UI state of the gambit editor: which character is open, which panel has
 /// keyboard focus, and each panel's selection + scroll.
 #[derive(Default)]
@@ -473,6 +486,11 @@ async fn main() {
     let mut shadows: HashMap<EntityId, ShadowBars> = HashMap::new();
     // Gambit-editor UI state (selection, focus, scroll).
     let mut editor_state = EditorState::default();
+    // The active gauntlet run, if the gauntlet game mode is being played, plus
+    // where the current wave stands (win/lose transitions live here). `None`
+    // means an ordinary scenario is loaded instead.
+    let mut gauntlet: Option<scenario::GauntletRun> = None;
+    let mut gauntlet_phase = GauntletPhase::Fighting;
 
     loop {
         match screen {
@@ -482,6 +500,7 @@ async fn main() {
                     if digit_key(i).is_some_and(is_key_pressed) {
                         combat = Some(scenarios[i].1());
                         current = i;
+                        gauntlet = None;
                         log.clear();
                         vfx.clear();
                         flash.clear();
@@ -490,6 +509,20 @@ async fn main() {
                         editor_state = EditorState::default();
                         screen = Screen::Playing;
                     }
+                }
+                // The entry after the scenarios starts a fresh gauntlet run.
+                if digit_key(scenarios.len()).is_some_and(is_key_pressed) {
+                    let run = scenario::GauntletRun::new();
+                    combat = Some(run.build());
+                    gauntlet = Some(run);
+                    gauntlet_phase = GauntletPhase::Fighting;
+                    log.clear();
+                    vfx.clear();
+                    flash.clear();
+                    shadows.clear();
+                    paused = false;
+                    editor_state = EditorState::default();
+                    screen = Screen::Playing;
                 }
 
                 clear_background(Color::new(0.10, 0.11, 0.13, 1.0));
@@ -501,10 +534,17 @@ async fn main() {
                     paused = !paused;
                 }
                 if is_key_pressed(KeyCode::R) {
-                    // Restart the scenario but keep any gambit edits: the fresh
-                    // build's rules are overwritten with the current (possibly
-                    // edited) ones. Re-picking from the menu gets a pristine copy.
-                    restart_keeping_edits(&scenarios, current, &mut combat);
+                    if let Some(run) = gauntlet.as_mut() {
+                        // Restart the whole run from wave 1 (a fresh hero).
+                        *run = scenario::GauntletRun::new();
+                        combat = Some(run.build());
+                        gauntlet_phase = GauntletPhase::Fighting;
+                    } else {
+                        // Restart the scenario but keep any gambit edits: the fresh
+                        // build's rules are overwritten with the current (possibly
+                        // edited) ones. Re-picking from the menu gets a pristine copy.
+                        restart_keeping_edits(&scenarios, current, &mut combat);
+                    }
                     log.clear();
                     vfx.clear();
                     flash.clear();
@@ -512,19 +552,63 @@ async fn main() {
                     paused = false;
                 }
                 if is_key_pressed(KeyCode::M) || is_key_pressed(KeyCode::Escape) {
+                    gauntlet = None;
                     screen = Screen::Menu;
                 }
                 if is_key_pressed(KeyCode::I) {
                     show_intent = !show_intent;
                 }
-                if is_key_pressed(KeyCode::G) {
+                // The gambit editor keys off the scenario registry, so it's only
+                // available in scenario mode — a gauntlet run has no registry slot.
+                if is_key_pressed(KeyCode::G) && gauntlet.is_none() {
                     paused = true;
                     screen = Screen::Editor;
+                }
+                // Between-wave input: Enter carries a cleared run into the next
+                // (harder) wave, or leaves a lost run back to the menu.
+                if gauntlet.is_some() && is_key_pressed(KeyCode::Enter) {
+                    match gauntlet_phase {
+                        GauntletPhase::Cleared => {
+                            let run = gauntlet.as_mut().unwrap();
+                            run.clear_wave();
+                            combat = Some(run.build());
+                            gauntlet_phase = GauntletPhase::Fighting;
+                            log.clear();
+                            vfx.clear();
+                            flash.clear();
+                            shadows.clear();
+                            paused = false;
+                        }
+                        GauntletPhase::Defeated => {
+                            gauntlet = None;
+                            screen = Screen::Menu;
+                        }
+                        GauntletPhase::Fighting => {}
+                    }
                 }
 
                 let Some(combat) = combat.as_mut() else {
                     continue;
                 };
+
+                // Watch for the wave ending: on a win the run banks the wave and
+                // waits for Enter; on a loss the run is over. Determined the frame
+                // the battle first reports `is_over` (before the draw below).
+                if gauntlet.is_some()
+                    && combat.is_over()
+                    && gauntlet_phase == GauntletPhase::Fighting
+                {
+                    let hero_alive = combat
+                        .state
+                        .entities
+                        .iter()
+                        .any(|e| e.team == Team::Player && e.is_alive());
+                    gauntlet_phase = if hero_alive {
+                        GauntletPhase::Cleared
+                    } else {
+                        GauntletPhase::Defeated
+                    };
+                }
 
                 // --- update: real frame time drives the sim directly ---
                 if !paused && !combat.is_over() {
@@ -605,7 +689,17 @@ async fn main() {
                 draw_flights(&view, combat);
                 let meter_top = draw_meter(combat);
                 draw_log(&log, meter_top);
-                draw_hud(combat, paused, scenarios[current].0);
+                let title = match gauntlet.as_ref() {
+                    Some(run) => format!("Gauntlet — Wave {}", run.wave()),
+                    None => scenarios[current].0.to_string(),
+                };
+                draw_hud(combat, paused, &title);
+                // Between-wave / run-over banner overlays the frozen final frame.
+                if let Some(run) = gauntlet.as_ref()
+                    && gauntlet_phase != GauntletPhase::Fighting
+                {
+                    draw_gauntlet_banner(gauntlet_phase, run.wave());
+                }
             }
             Screen::Editor => {
                 if is_key_pressed(KeyCode::R) {
@@ -695,6 +789,16 @@ fn draw_menu(scenarios: &[(&'static str, fn() -> Combat)]) {
         draw_text(name, 96.0, y, 26.0, WHITE);
         y += 44.0;
     }
+    // The gauntlet game mode sits after the scenarios, on the next number key.
+    draw_text(
+        &format!("{}.", scenarios.len() + 1),
+        60.0,
+        y,
+        28.0,
+        Color::new(0.95, 0.85, 0.3, 1.0),
+    );
+    draw_text(scenario::GAUNTLET_LABEL, 96.0, y, 26.0, Color::new(0.95, 0.9, 0.7, 1.0));
+    y += 44.0;
 
     draw_text(
         "Press a number key to begin.",
@@ -1632,6 +1736,47 @@ fn draw_hud(combat: &Combat, paused: bool, scenario: &str) {
         combat.time, state
     );
     draw_text(&hud, 20.0, 28.0, 22.0, WHITE);
+}
+
+/// The full-screen banner shown between gauntlet waves — a cleared-wave prompt
+/// to press on into the next (harder) wave, or the run-over notice when the hero
+/// finally falls. Overlays the frozen final frame of the battle underneath.
+fn draw_gauntlet_banner(phase: GauntletPhase, wave: u32) {
+    // Dim the battle behind the banner so the text reads.
+    draw_rectangle(
+        0.0,
+        0.0,
+        screen_width(),
+        screen_height(),
+        Color::new(0.05, 0.06, 0.08, 0.72),
+    );
+    let (headline, prompt, color) = match phase {
+        GauntletPhase::Cleared => (
+            format!("Wave {wave} cleared!"),
+            "Enter: face the next wave   ·   M: menu".to_string(),
+            Color::new(0.45, 0.85, 0.5, 1.0),
+        ),
+        GauntletPhase::Defeated => (
+            format!("You fell on Wave {wave}"),
+            "Enter / M: menu   ·   R: run it again from Wave 1".to_string(),
+            Color::new(0.9, 0.45, 0.4, 1.0),
+        ),
+        GauntletPhase::Fighting => return,
+    };
+    let cx = screen_width() / 2.0;
+    let cy = screen_height() / 2.0;
+    let hsize = 56.0;
+    let hd = measure_text(&headline, None, hsize as u16, 1.0);
+    draw_text(&headline, cx - hd.width / 2.0, cy - 10.0, hsize, color);
+    let psize = 24.0;
+    let pd = measure_text(&prompt, None, psize as u16, 1.0);
+    draw_text(
+        &prompt,
+        cx - pd.width / 2.0,
+        cy + 34.0,
+        psize,
+        Color::new(0.82, 0.85, 0.9, 1.0),
+    );
 }
 
 // --- gambit editor ----------------------------------------------------------
